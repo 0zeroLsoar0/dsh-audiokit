@@ -102,18 +102,17 @@ console.log('-- minimax happy path --')
   const sent = seen[0].body
   check('sent subtitle_enable', sent.subtitle_enable === true)
   check('sent subtitle_type', sent.subtitle_type === 'sentence')
-  check('auto emotion is omitted', sent.voice_setting.emotion === undefined, JSON.stringify(sent.voice_setting))
+  check('no emotion key sent', sent.voice_setting.emotion === undefined, JSON.stringify(sent.voice_setting))
   check('requests pcm', sent.audio_setting.format === 'pcm')
   check('bearer token', seen[0].auth === 'Bearer test-key', String(seen[0].auth))
   check('effective params reported', result.effective.model === 'speech-2.8-hd' && result.effective.sampleRate === 32000, JSON.stringify(result.effective))
 }
 
-console.log('-- explicit emotion / subtitle off --')
+console.log('-- subtitle off --')
 {
   seen.length = 0
-  await speak(config(), '测试', { emotion: 'sad', subtitle: false })
+  await speak(config(), '测试', { subtitle: false })
   const sent = seen[0].body
-  check('emotion forwarded', sent.voice_setting.emotion === 'sad')
   check('no subtitle when off', sent.subtitle_enable === undefined)
 }
 

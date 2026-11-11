@@ -40,13 +40,12 @@
 tts:
   provider: minimax          # minimax | openai | custom | none
   baseUrl: https://api.minimax.chat     # 海外换成 https://api.minimaxi.com
-  model: speech-2.8-hd       # 要手动控制情感时用 speech-2.6-hd
-  voice: female-shaonv
-  emotion: auto              # auto | happy | sad | angry | fearful | surprised | calm | fluent | whisper
+  model: speech-2.8-hd
+  voice: female-shaonv       # 设置页会列出账号的真实音色
   apiKeyEnv: MINIMAX_API_KEY
 check:
   baseUrl: https://dashscope.aliyuncs.com/compatible-mode
-  model: qwen3-omni-flash
+  model: qwen2.5-omni-7b     # 小模型；账号若只有别的 omni 型号，在设置页改成那个
   apiKeyEnv: DASHSCOPE_API_KEY
 ```
 

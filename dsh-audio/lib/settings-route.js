@@ -20,7 +20,7 @@ import { describeAudio, listVoices, speak } from './providers.js'
 
 const MAX_BODY = 64 * 1024
 
-const TTS_FIELDS = ['provider', 'baseUrl', 'model', 'voice', 'emotion', 'speed', 'pitch', 'sampleRate', 'groupId', 'apiKey', 'apiKeyEnv']
+const TTS_FIELDS = ['provider', 'baseUrl', 'model', 'voice', 'speed', 'pitch', 'sampleRate', 'groupId', 'apiKey', 'apiKeyEnv']
 const CHECK_FIELDS = ['provider', 'baseUrl', 'model', 'apiKey', 'apiKeyEnv']
 
 /** Defaults used when the config leaves the env name empty. */
@@ -59,26 +59,17 @@ function readJson (req) {
 }
 
 /**
- * Reject cross-site callers. Any page in the browser could otherwise POST to
- * 127.0.0.1:<port> and rewrite the config — a plain form post needs no
- * preflight, so the endpoint has to check for itself.
+ * Reject cross-site callers. `Sec-Fetch-Site` is the reliable signal; the
+ * `Origin` equality check is deliberately gone because a reverse proxy or an
+ * alias host (localhost vs 127.0.0.1) makes it false-positive and blocks the
+ * save button.
  */
 function sameOriginOnly (request, response) {
   const site = request.headers['sec-fetch-site']
-  if (site !== undefined && site !== 'same-origin' && site !== 'none') {
-    sendJson(response, 403, { ok: false, error: '只接受同源请求' })
-    return false
-  }
-  const origin = request.headers.origin
-  if (origin !== undefined) {
-    let originHost
-    try { originHost = new URL(origin).host } catch { originHost = undefined }
-    if (originHost !== request.headers.host) {
-      sendJson(response, 403, { ok: false, error: '只接受同源请求' })
-      return false
-    }
-  }
-  return true
+  if (site === undefined || site === 'none') return true
+  if (site === 'same-origin' || site === 'same-site') return true
+  sendJson(response, 403, { ok: false, error: '只接受同源请求' })
+  return false
 }
 
 /** Keep only known fields, and coerce the numeric ones. */
@@ -174,8 +165,10 @@ export function registerSettingsRoute (ctx, config, version) {
         // page never edited — including a stored key — survives the write.
         let saved = null
         await editor.edit(entry, (current) => {
-          const nextTts = { ...(current.tts ?? {}), ...tts }
-          const nextCheck = { ...(current.check ?? {}), ...check }
+          // Rebuild from the schema-known fields only: a key the schema no longer
+          // declares (say, a removed field) must not survive in the stored row.
+          const nextTts = { ...pickFields(current.tts ?? {}, TTS_FIELDS, ['speed', 'pitch', 'sampleRate']), ...tts }
+          const nextCheck = { ...pickFields(current.check ?? {}, CHECK_FIELDS, []), ...check }
           saved = { tts: nextTts, check: nextCheck }
           return { ...current, tts: nextTts, check: nextCheck }
         })

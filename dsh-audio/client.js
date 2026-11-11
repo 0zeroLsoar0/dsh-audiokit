@@ -177,19 +177,7 @@ window.__ModuleLoader__.load({
       { value: 'none', label: '关闭' }
     ]
 
-    const EMOTIONS = [
-      { value: 'auto', label: '自动（按文本决定）' },
-      { value: 'happy', label: '开心' },
-      { value: 'sad', label: '悲伤' },
-      { value: 'angry', label: '生气' },
-      { value: 'fearful', label: '恐惧' },
-      { value: 'surprised', label: '惊讶' },
-      { value: 'calm', label: '平静' },
-      { value: 'fluent', label: '流畅' },
-      { value: 'whisper', label: '耳语' }
-    ]
-
-    const TTS_KEYS = ['provider', 'baseUrl', 'model', 'voice', 'emotion', 'speed', 'pitch']
+    const TTS_KEYS = ['provider', 'baseUrl', 'model', 'voice', 'speed', 'pitch']
     const CHECK_KEYS = ['provider', 'baseUrl', 'model']
 
     function pick (source, keys) {
@@ -272,38 +260,70 @@ window.__ModuleLoader__.load({
         setStatus(null)
       }
 
+      // The config editor restarts the plugin to apply a write, so the endpoint
+      // goes away for a moment. Poll it instead of guessing a delay, and keep the
+      // button out of a "did nothing" state by always writing a status line.
+      const waitForRestart = (attempt) => {
+        const tries = attempt ?? 0
+        fetch('/dsh-audio/config', { headers: { accept: 'application/json' } })
+          .then(async (response) => {
+            if (!response.ok) throw new Error(`HTTP ${response.status}`)
+            const body = JSON.parse(await response.text())
+            if (body.ok !== true) throw new Error(body.error ?? 'not ready')
+            setConfig(body.config)
+            setSaving(false)
+            setStatus('已生效')
+          })
+          .catch(() => {
+            if (tries >= 20) {
+              setSaving(false)
+              setStatus('已保存，但页面没等到插件重启；刷新一下确认')
+              return
+            }
+            setTimeout(() => waitForRestart(tries + 1), 700)
+          })
+      }
+
       const save = () => {
         setSaving(true)
-        setStatus(null)
+        setStatus('保存中…')
         setError(null)
-        const payload = {
-          tts: pick(config.tts ?? {}, TTS_KEYS),
-          check: pick(config.check ?? {}, CHECK_KEYS)
-        }
-        // Only send a key the user actually touched, so an untouched field does
-        // not overwrite a stored key with an empty string.
-        if (dirty.tts) payload.tts.apiKey = keys.tts.trim()
-        if (dirty.check) payload.check.apiKey = keys.check.trim()
+        try {
+          const payload = {
+            tts: pick(config.tts ?? {}, TTS_KEYS),
+            check: pick(config.check ?? {}, CHECK_KEYS)
+          }
+          // Only send a key the user actually touched, so an untouched field does
+          // not overwrite a stored key with an empty string.
+          if (dirty.tts) payload.tts.apiKey = keys.tts.trim()
+          if (dirty.check) payload.check.apiKey = keys.check.trim()
 
-        fetch('/dsh-audio/config', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(payload)
-        })
-          .then(async (response) => {
-            const text = await response.text()
-            if (text.length === 0) throw new Error(`接口还没就绪（HTTP ${response.status}）`)
-            let body
-            try { body = JSON.parse(text) } catch { throw new Error(`接口返回的不是 JSON（HTTP ${response.status}）`) }
-            if (!response.ok || body.ok !== true) throw new Error(body.error ?? '保存失败')
-            setStatus('已保存，插件正在重启以应用新配置（几秒后生效）')
-            setDirty({ tts: false, check: false })
-            setKeys({ tts: '', check: '' })
-            if (body.config !== undefined && body.config !== null) setConfig(body.config)
-            setTimeout(() => load(0), 3200)
+          fetch('/dsh-audio/config', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(payload)
           })
-          .catch((cause) => setError(cause.message))
-          .finally(() => setSaving(false))
+            .then(async (response) => {
+              const text = await response.text()
+              if (text.length === 0) throw new Error(`接口还没就绪（HTTP ${response.status}）`)
+              let body
+              try { body = JSON.parse(text) } catch { throw new Error(`接口返回的不是 JSON（HTTP ${response.status}）`) }
+              if (!response.ok || body.ok !== true) throw new Error(body.error ?? '保存失败')
+              setDirty({ tts: false, check: false })
+              setKeys({ tts: '', check: '' })
+              setStatus('已保存，等待插件重启…')
+              waitForRestart(0)
+            })
+            .catch((cause) => {
+              setSaving(false)
+              setError(cause.message)
+              setStatus(null)
+            })
+        } catch (cause) {
+          setSaving(false)
+          setError(cause.message)
+          setStatus(null)
+        }
       }
 
       const runTest = (target) => {
@@ -393,12 +413,6 @@ window.__ModuleLoader__.load({
               onChange: (value) => patch('tts', 'voice', value)
             }),
             h(Text, { value: tts.voice, placeholder: '也可以直接填音色 id', onChange: (value) => patch('tts', 'voice', value) })),
-          h(Row, { label: '情感' },
-            h(Dropdown, {
-              value: tts.emotion ?? 'auto',
-              options: EMOTIONS,
-              onChange: (value) => patch('tts', 'emotion', value)
-            })),
           h(Row, { label: '语速', desc: '0.5 – 2.0' },
             h(NumberField, { value: tts.speed, min: 0.5, max: 2, step: 0.05, onChange: (value) => patch('tts', 'speed', value) })),
           h(Row, { label: '音调', desc: '半音，−12 – 12' },

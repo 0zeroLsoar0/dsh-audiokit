@@ -13,14 +13,13 @@
           baseUrl: https://api.minimax.chat
           model: speech-2.8-hd
           voice: female-shaonv
-          emotion: auto
           apiKeyEnv: MINIMAX_API_KEY
           # groupId: ''      # only the legacy T2A endpoint needs this
           # apiKey: ''       # prefer the settings page or the env var
         check:
-          # OpenAI-compatible audio-input endpoint (Qwen-Omni and friends).
-          # MiniMax has no audio-understanding endpoint.
+          # OpenAI-compatible audio-input endpoint. qwen2.5-omni-7b is the small
+          # omni model; if your account exposes another id, type it in Settings.
           provider: openai
           baseUrl: https://dashscope.aliyuncs.com/compatible-mode
-          model: qwen3-omni-flash
+          model: qwen2.5-omni-7b
           apiKeyEnv: DASHSCOPE_API_KEY

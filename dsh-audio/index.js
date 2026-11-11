@@ -23,7 +23,7 @@ import { registerTtsTool, registerVoicesTool } from './lib/tts.js'
 export const name = 'dsh-audio'
 
 /** Shown by the settings page; keep in sync with package.json. */
-const VERSION = '0.5.2'
+const VERSION = '0.5.3'
 
 /** The tool registry is required; the other seams are used when present. */
 export const inject = ['tools']
@@ -39,8 +39,6 @@ export const Config = z.object({
       .description('要手动控制情感时改用 speech-2.6-hd'),
     voice: z.string().default('female-shaonv')
       .description('音色 id；设置页会列出账号可用的实时音色'),
-    emotion: z.string().default('auto')
-      .description('auto 由模型按文本自选；也可填 happy / sad / angry / fearful / surprised / calm / fluent / whisper'),
     speed: z.number().min(0.5).max(2).default(1).description('语速 0.5–2.0'),
     pitch: z.number().min(-12).max(12).default(0).description('音调偏移，单位半音，−12–12'),
     sampleRate: z.number().min(8000).max(48000).default(32000).description('输出采样率，MiniMax 默认 32000'),

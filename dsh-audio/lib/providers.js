@@ -30,11 +30,8 @@ export const OPENAI_TTS_DEFAULTS = {
 
 export const CHAT_AUDIO_DEFAULTS = {
   baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode',
-  model: 'qwen3-omni-flash'
+  model: 'qwen2.5-omni-7b'
 }
-
-/** MiniMax emotions. `auto` lets the model pick from the text. */
-export const EMOTIONS = ['auto', 'happy', 'sad', 'angry', 'fearful', 'surprised', 'calm', 'fluent', 'whisper']
 
 /**
  * A curated voice subset, so the model picks real ids instead of inventing one.
@@ -262,7 +259,6 @@ async function minimaxSpeech (config, text, options = {}) {
   const sampleRate = Math.round(options.sampleRate ?? config.sampleRate ?? MINIMAX_DEFAULTS.sampleRate)
   const model = options.model ?? config.model ?? MINIMAX_DEFAULTS.model
   const voice = options.voice ?? config.voice ?? MINIMAX_DEFAULTS.voice
-  const emotion = options.emotion ?? config.emotion ?? 'auto'
   const speed = Number(options.speed ?? config.speed ?? 1)
   const pitch = Number(options.pitch ?? config.pitch ?? 0)
   const subtitle = options.subtitle ?? config.subtitle ?? true
@@ -277,7 +273,6 @@ async function minimaxSpeech (config, text, options = {}) {
     voice_setting: { voice_id: voice, speed, vol: Number(options.volume ?? config.volume ?? 1), pitch },
     audio_setting: { sample_rate: sampleRate, bitrate: 128000, format: 'pcm', channel: 1 }
   }
-  if (emotion !== 'auto') body.voice_setting.emotion = emotion
   if (subtitle) {
     body.subtitle_enable = true
     body.subtitle_type = subtitleType
@@ -300,7 +295,6 @@ async function minimaxSpeech (config, text, options = {}) {
       host: new URL(url).host,
       model,
       voice,
-      emotion,
       speed,
       pitch,
       sampleRate,

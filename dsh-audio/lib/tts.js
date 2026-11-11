@@ -18,7 +18,7 @@ import {
   toWavBytes,
   writeFileAtomic
 } from './audio.js'
-import { EMOTIONS, VOICE_CATALOG, listVoices, speak } from './providers.js'
+import { VOICE_CATALOG, listVoices, speak } from './providers.js'
 
 const MAX_TEXT = 8000
 const CHUNK = 600
@@ -112,12 +112,11 @@ export function registerTtsTool (ctx, config = {}) {
       properties: {
         text: { type: 'string', description: 'What to say (≤8000 chars; longer scripts are split at sentence boundaries). Supports MiniMax inline pauses: <#1.5#> for a 1.5 s pause.' },
         voice: { type: 'string', description: `Voice id. Shortlist: ${VOICE_CATALOG.map((voice) => voice.id).join(', ')}. Any other id from the MiniMax console also works; call audio_voices to see the shortlist with descriptions.` },
-        emotion: { type: 'string', enum: EMOTIONS, description: 'Emotion. "auto" lets the model decide from the text, which is usually better than forcing one. Ignored by non-MiniMax providers.' },
         speed: { type: 'number', description: 'Speaking rate, 0.5..2.0. Defaults to 1.' },
         pitch: { type: 'number', description: 'Pitch shift in semitones, -12..12. Defaults to 0.' },
         subtitle: { type: 'boolean', description: 'Ask the provider for timestamps. Defaults to true; the result says whether any came back.' },
         subtitleType: { type: 'string', enum: ['sentence', 'word'], description: 'Timestamp granularity to request. Word level is finer but not every model or endpoint returns it — check the result before relying on it.' },
-        model: { type: 'string', description: 'Provider model. Defaults to speech-2.8-hd (best quality, auto emotion). Use speech-2.6-hd when you need manual emotion control with lower latency.' },
+        model: { type: 'string', description: 'Provider model. Defaults to speech-2.8-hd.' },
         gapSeconds: { type: 'number', description: 'Silence inserted between chunks of a long script; defaults to 0.15.' },
         sampleRate: { type: 'integer', description: 'Output rate; defaults to the provider setting (MiniMax 32000).' },
         srt: { type: 'boolean', description: 'Also write an .srt subtitle file next to the wav when the provider returned timestamps. Defaults to false.' },
@@ -145,7 +144,6 @@ export function registerTtsTool (ctx, config = {}) {
         rendered.push(await speak(ttsConfig, chunk, {
           voice: args.voice,
           model: args.model,
-          emotion: args.emotion,
           speed,
           pitch,
           subtitle: args.subtitle !== false,
@@ -188,7 +186,6 @@ export function registerTtsTool (ctx, config = {}) {
         text,
         voice: args.voice ?? ttsConfig.voice,
         model: args.model ?? ttsConfig.model,
-        emotion: args.emotion ?? ttsConfig.emotion,
         speed,
         pitch,
         subtitleType: args.subtitleType ?? ttsConfig.subtitleType,
@@ -221,7 +218,7 @@ export function registerTtsTool (ctx, config = {}) {
         srtPath === null
           ? (args.srt === true ? 'SRT：未生成（没有时间戳）' : 'SRT：未要求')
           : `SRT：${displayPath(cwd, srtPath)}`,
-        `生效参数：${effective.provider} · ${effective.model} · ${effective.voice} · emotion=${effective.emotion ?? '-'} · speed=${effective.speed ?? 1} · pitch=${effective.pitch ?? 0}`
+        `生效参数：${effective.provider} · ${effective.model} · ${effective.voice} · speed=${effective.speed ?? 1} · pitch=${effective.pitch ?? 0}`
       ].join('\n')
 
       return {
