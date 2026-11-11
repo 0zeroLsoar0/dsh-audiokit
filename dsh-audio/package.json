@@ -1,8 +1,9 @@
 {
   "name": "@local/dsh-audio",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "Sound effects for HTML animation: a deterministic synthesizer exposed as DSH tools, plus the workflow skill that makes an agent actually use it.",
   "license": "MIT",
+  "author": "Soar_L",
   "type": "module",
   "icon": "./icon.svg",
   "exports": {

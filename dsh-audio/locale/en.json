@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Sound for animation",
-    "description": "Synthesizes sound effects, event trains and ambience into wav files, with measurements the agent can verify without listening."
+    "title": "Sound",
+    "description": "Synthesizes sound effects, event trains, ambience and narration for HTML animation, with measurements the agent can verify without listening."
   }
 }
