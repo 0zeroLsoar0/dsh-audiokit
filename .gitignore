@@ -1,0 +1,14 @@
+# 只跟踪这个项目本身，工作区里其他目录（其他会话的产物）不进仓库。
+
+/*
+!/.gitignore
+!/CHANGELOG.md
+!/dsh-audio/
+!/demo/
+
+# 依赖与生成物
+dsh-audio/node_modules/
+dsh-audio/test/out/
+*.tgz
+*.log
+.DS_Store

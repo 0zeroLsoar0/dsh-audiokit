@@ -1,0 +1,25 @@
+# dsh-audio bundle: registers the sound-for-animation tools and skill.
+#
+# Providers are optional — the synthesizer, mixing and the technical half of
+# audio_check work with no key at all. Fill these in to enable speech and the
+# semantic half of the check.
+- insert:
+    - id: dsh-audio
+      name: '@local/dsh-audio'
+      config:
+        tts:
+          # minimax (default) | openai | custom | none
+          provider: minimax
+          baseUrl: https://api.minimax.chat
+          model: speech-2.8-hd
+          voice: female-shaonv
+          emotion: auto
+          apiKeyEnv: MINIMAX_API_KEY
+          # groupId: ''            # 旧版 T2A 需要；新接口留空
+          # apiKey: ''             # 不推荐，优先用 apiKeyEnv
+        check:
+          # OpenAI 兼容的音频输入端点（Qwen-Omni 等）。没有 MiniMax 侧的音频理解能力。
+          provider: openai
+          baseUrl: https://dashscope.aliyuncs.com/compatible-mode
+          model: qwen3-omni-flash
+          apiKeyEnv: DASHSCOPE_API_KEY
