@@ -23,7 +23,7 @@ import { registerTtsTool, registerVoicesTool } from './lib/tts.js'
 export const name = 'dsh-audio'
 
 /** Shown by the settings page; keep in sync with package.json. */
-const VERSION = '0.5.3'
+const VERSION = '0.5.4'
 
 /** The tool registry is required; the other seams are used when present. */
 export const inject = ['tools']

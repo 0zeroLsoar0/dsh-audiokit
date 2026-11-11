@@ -20,6 +20,7 @@ window.__ModuleLoader__.load({
 
     const TOKEN = {
       bg: 'var(--dsw-alias-bg-layer-1, transparent)',
+      layer2: 'var(--dsw-alias-bg-layer-2, rgba(127,127,127,.16))',
       overlay: 'var(--dsw-alias-bg-overlay, #1b2740)',
       border: 'var(--dsw-alias-border-l1, rgba(127,127,127,.28))',
       borderStrong: 'var(--dsw-alias-border-l2, rgba(127,127,127,.45))',
@@ -66,9 +67,13 @@ window.__ModuleLoader__.load({
       option: { padding: '7px 10px', borderRadius: 7, cursor: 'pointer', fontSize: 12.5 },
       chevron: { opacity: 0.55, fontSize: 10 },
       footer: { display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginTop: 18 },
+      // Neutral filled button: never hard-code white text or use the brand color
+      // as a background — a light-theme brand tint plus white text renders as a
+      // blank white pill.
       primary: {
-        padding: '8px 18px', fontSize: 12.5, color: '#fff', background: TOKEN.brand,
-        border: `1px solid ${TOKEN.brand}`, borderRadius: 8, cursor: 'pointer', font: 'inherit', fontWeight: 600
+        padding: '8px 18px', fontSize: 12.5, color: TOKEN.text, background: TOKEN.layer2,
+        border: `1px solid ${TOKEN.borderStrong}`, borderRadius: 8, cursor: 'pointer',
+        font: 'inherit', fontWeight: 600
       },
       secondary: {
         padding: '8px 18px', fontSize: 12.5, color: TOKEN.text, background: TOKEN.bg,
@@ -446,8 +451,13 @@ window.__ModuleLoader__.load({
             }, testing === 'check' ? '测试中…' : '试听并识别'))),
 
         h('div', { style: S.footer },
-          h('button', { style: saving ? { ...S.primary, opacity: 0.6 } : S.primary, disabled: saving, onClick: save },
-            saving ? '保存中…' : '保存'),
+          h('button', {
+            style: saving ? { ...S.primary, opacity: 0.6 } : S.primary,
+            disabled: saving,
+            onClick: save,
+            onMouseEnter: (event) => { if (!saving) event.currentTarget.style.background = 'rgba(127,127,127,0.28)' },
+            onMouseLeave: (event) => { event.currentTarget.style.background = TOKEN.layer2 }
+          }, saving ? '保存中…' : '保存'),
           h('button', { style: S.secondary, onClick: () => load(0), disabled: saving }, '重新读取'),
           status !== null ? h('span', { style: S.ok }, status) : null,
           error !== null ? h('span', { style: S.bad }, error) : null)
