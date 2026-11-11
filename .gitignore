@@ -5,6 +5,7 @@
 !/CHANGELOG.md
 !/dsh-audio/
 !/demo/
+!/versions/
 
 # 依赖与生成物
 dsh-audio/node_modules/
@@ -12,3 +13,6 @@ dsh-audio/test/out/
 *.tgz
 *.log
 .DS_Store
+
+# 但 0.1.0 重建快照的 tgz 是这份留档的一部分
+!versions/0.1.0-reconstructed/dist/*.tgz

@@ -169,6 +169,10 @@ export function registerTtsTool (ctx, config = {}) {
         voice: args.voice ?? ttsConfig.voice,
         model: args.model ?? ttsConfig.model,
         emotion: args.emotion ?? ttsConfig.emotion,
+        speed,
+        pitch,
+        subtitleType: args.subtitleType ?? ttsConfig.subtitleType,
+        sampleRate: args.sampleRate ?? ttsConfig.sampleRate,
         provider: ttsConfig.provider ?? 'minimax'
       })
       const target = resolvePath(cwd, args.out) ?? defaultOutputPath(cwd, 'voice', hash)

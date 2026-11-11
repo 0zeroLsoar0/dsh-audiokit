@@ -1,0 +1,48 @@
+{
+  "name": "@local/dsh-audio",
+  "version": "0.1.0",
+  "description": "Sound effects for HTML animation: a deterministic synthesizer exposed as DSH tools, plus the workflow skill that makes an agent actually use it.",
+  "license": "MIT",
+  "type": "module",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib/*.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/smoke.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "dsh-bundle",
+    "audio",
+    "synthesizer",
+    "sound-effects",
+    "animation",
+    "html"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

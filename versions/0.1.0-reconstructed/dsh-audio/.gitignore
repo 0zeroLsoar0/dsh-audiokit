@@ -1,0 +1,9 @@
+node_modules/
+*.tgz
+*.log
+.DS_Store
+test/out/
+
+# 渲染产物与演示素材：可由脚本重建
+demo/assets/audio/*.wav
+demo/*.bundle.html

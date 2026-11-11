@@ -24,7 +24,7 @@ import { registerTtsTool, registerVoicesTool } from './lib/tts.js'
 export const name = 'dsh-audio'
 
 /** Shown by the settings page; keep in sync with package.json. */
-const VERSION = '0.5.0'
+const VERSION = '0.5.1'
 
 /** The tool registry is required; the other seams are used when present. */
 export const inject = ['tools']
@@ -46,13 +46,15 @@ export const Config = z.object({
     pitch: z.number().min(-12).max(12).default(0).description('音调偏移，单位半音，−12–12'),
     sampleRate: z.number().min(8000).max(48000).default(32000).description('输出采样率，MiniMax 默认 32000'),
     groupId: z.string().default('').description('旧版 T2A 需要；新接口留空'),
-    apiKeyEnv: z.string().default('MINIMAX_API_KEY').description('从这个环境变量读密钥（推荐）')
+    apiKey: z.string().default('').description('直接填密钥。留空则读下面的环境变量'),
+    apiKeyEnv: z.string().default('MINIMAX_API_KEY').description('留空时默认检测 MINIMAX_API_KEY')
   }),
   check: z.object({
     provider: z.string().default('openai').description('音频理解走 OpenAI 兼容端点（MiniMax 没有对应能力）'),
     baseUrl: z.string().default('https://dashscope.aliyuncs.com/compatible-mode').description('Qwen-Omni 等支持 input_audio 的端点'),
     model: z.string().default('qwen3-omni-flash'),
-    apiKeyEnv: z.string().default('DASHSCOPE_API_KEY').description('从这个环境变量读密钥')
+    apiKey: z.string().default('').description('直接填密钥。留空则读下面的环境变量'),
+    apiKeyEnv: z.string().default('DASHSCOPE_API_KEY').description('留空时默认检测 DASHSCOPE_API_KEY')
   })
 })
 

@@ -1,0 +1,5 @@
+# dsh-audio bundle: registers the sound-for-animation tools and skill.
+- insert:
+    - id: dsh-audio
+      name: '@local/dsh-audio'
+      config: {}

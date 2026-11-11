@@ -53,7 +53,7 @@ function fractionBelow (samples, sampleRate, thresholdDb = SILENT_PEAK_DB) {
   return samples.length === 0 ? 1 : quiet / samples.length
 }
 
-function inspectFile (cwd, path, expectDuration, issues) {
+function inspectFile (cwd, path, expectDuration, issues, trackCache) {
   const label = displayPath(cwd, path)
   const track = trackCache.get(path)
   const metrics = { ...measure(track.samples, track.sampleRate), sampleRate: track.sampleRate }
@@ -72,8 +72,6 @@ function inspectFile (cwd, path, expectDuration, issues) {
 
   return { path, label, metrics, attack }
 }
-
-const trackCache = new Map()
 
 /** Register the `audio_check` tool. */
 export function registerCheckTool (ctx, config = {}) {
@@ -110,7 +108,9 @@ export function registerCheckTool (ctx, config = {}) {
     async execute (args, exec) {
       const cwd = sessionCwd(ctx, exec)
       const issues = []
-      trackCache.clear()
+      // Per-call cache: a module-level one would be cleared by a concurrent
+      // call from another sub-agent while this one is still folding.
+      const trackCache = new Map()
       const files = []
       const seen = new Set()
       const paths = Array.isArray(args.paths) ? args.paths : []
@@ -124,7 +124,7 @@ export function registerCheckTool (ctx, config = {}) {
         try {
           const track = await readTrack(path)
           trackCache.set(path, track)
-          files.push(inspectFile(cwd, path, paths.length === 1 ? args.expectDuration : undefined, issues))
+          files.push(inspectFile(cwd, path, paths.length === 1 ? args.expectDuration : undefined, issues, trackCache))
         } catch (error) {
           issues.push({ level: 'error', target: displayPath(cwd, path), message: `读不出来：${error.message}` })
         }
@@ -147,7 +147,7 @@ export function registerCheckTool (ctx, config = {}) {
             if (!trackCache.has(path)) trackCache.set(path, await readTrack(path))
             const track = trackCache.get(path)
             if (!files.some((file) => file.path === path)) {
-              files.push(inspectFile(cwd, path, undefined, issues))
+              files.push(inspectFile(cwd, path, undefined, issues, trackCache))
             }
             const metrics = measure(track.samples, track.sampleRate)
             if (metrics.peakDbfs <= SILENT_PEAK_DB) {

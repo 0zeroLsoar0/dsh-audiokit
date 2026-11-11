@@ -2,24 +2,27 @@
  * Host side of the settings page.
  *
  * Two endpoints on the browser HTTP carrier:
- *   GET  /dsh-audio/config  → the resolved config the running plugin actually
- *                             uses (defaults included, not the raw patch);
+ *   GET  /dsh-audio/config  → the config the running plugin actually uses, with
+ *                             the API key reduced to "is it set" flags;
  *   POST /dsh-audio/config  → merge a patch and persist it through the config
  *                             editor, which writes the user's profile layer.
  *
- * Writing through the config editor (rather than editing the patch file) keeps
- * the user's comments and other plugins' rows intact, and it makes the change
- * survive plugin upgrades.
+ * Key handling follows the DSH convention the user asked for: leave the key
+ * field empty and the provider reads its default environment variable; type
+ * something and that value *is* the key. A stored key is never echoed back to
+ * the page — only whether one exists.
  *
- * The route is registered inside `ctx.effect` so it is disposed with the
- * plugin: an un-owned route outlives a reload and the next activation dies on
- * "duplicate exact route".
+ * The route is registered inside `ctx.inject(['webServer'], …)` because on a
+ * cold boot this plugin can activate before the HTTP carrier is mounted.
  */
 
 const MAX_BODY = 64 * 1024
 
-const TTS_FIELDS = ['provider', 'baseUrl', 'model', 'voice', 'emotion', 'speed', 'pitch', 'sampleRate', 'groupId', 'apiKeyEnv']
-const CHECK_FIELDS = ['provider', 'baseUrl', 'model', 'apiKeyEnv']
+const TTS_FIELDS = ['provider', 'baseUrl', 'model', 'voice', 'emotion', 'speed', 'pitch', 'sampleRate', 'groupId', 'apiKey', 'apiKeyEnv']
+const CHECK_FIELDS = ['provider', 'baseUrl', 'model', 'apiKey', 'apiKeyEnv']
+
+/** Defaults used when the config leaves the env name empty. */
+const DEFAULT_ENV = { tts: 'MINIMAX_API_KEY', check: 'DASHSCOPE_API_KEY' }
 
 function sendJson (res, status, payload) {
   const body = JSON.stringify(payload)
@@ -65,8 +68,8 @@ function pickFields (source, fields, numeric) {
       if (!Number.isFinite(number)) throw new Error(`${field} 必须是数字`)
       out[field] = number
     } else {
-      if (typeof value !== 'string') throw new Error(`${field} 必须是字符串`)
-      out[field] = value.trim()
+      if (value !== null && typeof value !== 'string') throw new Error(`${field} 必须是字符串`)
+      out[field] = (value ?? '').trim()
     }
   }
   return out
@@ -83,14 +86,20 @@ function validate (section) {
   return section
 }
 
+/** One section as the page sees it: values minus the key, plus key/env facts. */
+function presentSection (section, defaultEnv) {
+  const { apiKey, apiKeyEnv, ...rest } = section ?? {}
+  const envName = (typeof apiKeyEnv === 'string' && apiKeyEnv.trim().length > 0) ? apiKeyEnv.trim() : defaultEnv
+  return {
+    ...rest,
+    keySet: typeof apiKey === 'string' && apiKey.trim().length > 0,
+    envName,
+    envPresent: typeof process.env[envName] === 'string' && process.env[envName].trim().length > 0
+  }
+}
+
 /**
  * Register the settings endpoints.
- *
- * Waits for the `webServer` service instead of reading it eagerly: on a cold
- * boot this plugin may activate before the HTTP carrier is mounted, and an
- * eager `ctx.get('webServer')` would silently return undefined and leave the
- * page fetching a 404.
- *
  * @param {object} ctx - plugin context.
  * @param {object} config - resolved config captured at activation.
  * @param {string} version - plugin version, echoed to the page.
@@ -98,8 +107,8 @@ function validate (section) {
  */
 export function registerSettingsRoute (ctx, config, version) {
   const snapshot = () => ({
-    tts: { ...(config.tts ?? {}) },
-    check: { ...(config.check ?? {}) }
+    tts: presentSection(config.tts, DEFAULT_ENV.tts),
+    check: presentSection(config.check, DEFAULT_ENV.check)
   })
 
   ctx.inject(['webServer'], (child) => {
@@ -109,6 +118,24 @@ export function registerSettingsRoute (ctx, config, version) {
       path: '/dsh-audio/config',
       handler: async (request, response) => {
         try {
+          // Same-origin only: any page open in the browser could otherwise POST
+          // to 127.0.0.1:<port> and rewrite the config (a plain form post needs
+          // no preflight, so the endpoint has to check for itself).
+          const site = request.headers['sec-fetch-site']
+          if (site !== undefined && site !== 'same-origin' && site !== 'none') {
+            sendJson(response, 403, { ok: false, error: '只接受同源请求' })
+            return
+          }
+          const origin = request.headers.origin
+          if (origin !== undefined) {
+            let originHost
+            try { originHost = new URL(origin).host } catch { originHost = undefined }
+            if (originHost !== request.headers.host) {
+              sendJson(response, 403, { ok: false, error: '只接受同源请求' })
+              return
+            }
+          }
+
           if (request.method === 'GET') {
             sendJson(response, 200, { ok: true, version, config: snapshot() })
             return
@@ -126,18 +153,21 @@ export function registerSettingsRoute (ctx, config, version) {
             return
           }
 
-          const next = { ...snapshot() }
           const tts = pickFields(body.tts, TTS_FIELDS, ['speed', 'pitch', 'sampleRate'])
           const check = pickFields(body.check, CHECK_FIELDS, [])
-          if (Object.keys(tts).length > 0) next.tts = { ...next.tts, ...tts }
-          if (Object.keys(check).length > 0) next.check = { ...next.check, ...check }
-
-          await editor.edit(entry, (current) => ({
-            ...current,
-            tts: next.tts,
-            check: next.check
-          }))
-          sendJson(response, 200, { ok: true, config: next, restarting: true })
+          // Merge into what is stored (not into the redacted view), so a field
+          // the page never edited — including a stored key — survives the write.
+          let saved = null
+          await editor.edit(entry, (current) => {
+            const nextTts = { ...(current.tts ?? {}), ...tts }
+            const nextCheck = { ...(current.check ?? {}), ...check }
+            saved = { tts: nextTts, check: nextCheck }
+            return { ...current, tts: nextTts, check: nextCheck }
+          })
+          sendJson(response, 200, { ok: true, restarting: true, config: saved === null ? null : {
+            tts: presentSection(saved.tts, DEFAULT_ENV.tts),
+            check: presentSection(saved.check, DEFAULT_ENV.check)
+          } })
         } catch (error) {
           sendJson(response, 400, { ok: false, error: error?.message ?? String(error) })
         }
