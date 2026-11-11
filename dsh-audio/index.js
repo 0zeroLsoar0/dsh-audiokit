@@ -4,13 +4,12 @@
  * The plugin owns exactly one seam: audio in, audio out. It renders files and
  * reports measurements; how the page consumes them is the animation author's
  * business. That is why there is no HTML writer, no bundler and no runtime in
- * this package — only tools, a workflow skill, and a short standing instruction
- * that makes the capability discoverable.
+ * this package — only tools, a workflow skill, a settings page and a short
+ * standing instruction that makes the capability discoverable.
  *
- * `Config` is the settings surface: the Host projects a declared Config schema
- * into an editable form under Settings → Plugins, and the same values reach
- * `apply` resolved (defaults filled in). Nothing here calls `settings.configure`
- * because the default automatic-page policy is already what we want.
+ * `Config` is the settings schema: the settings page writes through the config
+ * editor into the user's profile layer, and the same values reach `apply`
+ * resolved (defaults filled in).
  */
 
 import z from '@deepseek-ai/schemastery'
@@ -24,22 +23,22 @@ import { registerTtsTool, registerVoicesTool } from './lib/tts.js'
 export const name = 'dsh-audio'
 
 /** Shown by the settings page; keep in sync with package.json. */
-const VERSION = '0.5.1'
+const VERSION = '0.5.2'
 
 /** The tool registry is required; the other seams are used when present. */
 export const inject = ['tools']
 
-/** Settings form projected by the Host settings service. */
+/** Settings schema projected into the page's form and used to validate writes. */
 export const Config = z.object({
   tts: z.object({
     provider: z.string().default('minimax')
-      .description('minimax（默认）/ openai / custom（任何兼容 /v1/audio/speech 的端点）/ none（关闭）'),
+      .description('minimax / openai / custom（任何兼容 /v1/audio/speech 的端点）/ none（关闭）'),
     baseUrl: z.string().default('https://api.minimax.chat')
       .description('MiniMax 国内站；海外站换成 https://api.minimaxi.com'),
     model: z.string().default('speech-2.8-hd')
       .description('要手动控制情感时改用 speech-2.6-hd'),
     voice: z.string().default('female-shaonv')
-      .description('音色 id；agent 侧可用 audio_voices 查短名单'),
+      .description('音色 id；设置页会列出账号可用的实时音色'),
     emotion: z.string().default('auto')
       .description('auto 由模型按文本自选；也可填 happy / sad / angry / fearful / surprised / calm / fluent / whisper'),
     speed: z.number().min(0.5).max(2).default(1).description('语速 0.5–2.0'),
@@ -74,18 +73,16 @@ const PROMPT_SECTION = [
 ].join('\n')
 
 /**
- * Wire the tools, the workflow skill and the standing instruction.
+ * Wire the tools, the workflow skill, the settings endpoints and the standing
+ * instruction.
  * @param {object} ctx - registrant context.
  * @param {object} [config] - resolved Config: `tts` and `check` provider settings.
  */
 export function apply (ctx, config = {}) {
   registerTools(ctx)
   registerTtsTool(ctx, config)
-  registerVoicesTool(ctx)
+  registerVoicesTool(ctx, config)
   registerCheckTool(ctx, config)
-
-  // The settings page's read/write endpoints. Registered only when the profile
-  // mounts the browser HTTP carrier; a headless composition simply skips it.
   registerSettingsRoute(ctx, config, VERSION)
 
   // Optional seams: resolved through `ctx.get` so the plugin still activates in

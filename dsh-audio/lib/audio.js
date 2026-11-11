@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Rendering orchestration: turn a declarative request into samples, measure
  * what came out, and put it on disk atomically.
  *

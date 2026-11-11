@@ -1,20 +1,22 @@
 /**
  * Host side of the settings page.
  *
- * Two endpoints on the browser HTTP carrier:
- *   GET  /dsh-audio/config  → the config the running plugin actually uses, with
- *                             the API key reduced to "is it set" flags;
- *   POST /dsh-audio/config  → merge a patch and persist it through the config
- *                             editor, which writes the user's profile layer.
+ * Four endpoints on the browser HTTP carrier, all same-origin only:
+ *   GET  /dsh-audio/config  → config the running plugin uses; API keys reduced
+ *                             to "is it set" flags, never echoed back;
+ *   POST /dsh-audio/config  → merge a patch and persist it via the config editor;
+ *   POST /dsh-audio/test    → really talk to the provider (synthesize a sentence,
+ *                             or describe a sample) and return the audio so the
+ *                             page can play what it just produced;
+ *   POST /dsh-audio/voices  → ask MiniMax for the account's system voices, and
+ *                             fall back to the static shortlist with a marker.
  *
- * Key handling follows the DSH convention the user asked for: leave the key
- * field empty and the provider reads its default environment variable; type
- * something and that value *is* the key. A stored key is never echoed back to
- * the page — only whether one exists.
- *
- * The route is registered inside `ctx.inject(['webServer'], …)` because on a
- * cold boot this plugin can activate before the HTTP carrier is mounted.
+ * Routes are registered inside `ctx.inject(['webServer'], …)`: on a cold boot
+ * this plugin can activate before the HTTP carrier is mounted.
  */
+
+import { finalize, renderPreset, toWavBytes } from './audio.js'
+import { describeAudio, listVoices, speak } from './providers.js'
 
 const MAX_BODY = 64 * 1024
 
@@ -54,6 +56,29 @@ function readJson (req) {
     })
     req.on('error', reject)
   })
+}
+
+/**
+ * Reject cross-site callers. Any page in the browser could otherwise POST to
+ * 127.0.0.1:<port> and rewrite the config — a plain form post needs no
+ * preflight, so the endpoint has to check for itself.
+ */
+function sameOriginOnly (request, response) {
+  const site = request.headers['sec-fetch-site']
+  if (site !== undefined && site !== 'same-origin' && site !== 'none') {
+    sendJson(response, 403, { ok: false, error: '只接受同源请求' })
+    return false
+  }
+  const origin = request.headers.origin
+  if (origin !== undefined) {
+    let originHost
+    try { originHost = new URL(origin).host } catch { originHost = undefined }
+    if (originHost !== request.headers.host) {
+      sendJson(response, 403, { ok: false, error: '只接受同源请求' })
+      return false
+    }
+  }
+  return true
 }
 
 /** Keep only known fields, and coerce the numeric ones. */
@@ -98,6 +123,13 @@ function presentSection (section, defaultEnv) {
   }
 }
 
+/** A short chime used as the sample for "test the audio-understanding endpoint". */
+function sampleWav (seconds = 0.6) {
+  const rendered = renderPreset({ preset: 'chime', seed: 1, duration: seconds, sampleRate: 24000 })
+  finalize(rendered.samples, rendered.sampleRate, -3)
+  return { wav: toWavBytes(rendered.samples, rendered.sampleRate), durationSeconds: seconds }
+}
+
 /**
  * Register the settings endpoints.
  * @param {object} ctx - plugin context.
@@ -113,66 +145,115 @@ export function registerSettingsRoute (ctx, config, version) {
 
   ctx.inject(['webServer'], (child) => {
     const webServer = child.webServer
-    child.effect(() => webServer.register({
-      kind: 'exact',
-      path: '/dsh-audio/config',
-      handler: async (request, response) => {
-        try {
-          // Same-origin only: any page open in the browser could otherwise POST
-          // to 127.0.0.1:<port> and rewrite the config (a plain form post needs
-          // no preflight, so the endpoint has to check for itself).
-          const site = request.headers['sec-fetch-site']
-          if (site !== undefined && site !== 'same-origin' && site !== 'none') {
-            sendJson(response, 403, { ok: false, error: '只接受同源请求' })
-            return
-          }
-          const origin = request.headers.origin
-          if (origin !== undefined) {
-            let originHost
-            try { originHost = new URL(origin).host } catch { originHost = undefined }
-            if (originHost !== request.headers.host) {
-              sendJson(response, 403, { ok: false, error: '只接受同源请求' })
-              return
-            }
-          }
 
-          if (request.method === 'GET') {
-            sendJson(response, 200, { ok: true, version, config: snapshot() })
-            return
-          }
-          if (request.method !== 'POST') {
-            sendJson(response, 405, { ok: false, error: `不支持 ${request.method}` })
-            return
-          }
+    const register = (path, handler) => child.effect(() => webServer.register({ kind: 'exact', path, handler }))
 
-          const body = validate(await readJson(request))
-          const editor = child.get('configEditor')
-          const entry = child.fiber?.entry
-          if (editor === undefined || entry === undefined) {
-            sendJson(response, 503, { ok: false, error: '这个 profile 不支持写配置' })
-            return
-          }
-
-          const tts = pickFields(body.tts, TTS_FIELDS, ['speed', 'pitch', 'sampleRate'])
-          const check = pickFields(body.check, CHECK_FIELDS, [])
-          // Merge into what is stored (not into the redacted view), so a field
-          // the page never edited — including a stored key — survives the write.
-          let saved = null
-          await editor.edit(entry, (current) => {
-            const nextTts = { ...(current.tts ?? {}), ...tts }
-            const nextCheck = { ...(current.check ?? {}), ...check }
-            saved = { tts: nextTts, check: nextCheck }
-            return { ...current, tts: nextTts, check: nextCheck }
-          })
-          sendJson(response, 200, { ok: true, restarting: true, config: saved === null ? null : {
-            tts: presentSection(saved.tts, DEFAULT_ENV.tts),
-            check: presentSection(saved.check, DEFAULT_ENV.check)
-          } })
-        } catch (error) {
-          sendJson(response, 400, { ok: false, error: error?.message ?? String(error) })
+    register('/dsh-audio/config', async (request, response) => {
+      try {
+        if (!sameOriginOnly(request, response)) return
+        if (request.method === 'GET') {
+          sendJson(response, 200, { ok: true, version, config: snapshot() })
+          return
         }
+        if (request.method !== 'POST') {
+          sendJson(response, 405, { ok: false, error: `不支持 ${request.method}` })
+          return
+        }
+
+        const body = validate(await readJson(request))
+        const editor = child.get('configEditor')
+        const entry = child.fiber?.entry
+        if (editor === undefined || entry === undefined) {
+          sendJson(response, 503, { ok: false, error: '这个 profile 不支持写配置' })
+          return
+        }
+
+        const tts = pickFields(body.tts, TTS_FIELDS, ['speed', 'pitch', 'sampleRate'])
+        const check = pickFields(body.check, CHECK_FIELDS, [])
+        // Merge into what is stored (not into the redacted view), so a field the
+        // page never edited — including a stored key — survives the write.
+        let saved = null
+        await editor.edit(entry, (current) => {
+          const nextTts = { ...(current.tts ?? {}), ...tts }
+          const nextCheck = { ...(current.check ?? {}), ...check }
+          saved = { tts: nextTts, check: nextCheck }
+          return { ...current, tts: nextTts, check: nextCheck }
+        })
+        sendJson(response, 200, {
+          ok: true,
+          restarting: true,
+          config: saved === null
+            ? null
+            : { tts: presentSection(saved.tts, DEFAULT_ENV.tts), check: presentSection(saved.check, DEFAULT_ENV.check) }
+        })
+      } catch (error) {
+        sendJson(response, 400, { ok: false, error: error?.message ?? String(error) })
       }
-    }))
+    })
+
+    register('/dsh-audio/test', async (request, response) => {
+      try {
+        if (!sameOriginOnly(request, response)) return
+        if (request.method !== 'POST') {
+          sendJson(response, 405, { ok: false, error: `不支持 ${request.method}` })
+          return
+        }
+        const body = await readJson(request)
+        const target = body.target === 'check' ? 'check' : 'tts'
+
+        if (target === 'tts') {
+          const result = await speak(config.tts ?? {}, '这是一次连接测试。')
+          finalize(result.samples, result.sampleRate, -3)
+          const wav = toWavBytes(result.samples, result.sampleRate)
+          sendJson(response, 200, {
+            ok: true,
+            target,
+            durationSeconds: Number((result.samples.length / result.sampleRate).toFixed(2)),
+            sampleRate: result.sampleRate,
+            effective: result.effective,
+            timestamps: result.timestamps === null ? null : result.timestamps.items.length,
+            wavBase64: wav.toString('base64')
+          })
+          return
+        }
+
+        const sample = sampleWav()
+        const answer = await describeAudio(config.check ?? {}, sample.wav, '这是什么声音？用一句话回答。')
+        sendJson(response, 200, {
+          ok: true,
+          target,
+          answer,
+          durationSeconds: sample.durationSeconds,
+          wavBase64: sample.wav.toString('base64')
+        })
+      } catch (error) {
+        sendJson(response, 400, { ok: false, error: error?.message ?? String(error) })
+      }
+    })
+
+    register('/dsh-audio/voices', async (request, response) => {
+      try {
+        if (!sameOriginOnly(request, response)) return
+        if (request.method !== 'POST') {
+          sendJson(response, 405, { ok: false, error: `不支持 ${request.method}` })
+          return
+        }
+        const body = await readJson(request)
+        const ttsConfig = { ...(config.tts ?? {}), ...(body.tts ?? {}) }
+        if ((ttsConfig.provider ?? 'minimax') !== 'minimax') {
+          sendJson(response, 200, { ok: true, source: 'static', items: [], note: '只有 MiniMax 提供音色列表' })
+          return
+        }
+        try {
+          const items = await listVoices(ttsConfig)
+          sendJson(response, 200, { ok: true, source: 'live', items, note: null })
+        } catch (error) {
+          sendJson(response, 200, { ok: true, source: 'static', items: [], note: `实时查询失败：${error?.message ?? error}` })
+        }
+      } catch (error) {
+        sendJson(response, 400, { ok: false, error: error?.message ?? String(error) })
+      }
+    })
   })
   return true
 }

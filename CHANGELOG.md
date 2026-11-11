@@ -11,6 +11,30 @@
 - **U 盘上的版本目录只增不删。** 需要更新同一版本时覆盖同名文件，不要删目录。
 - 旧版本的唯一权威来源是 git tag；U 盘只是副本。
 
+## 0.5.2 — 2026-11-11
+
+### 设置页与 DSH 统一
+
+- 全部改用宿主主题令牌（`--dsw-alias-bg-layer-1` / `border-l1` / `label-primary` /
+  `label-secondary` / `brand-primary` / `state-*`），行式布局（左标签+说明、右控件、分隔线），
+  与 DSH 自带设置页同构，明暗主题自动跟随。
+- 下拉仍为自绘控件（原生 select 在 Windows 上不可控风格）。
+
+### 新功能
+
+- **测试连接**：TTS 侧真的合成一句话并**在页面里直接回放**，同时显示时长/模型/音色/时间戳条数；
+  语义检查侧把一段铃声送给模型并显示它的回答。填完密钥当场就知道对不对。
+- **音色实时列表**：`/dsh-audio/voices` 调 MiniMax `get_voice`，有 key 时用账号真实音色；
+  失败/无 key 时退回静态名单并**明确标注"未联网校验"**。`audio_voices` 工具同样优先实时。
+- **SRT**：`audio_tts` 新增 `srt: true`，有时间戳时顺带写出 `.srt` 字幕。
+
+### 修复
+
+- **PowerShell 写文件引入 UTF-8 BOM**，导致 `package.json` 无法被 `JSON.parse` 读取，
+  bundle 整块从组合里消失、插件在会话中"凭空消失"。已清理 4 个文件的 BOM，
+  并改为非 ASCII 文件一律用编辑器工具写入。
+- `cordis.patch.yml` 被同一次 BOM/编码事故写坏（中文注释乱码、`provider: openai` 被吞进注释行），已重写为纯 ASCII。
+
 ## 0.5.1 — 2026-11-11
 
 ### 设置页

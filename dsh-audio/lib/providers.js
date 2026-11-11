@@ -61,6 +61,61 @@ export const VOICE_CATALOG = [
 const trimUrl = (url) => String(url).replace(/\/+$/, '')
 
 /**
+ * Pull a voice list out of whatever shape `get_voice` answers with.
+ * @param {any} payload - parsed response body.
+ * @returns {{ id: string, name: string }[]} empty when the shape is unknown.
+ */
+export function normalizeVoiceList (payload) {
+  const candidates = [
+    payload?.system_voice,
+    payload?.voice_list,
+    payload?.voices,
+    payload?.data?.system_voice,
+    payload?.data?.voice_list,
+    payload?.data?.voices
+  ]
+  for (const list of candidates) {
+    if (!Array.isArray(list) || list.length === 0) continue
+    const items = []
+    for (const entry of list) {
+      if (typeof entry !== 'object' || entry === null) continue
+      const id = entry.voice_id ?? entry.voiceId ?? entry.id
+      if (typeof id !== 'string' || id.trim().length === 0) continue
+      const name = entry.voice_name ?? entry.name ?? entry.description ?? id
+      items.push({ id: id.trim(), name: String(name).trim() })
+    }
+    if (items.length > 0) return items
+  }
+  return []
+}
+
+/**
+ * Ask MiniMax for the account's system voices.
+ * @throws when no key is configured or the endpoint refuses.
+ * @returns {Promise<{ id: string, name: string }[]>}
+ */
+export async function listVoices (config) {
+  const key = requireKey('MiniMax', config, 'MINIMAX_API_KEY')
+  const baseUrl = trimUrl(config?.baseUrl ?? MINIMAX_DEFAULTS.baseUrl)
+  const response = await fetch(`${baseUrl}/v1/get_voice`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+    body: JSON.stringify({ voice_type: 'system' }),
+    signal: AbortSignal.timeout(20000)
+  })
+  const text = await response.text()
+  if (!response.ok) throw new Error(`HTTP ${response.status}: ${text.slice(0, 200)}`)
+  const payload = JSON.parse(text)
+  const status = payload?.base_resp?.status_code
+  if (status !== undefined && status !== 0) {
+    throw new Error(`MiniMax: ${payload?.base_resp?.status_msg ?? 'get_voice 失败'}`)
+  }
+  const items = normalizeVoiceList(payload)
+  if (items.length === 0) throw new Error('接口没有返回可识别的音色列表')
+  return items
+}
+
+/**
  * Resolve an API key from the row, the environment, or fail with instructions.
  *
  * The default env name is what makes the zero-config path work: setting

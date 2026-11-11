@@ -1,4 +1,4 @@
-﻿/**
+/**
  * The four model-facing tools.
  *
  * They are deliberately few and verb-shaped: one sound, one span of sound, one

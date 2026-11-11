@@ -18,7 +18,7 @@ import {
   toWavBytes,
   writeFileAtomic
 } from './audio.js'
-import { EMOTIONS, VOICE_CATALOG, speak } from './providers.js'
+import { EMOTIONS, VOICE_CATALOG, listVoices, speak } from './providers.js'
 
 const MAX_TEXT = 8000
 const CHUNK = 600
@@ -81,6 +81,25 @@ function joinWithGaps (parts, sampleRate, gapSeconds) {
   return { samples: out, offsets }
 }
 
+/** Format seconds as an SRT timestamp. */
+function srtTime (seconds) {
+  const total = Math.max(0, seconds)
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const secs = Math.floor(total % 60)
+  const millis = Math.round((total - Math.floor(total)) * 1000)
+  const pad = (value, width) => String(value).padStart(width, '0')
+  return `${pad(hours, 2)}:${pad(minutes, 2)}:${pad(secs, 2)},${pad(millis, 3)}`
+}
+
+/** Render timestamp items as an SRT subtitle file. */
+export function toSrt (items) {
+  return items.map((item, index) => {
+    const end = item.end > item.start ? item.end : item.start + 0.8
+    return `${index + 1}\n${srtTime(item.start)} --> ${srtTime(end)}\n${item.text}\n`
+  }).join('\n')
+}
+
 /** Register the `audio_tts` tool. */
 export function registerTtsTool (ctx, config = {}) {
   const ttsConfig = config.tts ?? {}
@@ -101,6 +120,7 @@ export function registerTtsTool (ctx, config = {}) {
         model: { type: 'string', description: 'Provider model. Defaults to speech-2.8-hd (best quality, auto emotion). Use speech-2.6-hd when you need manual emotion control with lower latency.' },
         gapSeconds: { type: 'number', description: 'Silence inserted between chunks of a long script; defaults to 0.15.' },
         sampleRate: { type: 'integer', description: 'Output rate; defaults to the provider setting (MiniMax 32000).' },
+        srt: { type: 'boolean', description: 'Also write an .srt subtitle file next to the wav when the provider returned timestamps. Defaults to false.' },
         out: { type: 'string', description: 'Output path; defaults to assets/audio/voice-<hash>.wav.' }
       },
       required: ['text'],
@@ -181,6 +201,16 @@ export function registerTtsTool (ctx, config = {}) {
       const info = await stat(target)
       const metrics = { ...measure(samples, sampleRate), sampleRate }
 
+      let srtPath = null
+      if (args.srt === true) {
+        if (timestamps === null) {
+          srtPath = null
+        } else {
+          srtPath = target.replace(/\.wav$/i, '') + '.srt'
+          await writeFileAtomic(srtPath, Buffer.from(toSrt(timestamps.items), 'utf8'))
+        }
+      }
+
       const stampNote = timestamps === null
         ? '时间戳：无（该端点没返回；字幕只能按时长估算）'
         : `时间戳：${timestamps.items.length} 条，${timestamps.complete ? '完整' : '部分 chunk 缺失'}，来源 ${timestamps.source}`
@@ -188,6 +218,9 @@ export function registerTtsTool (ctx, config = {}) {
         `Wrote ${displayPath(cwd, target)} (${metrics.durationSeconds.toFixed(2)}s, ${sampleRate} Hz, ${Math.round(info.size / 1024)} KB)`,
         `${chunks.length} chunk(s) · peak ${metrics.peakDbfs} dBFS · rms ${metrics.rmsDbfs} dBFS`,
         stampNote,
+        srtPath === null
+          ? (args.srt === true ? 'SRT：未生成（没有时间戳）' : 'SRT：未要求')
+          : `SRT：${displayPath(cwd, srtPath)}`,
         `生效参数：${effective.provider} · ${effective.model} · ${effective.voice} · emotion=${effective.emotion ?? '-'} · speed=${effective.speed ?? 1} · pitch=${effective.pitch ?? 0}`
       ].join('\n')
 
@@ -199,6 +232,7 @@ export function registerTtsTool (ctx, config = {}) {
         durationSeconds: metrics.durationSeconds,
         metrics,
         timestamps,
+        srtPath,
         effective,
         text: text2
       }
@@ -210,17 +244,30 @@ export function registerTtsTool (ctx, config = {}) {
   })
 }
 
-/** Register the `audio_voices` tool: a shortlist, not a whitelist. */
-export function registerVoicesTool (ctx) {
+/** Register the `audio_voices` tool: live list when possible, shortlist otherwise. */
+export function registerVoicesTool (ctx, config = {}) {
+  const ttsConfig = config.tts ?? {}
+
   ctx.tools.register({
     name: 'audio_voices',
-    description: 'List the curated MiniMax voice ids this plugin documents, with a one-line note each. It is a shortlist to keep the model from inventing ids, not a whitelist — any voice id from the provider console can still be passed to audio_tts.',
+    description: 'List the MiniMax voice ids available to this account. With a configured key it asks the provider for the live list; without one it returns a static shortlist that has not been verified against any account.',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     isConcurrencySafe: true,
     async execute () {
-      const lines = ['MiniMax 常用音色（只是短名单，控制台里的其他 id 也能直接用）：']
+      if ((ttsConfig.provider ?? 'minimax') === 'minimax') {
+        try {
+          const items = await listVoices(ttsConfig)
+          const lines = [`MiniMax 实时音色（${items.length} 个，来自当前账号）：`]
+          for (const voice of items.slice(0, 80)) lines.push(`  ${voice.id.padEnd(38)} ${voice.name}`)
+          if (items.length > 80) lines.push(`  … 共 ${items.length} 个`)
+          return { source: 'live', voices: items, text: lines.join('\n') }
+        } catch {
+          // fall through to the static shortlist
+        }
+      }
+      const lines = ['MiniMax 常用音色（静态短名单，未联网校验；配置密钥后这里会换成账号的实时列表）：']
       for (const voice of VOICE_CATALOG) lines.push(`  ${voice.id.padEnd(38)} ${voice.note}`)
-      return { voices: VOICE_CATALOG, text: lines.join('\n') }
+      return { source: 'static', voices: VOICE_CATALOG, text: lines.join('\n') }
     },
     output: {
       schema: { type: 'object' },

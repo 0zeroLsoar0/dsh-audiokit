@@ -1,4 +1,4 @@
-﻿import { mkdir, rm } from 'node:fs/promises'
+import { mkdir, rm } from 'node:fs/promises'
 import { PRESETS, presetCatalog } from '../lib/dsp.js'
 import {
   ENGINE_VERSION,
