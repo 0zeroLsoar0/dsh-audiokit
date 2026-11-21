@@ -5,9 +5,28 @@
  * The encoder writes interleaved channels from one Float32Array per channel.
  * Samples are clipped to [-1, 1] and dithered with a tiny triangular noise so
  * quiet fades do not collapse into quantisation steps.
+ *
+ * The dither is generated from a fixed-seed xorshift, never from Math.random:
+ * the plugin's contract is that the same request produces the same bytes, and
+ * `audio_regress` compares file hashes across processes. Random dither silently
+ * broke that contract — same samples, different file every run.
  */
 
 const RIFF_HEADER_BYTES = 44
+
+/**
+ * Deterministic triangular dither source.
+ * @returns {() => number} uniform values in [0, 1).
+ */
+function makeDither () {
+  let state = 0x9E3779B9
+  return () => {
+    state ^= state << 13; state >>>= 0
+    state ^= state >>> 17
+    state ^= state << 5; state >>>= 0
+    return state / 4294967296
+  }
+}
 
 /**
  * Encode channel buffers as a 16-bit PCM WAVE file.
@@ -42,11 +61,12 @@ export function encodeWav (channels, sampleRate, options = {}) {
   out.writeUInt32LE(dataBytes, 40)
 
   const dither = options.dither !== false
+  const random = dither ? makeDither() : null
   let offset = RIFF_HEADER_BYTES
   for (let frame = 0; frame < frames; frame += 1) {
     for (let channel = 0; channel < channelCount; channel += 1) {
       let sample = channels[channel][frame]
-      if (dither) sample += (Math.random() - Math.random()) / 32768
+      if (dither) sample += (random() - random()) / 32768
       sample = sample > 1 ? 1 : sample < -1 ? -1 : sample
       out.writeInt16LE(Math.round(sample * 32767), offset)
       offset += 2
