@@ -1,0 +1,68 @@
+{
+  "sampleRate": 22050,
+  "duration": 16,
+  "cues": [
+    {
+      "name": "bed",
+      "file": "bed.wav",
+      "at": 0,
+      "gainDb": 0,
+      "loop": true
+    },
+    {
+      "name": "impact",
+      "file": "impact.wav",
+      "at": 2.5,
+      "gainDb": 0,
+      "loop": false
+    },
+    {
+      "name": "ticks",
+      "file": "ticks.wav",
+      "at": 6,
+      "gainDb": 0,
+      "loop": false
+    },
+    {
+      "name": "voice",
+      "file": "voice.wav",
+      "at": 10,
+      "gainDb": 0,
+      "loop": false
+    },
+    {
+      "name": "end",
+      "file": "end.wav",
+      "at": 13.5,
+      "gainDb": 0,
+      "loop": false
+    }
+  ],
+  "files": {
+    "bed": {
+      "bytes": 705644,
+      "durationSeconds": 16,
+      "peakDbfs": -6
+    },
+    "impact": {
+      "bytes": 44144,
+      "durationSeconds": 1,
+      "peakDbfs": -1
+    },
+    "ticks": {
+      "bytes": 176444,
+      "durationSeconds": 4,
+      "peakDbfs": -8
+    },
+    "voice": {
+      "bytes": 132344,
+      "durationSeconds": 3,
+      "peakDbfs": -4
+    },
+    "end": {
+      "bytes": 35324,
+      "durationSeconds": 0.8,
+      "peakDbfs": -3
+    }
+  }
+}
