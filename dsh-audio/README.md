@@ -134,6 +134,12 @@ check:
 **能换成别的 TTS 供应商吗？**
 可以，任何兼容 OpenAI `/v1/audio/speech` 的服务都行；不兼容的可以按 `lib/providers.js` 里的适配器形状加一个。
 
+**为什么 `audio_tts` 没返回时间戳、也没生成 SRT？**
+实测（2026-11，MiniMax `speech-2.8-hd`，T2A v2 同步接口）：开了 `subtitle_enable`，句级和词级都没有返回
+可解析的时间戳。所以工具会如实返回 `timestamps: null` 并说明"该端点没返回"，不会编造。
+需要精确时间戳时，可改用服务商的异步长文本或 WebSocket 流式接口，再按 `lib/providers.js` 的
+`normalizeTimestamps` 支持的形状接进来。
+
 ## 许可
 
 MIT © 2026 Soar_L
