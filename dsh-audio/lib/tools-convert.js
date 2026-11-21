@@ -30,12 +30,14 @@ import {
 } from './audio.js'
 import { clamp } from './dsp.js'
 import { decodeWav } from './wav.js'
-import { applyGainDb, concat, fade, reverse, resampleHiFi, toStereo, trim } from './convert.js'
+import { applyGainDb, concat, fade, reverse, resampleHiFi, toStereo, trim, MAX_JOIN_SECONDS } from './convert.js'
 import { encodeWavEx } from './wav-encode.js'
 
 const BIT_DEPTHS = [8, 16, 24, 32]
 const OPS = ['trim', 'gain', 'fade', 'reverse', 'concat', 'gain-scan', 'convert']
 const SINGLE_INPUT_OPS = ['trim', 'gain', 'fade', 'reverse', 'convert']
+const CURVES = ['linear', 'equalPower']
+const GAIN_DB_LIMITS = Object.freeze([-120, 24])
 const DEFAULT_MAX_INLINE_BYTES = 2 * 1024 * 1024
 const MIN_SAMPLE_RATE = 8000
 const MAX_SAMPLE_RATE = 96000
@@ -73,6 +75,35 @@ function sizeLabel (bytes) {
 
 function positive (value) {
   return Number.isFinite(value) && value > 0
+}
+
+/** The inline budget: a positive byte count, or the documented default. */
+function resolveInlineLimit (requested) {
+  if (requested === undefined || requested === null) return DEFAULT_MAX_INLINE_BYTES
+  const limit = Number(requested)
+  if (!Number.isFinite(limit) || limit < 1) {
+    throw new Error(`audio_convert: maxInlineBytes must be a positive integer (default ${DEFAULT_MAX_INLINE_BYTES})`)
+  }
+  return Math.round(limit)
+}
+
+/** Validate the `gain` op level: a meaningless dB value must not be turned into a silent file. */
+function resolveGainDb (value) {
+  if (value === undefined || value === null) return 0
+  const number = Number(value)
+  if (!Number.isFinite(number) || number < GAIN_DB_LIMITS[0] || number > GAIN_DB_LIMITS[1]) {
+    throw new Error(`audio_convert: gainDb must be a finite number of dB between ${GAIN_DB_LIMITS[0]} and ${GAIN_DB_LIMITS[1]}`)
+  }
+  return number
+}
+
+/** Validate one concat join length before the takes are even read. */
+function checkJoinSeconds (key, value) {
+  if (value === undefined || value === null) return
+  const number = Number(value)
+  if (!Number.isFinite(number) || number > MAX_JOIN_SECONDS) {
+    throw new Error(`audio_convert: ${key} must be a finite number of seconds at most ${MAX_JOIN_SECONDS}`)
+  }
 }
 
 function safeLabel (label) {
@@ -191,10 +222,7 @@ async function writeTrack (cwd, track, format, target) {
 }
 
 /** Wrap the encoded bytes as a base64 data URI, enforcing the size guard. */
-function buildInline (bytes, requestedLimit) {
-  const limit = Number.isFinite(requestedLimit) && requestedLimit >= 0
-    ? Math.round(requestedLimit)
-    : DEFAULT_MAX_INLINE_BYTES
+function buildInline (bytes, limit) {
   if (bytes.length > limit) {
     return {
       inline: null,
@@ -253,7 +281,7 @@ function requestHash (op, tracks, args) {
 /* -------------------------------------------------------------------- ops -- */
 
 /** One track in, one file out. */
-async function runSingleOp (cwd, tracks, args, op, format) {
+async function runSingleOp (cwd, tracks, args, op, format, inlineLimit) {
   const source = tracks[0]
   let track
   if (op === 'trim') {
@@ -282,7 +310,7 @@ async function runSingleOp (cwd, tracks, args, op, format) {
   const written = await writeTrack(cwd, track, format, target)
   const extra = []
   if (args.inline === true) {
-    const inline = buildInline(written.bytesBuffer, args.maxInlineBytes)
+    const inline = buildInline(written.bytesBuffer, inlineLimit)
     extra.push(inline.note)
     const result = {
       path: written.path,
@@ -414,12 +442,12 @@ export function registerConvertTools (ctx) {
         start: { type: 'number', description: 'trim: start of the span in seconds (default 0).' },
         end: { type: 'number', description: 'trim: end of the span in seconds (default end of the track).' },
         snapToZeroCrossing: { type: 'boolean', description: 'trim only: move the cut to the nearest zero crossing (within 5 ms) so the edit does not click.' },
-        gainDb: { type: 'number', description: 'gain: level change in dB; negative attenuates.' },
+        gainDb: { type: 'number', description: 'gain: level change in dB (finite, -120..24); negative attenuates.' },
         fadeInSeconds: { type: 'number', description: 'Fade-in length in seconds; applied after the op (or as the fade op itself).' },
         fadeOutSeconds: { type: 'number', description: 'Fade-out length in seconds; applied after the op (or as the fade op itself).' },
         curve: { type: 'string', enum: ['linear', 'equalPower'], description: 'Fade shape; equalPower keeps perceived loudness steadier.' },
-        gapSeconds: { type: 'number', description: 'concat: silent gap between takes; use this or crossfadeSeconds, not both.' },
-        crossfadeSeconds: { type: 'number', description: 'concat: overlap between takes instead of a gap.' },
+        gapSeconds: { type: 'number', description: 'concat: silent gap between takes (finite, at most 60 s; negative clamps to 0); use this or crossfadeSeconds, not both.' },
+        crossfadeSeconds: { type: 'number', description: 'concat: overlap between takes instead of a gap (finite, at most 60 s; negative clamps to 0).' },
         peakDbfs: { type: 'number', description: 'gain-scan: the common peak to hit in dBFS (default -1).' },
         pan: { type: 'number', description: 'Stereo placement, -1 left .. 0 centre .. 1 right; only used when channels is 2.' },
         width: { type: 'number', description: 'Stereo width 0..1: 0 folds both channels to mono, 1 keeps the pan image.' },
@@ -428,7 +456,7 @@ export function registerConvertTools (ctx) {
         sampleRate: { type: 'integer', description: 'Output rate in Hz; defaults to the input rate. Uses a windowed-sinc resampler, safe as the final rate change.' },
         out: { type: 'string', description: 'Output path, relative to the working directory. Defaults to assets/audio/<op>-<label>-<hash>.wav. For gain-scan with several inputs this is a directory.' },
         inline: { type: 'boolean', description: 'Also return the written file as a base64 data URI (audio/wav) for single-file HTML. Skipped when the file exceeds maxInlineBytes.' },
-        maxInlineBytes: { type: 'integer', description: 'Size guard for inline output; defaults to 2097152 (2 MB).' }
+        maxInlineBytes: { type: 'integer', description: `Size guard for inline output (positive; defaults to ${DEFAULT_MAX_INLINE_BYTES} = 2 MB).` }
       },
       required: ['inputs', 'op'],
       additionalProperties: false
@@ -442,6 +470,18 @@ export function registerConvertTools (ctx) {
       const op = String(args.op ?? '')
       if (!OPS.includes(op)) throw new Error(`audio_convert: op must be one of ${OPS.join(' | ')}`)
       const format = resolveFormat(args)
+      // Validate the request's own numeric/enum options before reading a single
+      // input: a bad join or gain must not cost a decode, and a zero inline
+      // budget must not silently mean "the default".
+      if (args.curve !== undefined && args.curve !== null && !CURVES.includes(args.curve)) {
+        throw new Error(`audio_convert: curve must be one of ${CURVES.join(' | ')}`)
+      }
+      if (op === 'gain') resolveGainDb(args.gainDb)
+      if (op === 'concat') {
+        checkJoinSeconds('gapSeconds', args.gapSeconds)
+        checkJoinSeconds('crossfadeSeconds', args.crossfadeSeconds)
+      }
+      const inlineLimit = args.inline === true ? resolveInlineLimit(args.maxInlineBytes) : null
 
       const tracks = []
       for (const entry of entries) tracks.push(await readInput(cwd, entry))
@@ -450,7 +490,7 @@ export function registerConvertTools (ctx) {
       }
 
       if (op === 'gain-scan') return runGainScan(cwd, tracks, args, format)
-      return runSingleOp(cwd, tracks, args, op, format)
+      return runSingleOp(cwd, tracks, args, op, format, inlineLimit)
     },
     output: {
       schema: { type: 'object' },

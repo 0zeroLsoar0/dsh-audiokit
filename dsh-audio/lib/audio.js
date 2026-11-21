@@ -118,6 +118,26 @@ function spectrum (samples, sampleRate) {
  * @returns {object} metric summary.
  */
 export function measure (samples, sampleRate) {
+  // A 0-frame wav is a legal file (an empty clip), and five tools measure one.
+  // Every metric has a defined zero here; the NaN this used to return for the
+  // seam/step leaked into all of their reports.
+  if (samples.length === 0) {
+    return {
+      durationSeconds: 0,
+      peakDbfs: -120,
+      rmsDbfs: -120,
+      crestDb: 0,
+      dcOffset: 0,
+      clipping: 0,
+      onsets: 0,
+      loopSeam: 0,
+      loopStep: 0,
+      centroidHz: 0,
+      brightness: 0,
+      lowRatio: 0,
+      highRatio: 0
+    }
+  }
   let peak = 0
   let sumSquares = 0
   let sum = 0
@@ -229,6 +249,13 @@ export function renderPreset (request) {
 }
 
 /**
+ * Pattern limits. A pattern is the texture of one cue, not a whole soundtrack:
+ * past these the request is a timeline to assemble with `audio_mix`, and the
+ * renderer would allocate tens of megabytes before the caller notices.
+ */
+export const PATTERN_LIMITS = Object.freeze({ maxSpanSeconds: 180, maxEvents: 20000 })
+
+/**
  * Fill a span with generated events.
  * @param {object} request - preset/kind/from/to/count/every/curve/params/seed.
  * @returns {{ samples: Float32Array, sampleRate: number, events: number, durationSeconds: number, spec: object }}
@@ -239,8 +266,25 @@ export function renderPattern (request) {
   if (spec === undefined) throw new Error(`unknown preset "${preset}"; available: ${Object.keys(PRESETS).join(', ')}`)
   const sampleRate = clamp(Math.round(request.sampleRate ?? 44100), 8000, 96000)
   const kind = ['train', 'scatter', 'riser'].includes(request.kind) ? request.kind : 'train'
-  const from = clamp(Number(request.from ?? 0), 0, 600)
-  const to = clamp(Number(request.to ?? 4), from + 0.02, 600)
+  // Validate the shape before allocating anything: `to: 600` used to render a
+  // 52 MB file and `count: 1e9` never returned at all.
+  const requestedFrom = Number(request.from ?? 0)
+  const requestedTo = Number(request.to ?? 4)
+  if (!Number.isFinite(requestedFrom) || !Number.isFinite(requestedTo)) {
+    throw new Error(`audio_pattern: from and to must be finite seconds, got from=${requestedFrom}, to=${requestedTo}`)
+  }
+  const requestedSpan = requestedTo - requestedFrom
+  if (requestedSpan > PATTERN_LIMITS.maxSpanSeconds) {
+    throw new Error(`audio_pattern: span ${Number(requestedSpan.toFixed(3))} s exceeds the ${PATTERN_LIMITS.maxSpanSeconds} s limit; render shorter patterns and place them with audio_mix`)
+  }
+  const requestedCount = Number.isFinite(request.count) && request.count > 0 ? Math.round(request.count) : null
+  if (requestedCount !== null && requestedCount > PATTERN_LIMITS.maxEvents) {
+    throw new Error(`audio_pattern: count ${requestedCount} exceeds the ${PATTERN_LIMITS.maxEvents} event limit; render the pattern in parts`)
+  }
+  // The clamps stay inside the validated cap, so they can never allocate more
+  // than the limits above allow.
+  const from = clamp(requestedFrom, 0, PATTERN_LIMITS.maxSpanSeconds)
+  const to = clamp(requestedTo, from + 0.02, from + PATTERN_LIMITS.maxSpanSeconds)
   const seed = Number.isFinite(request.seed) ? Math.round(request.seed) : 1
   const base = resolveParams(preset, request.params ?? {})
   const curve = ['linear', 'accelerando', 'ritardando', 'ease'].includes(request.curve) ? request.curve : 'linear'
@@ -251,9 +295,8 @@ export function renderPattern (request) {
   const frames = frameCount(span + 2, sampleRate)
   const master = new Float32Array(frames)
 
-  const count = Number.isFinite(request.count) && request.count > 0
-    ? Math.round(request.count)
-    : Math.max(1, Math.round(span / Math.max(0.01, Number(request.every ?? 0.25))))
+  const every = Number(request.every ?? 0.25)
+  const count = requestedCount ?? Math.max(1, Math.round(span / Math.max(0.01, Number.isFinite(every) ? every : 0.25)))
 
   const position = (progress) => {
     if (curve === 'accelerando') return Math.pow(progress, 0.62)
@@ -324,13 +367,60 @@ function resample (samples, fromRate, toRate) {
   return out
 }
 
+/** A mix longer than this means a bad offset, not a long cue. */
+export const MIX_MAX_SECONDS = 180
+/** Gains outside this range are meaningless and only produce non-finite samples. */
+export const MIX_GAIN_LIMITS_DB = Object.freeze([-120, 24])
+
+function describeValue (value) {
+  if (typeof value === 'number') return String(value)
+  try {
+    return JSON.stringify(value) ?? String(value)
+  } catch {
+    return String(value)
+  }
+}
+
+/**
+ * Validate the numeric mix options.
+ *
+ * Offsets and `durationSeconds` become `Float32Array` lengths, so one bad value
+ * turns into `RangeError: Invalid typed array length: Infinity` — after every
+ * input was already read. Both the tool boundary (before any file is opened)
+ * and `mixTracks` call this, so a direct caller is guarded too.
+ * @param {object} [options] - the same object `mixTracks` accepts.
+ */
+export function validateMixOptions (options = {}) {
+  const offsets = Array.isArray(options.offsets) ? options.offsets : []
+  for (let index = 0; index < offsets.length; index += 1) {
+    const value = Number(offsets[index])
+    if (!Number.isFinite(value) || value < 0 || value > MIX_MAX_SECONDS) {
+      throw new Error(`mix: offsets[${index}] must be a finite number of seconds between 0 and ${MIX_MAX_SECONDS}, got ${describeValue(offsets[index])}`)
+    }
+  }
+  if (options.durationSeconds !== undefined && options.durationSeconds !== null) {
+    const value = Number(options.durationSeconds)
+    if (!Number.isFinite(value) || value <= 0 || value > MIX_MAX_SECONDS) {
+      throw new Error(`mix: durationSeconds must be a finite number of seconds greater than 0 and at most ${MIX_MAX_SECONDS}, got ${describeValue(options.durationSeconds)}`)
+    }
+  }
+  const gains = Array.isArray(options.gains) ? options.gains : []
+  for (let index = 0; index < gains.length; index += 1) {
+    const value = Number(gains[index])
+    if (!Number.isFinite(value) || value < MIX_GAIN_LIMITS_DB[0] || value > MIX_GAIN_LIMITS_DB[1]) {
+      throw new Error(`mix: gains[${index}] must be a finite number of dB between ${MIX_GAIN_LIMITS_DB[0]} and ${MIX_GAIN_LIMITS_DB[1]}, got ${describeValue(gains[index])}`)
+    }
+  }
+}
+
 /**
  * Sum decoded tracks into one file.
  * @param {{ samples: Float32Array, sampleRate: number }[]} inputs - decoded tracks.
  * @param {object} options - sampleRate, gains (dB), offsets (seconds), normalizePeakDbfs, limiter, durationSeconds.
  */
 export function mixTracks (inputs, options = {}) {
-  if (inputs.length === 0) throw new Error('mix requires at least one input')
+  if (!Array.isArray(inputs) || inputs.length === 0) throw new Error('mix requires at least one input')
+  validateMixOptions(options)
   const sampleRate = clamp(Math.round(options.sampleRate ?? Math.max(...inputs.map((i) => i.sampleRate))), 8000, 96000)
   const resampled = inputs.map((input, index) => {
     const gain = dbToGain(Number(options.gains?.[index] ?? 0))
@@ -339,9 +429,9 @@ export function mixTracks (inputs, options = {}) {
     for (let i = 0; i < samples.length; i += 1) out[i] = samples[i] * gain
     return out
   })
-  const offsets = inputs.map((_, index) => Math.max(0, Number(options.offsets?.[index] ?? 0)))
+  const offsets = inputs.map((_, index) => Number(options.offsets?.[index] ?? 0))
   const longest = Math.max(...resampled.map((track, index) => track.length + Math.round(offsets[index] * sampleRate)))
-  const targetFrames = Number.isFinite(options.durationSeconds)
+  const targetFrames = options.durationSeconds !== undefined && options.durationSeconds !== null
     ? frameCount(Number(options.durationSeconds), sampleRate)
     : longest
   const master = new Float32Array(targetFrames)
@@ -405,14 +495,26 @@ export async function writeFileAtomic (target, bytes) {
       }
     } catch { /* fall through to the original error */ }
     await unlink(temp).catch(() => {})
-    throw error
+    // Name the file the caller asked for, not the internal temp name, so the
+    // error reads as "cannot write <out>" instead of leaking a sibling path.
+    throw new Error(`cannot write ${target}: ${error.code ?? error.message}`)
   }
 }
 
 /** Read a wav file and decode it to mono. */
 export async function readTrack (path) {
-  const bytes = await readFile(path)
-  const decoded = decodeWav(bytes)
+  let bytes
+  try {
+    bytes = await readFile(path)
+  } catch (error) {
+    throw new Error(`cannot read ${path}: ${error.code ?? error.message}`)
+  }
+  let decoded
+  try {
+    decoded = decodeWav(bytes)
+  } catch (error) {
+    throw new Error(`cannot decode ${path}: ${error.message}`)
+  }
   const samples = decoded.channels.length === 1
     ? decoded.channels[0]
     : averageChannels(decoded.channels)

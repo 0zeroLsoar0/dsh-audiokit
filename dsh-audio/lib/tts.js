@@ -29,6 +29,8 @@ import { EDGE_VOICE_CATALOG, VOICE_CATALOG, listVoices, speak } from './provider
 const MAX_TEXT = 8000
 const CHUNK = 600
 const GAP_SECONDS = 0.15
+/** A silence between chunks longer than this is a timeline edit, not a gap. */
+const MAX_GAP_SECONDS = 10
 
 function displayPath (cwd, path) {
   const rel = relative(cwd, path)
@@ -284,7 +286,7 @@ export function registerTtsTool (ctx, config = {}) {
         subtitle: { type: 'boolean', description: 'Ask the provider for timestamps. Defaults to true; the result says whether any came back.' },
         subtitleType: { type: 'string', enum: ['sentence', 'word'], description: 'Timestamp granularity to request. Word level is finer but not every model or endpoint returns it — check the result before relying on it.' },
         model: { type: 'string', description: 'Provider model id. Defaults to the provider setting (MiniMax speech-2.8-hd).' },
-        gapSeconds: { type: 'number', description: 'Silence inserted between chunks of a long script; defaults to 0.15. Not used on the MP3 path (chunks are joined frame-to-frame).' },
+        gapSeconds: { type: 'number', description: 'Silence inserted between chunks of a long script (finite, 0..10); defaults to 0.15. Not used on the MP3 path (chunks are joined frame-to-frame).' },
         sampleRate: { type: 'integer', description: 'Output rate for providers that accept it; the Edge engine fixes PCM at 24000.' },
         srt: { type: 'boolean', description: 'Also write an .srt subtitle file next to the audio file when the provider returned timestamps. Defaults to false.' },
         out: { type: 'string', description: 'Output path; defaults to assets/audio/voice-<hash>.wav (or .mp3 when only encoded audio is available).' }
@@ -303,6 +305,13 @@ export function registerTtsTool (ctx, config = {}) {
       if (!(speed >= 0.5 && speed <= 2)) throw new Error('audio_tts: speed 必须在 0.5..2.0 之间')
       const pitch = Number(args.pitch ?? 0)
       if (!(pitch >= -12 && pitch <= 12)) throw new Error('audio_tts: pitch 必须在 -12..12 半音之间')
+      // Validate the inter-chunk gap before the provider is called: a bad value
+      // used to crash the typed-array allocation only after every chunk had
+      // already been paid for.
+      const gapSeconds = Number(args.gapSeconds ?? GAP_SECONDS)
+      if (!Number.isFinite(gapSeconds) || gapSeconds < 0 || gapSeconds > MAX_GAP_SECONDS) {
+        throw new Error(`audio_tts: gapSeconds must be a finite number between 0 and ${MAX_GAP_SECONDS} seconds`)
+      }
 
       const cwd = sessionCwd(ctx, exec)
       const chunks = splitScript(text)
@@ -341,7 +350,7 @@ export function registerTtsTool (ctx, config = {}) {
       const sampleRate = rendered[0].sampleRate
       const joined = rendered.length === 1
         ? { samples: rendered[0].samples, offsets: [0] }
-        : joinWithGaps(rendered.map((part) => part.samples), sampleRate, Number(args.gapSeconds ?? GAP_SECONDS))
+        : joinWithGaps(rendered.map((part) => part.samples), sampleRate, gapSeconds)
 
       // Stitch per-chunk timestamps onto the joined timeline.
       const items = []
@@ -366,7 +375,7 @@ export function registerTtsTool (ctx, config = {}) {
       const effective = {
         ...(rendered[0].effective ?? {}),
         chunks: chunks.length,
-        gapSeconds: rendered.length > 1 ? Number(args.gapSeconds ?? GAP_SECONDS) : 0
+        gapSeconds: rendered.length > 1 ? gapSeconds : 0
       }
       const hash = hashSpec({
         text,
@@ -444,6 +453,7 @@ export function registerVoicesTool (ctx, config = {}) {
     description: 'List the voice ids available for the configured TTS provider: the live MiniMax account list, or the free Edge catalogue with ~318 voices. Falls back to a static shortlist when the endpoint cannot be reached.',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     isConcurrencySafe: true,
+    presentCall: () => ({ card: 'generic', title: 'List TTS voices', kind: 'other', rawInput: {} }),
     async execute () {
       try {
         const items = await listVoices(ttsConfig)

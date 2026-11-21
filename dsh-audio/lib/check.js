@@ -22,6 +22,15 @@ function displayPath (cwd, path) {
   return rel && !rel.startsWith('..') ? rel.split('\\').join('/') : path
 }
 
+function describeValue (value) {
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  try {
+    return JSON.stringify(value) ?? String(value)
+  } catch {
+    return String(value)
+  }
+}
+
 function sessionCwd (ctx, exec) {
   try {
     const session = exec?.agent?.session
@@ -114,11 +123,16 @@ export function registerCheckTool (ctx, config = {}) {
       const files = []
       const seen = new Set()
       const paths = Array.isArray(args.paths) ? args.paths : []
-      if (paths.length === 0 && !Array.isArray(args.cues)) throw new Error('audio_check 需要 paths 或 cues')
+      const cues = Array.isArray(args.cues) ? args.cues : []
+      if (paths.length === 0 && cues.length === 0) {
+        throw new Error('audio_check 需要 paths 或 cues：至少给一个要检查的音频文件或一条 cue')
+      }
 
-      for (const entry of paths) {
-        const path = resolvePath(cwd, entry)
-        if (path === undefined) continue
+      for (let index = 0; index < paths.length; index += 1) {
+        const path = resolvePath(cwd, paths[index])
+        if (path === undefined) {
+          throw new Error(`audio_check: paths[${index}] 不是可用的文件路径（${describeValue(paths[index])}）`)
+        }
         if (seen.has(path)) continue
         seen.add(path)
         try {
@@ -130,7 +144,20 @@ export function registerCheckTool (ctx, config = {}) {
         }
       }
 
-      const cues = Array.isArray(args.cues) ? args.cues : []
+      // Cues are validated before any of them is read: a cue with no `src` used
+      // to be skipped silently (which made a 0-file "ok" verdict possible) and a
+      // null entry crashed with a raw TypeError.
+      for (let index = 0; index < cues.length; index += 1) {
+        const cue = cues[index]
+        if (cue === null || typeof cue !== 'object') {
+          throw new Error(`audio_check: cues[${index}] 必须是 { at, src } 对象，收到 ${describeValue(cue)}`)
+        }
+        if (resolvePath(cwd, cue.src) === undefined) {
+          const name = typeof cue.name === 'string' && cue.name.trim() !== '' ? `（cue "${cue.name}"）` : ''
+          throw new Error(`audio_check: cues[${index}] 缺少可用的 src 路径${name}`)
+        }
+      }
+
       let summedPeak = 0
       let timelineEnd = 0
       if (cues.length > 0) {
@@ -181,6 +208,13 @@ export function registerCheckTool (ctx, config = {}) {
             issues.push({ level: 'warn', target: 'timeline', message: `最后一条 cue 在 ${timelineEnd.toFixed(2)}s 结束，动画是 ${Number(args.expectDuration).toFixed(2)}s` })
           }
         }
+      }
+
+      // Nothing readable is an error, not a clean verdict: an "ok · 0 file(s)"
+      // report hid a blank path or an empty cue list.
+      if (files.length === 0) {
+        const reasons = issues.map((issue) => `${issue.target}: ${issue.message}`).join('；')
+        throw new Error(`audio_check: 没有可读的音频文件${reasons === '' ? '' : `（${reasons}）`}`)
       }
 
       let verdict = 'ok'

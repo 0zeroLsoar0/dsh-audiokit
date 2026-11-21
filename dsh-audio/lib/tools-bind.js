@@ -48,6 +48,16 @@ function formatBytes (bytes) {
   return `${(bytes / 1024 / 1024).toFixed(2)} MB`
 }
 
+/** The inline budget: a positive byte count, or the documented default. */
+function resolveInlineBudget (value) {
+  if (value === undefined || value === null) return DEFAULT_MAX_INLINE_BYTES
+  const bytes = Number(value)
+  if (!Number.isFinite(bytes) || bytes < 1) {
+    throw new Error(`audio_bind: maxBytes must be a positive integer (default ${DEFAULT_MAX_INLINE_BYTES})`)
+  }
+  return Math.floor(bytes)
+}
+
 function formatRow (row) {
   const show = (value) => {
     if (value === null || value === undefined) return '-'
@@ -141,7 +151,7 @@ export function registerBindTools (ctx) {
         out: { type: 'string', description: 'Output stem, relative to the working directory; writes <out>.json and <out>.js. Defaults to assets/audio/cues-<hash>.' },
         duration: { type: 'number', description: 'Timeline length in seconds; defaults to the end of the last cue, including its wav.' },
         inline: { type: 'boolean', description: 'Embed the wavs as base64 data URIs so the HTML has zero network requests. Defaults to false.' },
-        maxBytes: { type: 'integer', description: `Inline page-weight budget in bytes; defaults to ${DEFAULT_MAX_INLINE_BYTES} (2 MB).` },
+        maxBytes: { type: 'integer', description: `Inline page-weight budget in bytes (positive); defaults to ${DEFAULT_MAX_INLINE_BYTES} (2 MB).` },
         basePath: { type: 'string', description: 'Prefix for relative cue sources when not inlining, e.g. "assets/audio/".' },
         sampleRate: { type: 'integer', description: 'Device sample rate used for the drift budget; defaults to 48000.' }
       },
@@ -171,10 +181,11 @@ export function registerBindTools (ctx) {
 
       let inlineResult = null
       if (args.inline === true) {
+        const maxBytes = resolveInlineBudget(args.maxBytes)
         try {
           inlineResult = await inlineAudio({
             entries: loaded.map((cue) => ({ name: cue.name, bytes: cue.bytes })),
-            maxBytes: args.maxBytes,
+            maxBytes,
             cwd
           })
         } catch (error) {
@@ -340,7 +351,9 @@ export function registerBindTools (ctx) {
         }
       }
 
-      if (args.action !== 'compare') throw new Error(`audio_regress action must be snapshot or compare, got "${args.action}"`)
+      if (args.action !== 'compare') throw new Error(args.action === undefined
+        ? 'audio_regress needs action: "snapshot" or "compare"'
+        : `audio_regress action must be snapshot or compare, got "${String(args.action)}"`)
       if (!Array.isArray(args.specs) || args.specs.length === 0) throw new Error('audio_regress compare needs specs to re-render')
       let baseline
       try {

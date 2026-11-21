@@ -426,8 +426,12 @@ async function writeRender (cwd, args, samples, sampleRate, hash) {
  * @returns {Promise<object>} the tool result.
  */
 async function singWithFormant (cwd, args, plan, warning) {
+  // The engine falls back to alto for an unknown id; report the voice that
+  // actually sang instead of echoing the unknown id back as if it had applied.
+  const requestedVoice = args.voice === undefined || args.voice === null ? 'alto' : String(args.voice)
+  const voice = VOICE_PRESETS[requestedVoice] !== undefined ? requestedVoice : 'alto'
   const options = {
-    voice: args.voice,
+    voice,
     vibrato: args.vibrato,
     breath: args.breath,
     harmony: args.harmony,
@@ -442,7 +446,7 @@ async function singWithFormant (cwd, args, plan, warning) {
     engine: 'sing/1',
     notes: plan.notes.map((note) => [note.midi, note.startBeat, note.durBeats, note.syllable]),
     bpm: plan.bpm,
-    voice: options.voice ?? 'alto',
+    voice,
     vibrato: options.vibrato ?? null,
     breath: options.breath ?? null,
     harmony: options.harmony ?? null,
@@ -451,7 +455,7 @@ async function singWithFormant (cwd, args, plan, warning) {
   })
   const written = await writeRender(cwd, args, rendered.samples, sampleRate, hash)
 
-  const multiVoice = Boolean(args.harmony) || (VOICE_PRESETS[String(args.voice ?? '')]?.voices ?? 1) > 1
+  const multiVoice = Boolean(args.harmony) || VOICE_PRESETS[voice].voices > 1
   // Autocorrelation on a two-voice mix locks onto the common period of the
   // harmony, not the melody (C4 + E4 reads as C3). When the render is a mix,
   // measure a melody-only copy so the reported accuracy describes the line.
@@ -462,10 +466,11 @@ async function singWithFormant (cwd, args, plan, warning) {
   const timings = rendered.syllableTimings
   const cappedTimings = timings.slice(0, MAX_TIMINGS)
   const warnings = rendered.warnings.slice()
+  if (requestedVoice !== voice) warnings.push(`unknown voice "${requestedVoice}"; sang with "${voice}"`)
   if (warning !== null) warnings.push(warning)
   const text = [
     summaryLine(cwd, written.target, written.bytes, written.metrics, [
-      `engine ${ENGINE_FORMANT} · voice ${String(args.voice ?? 'alto')} · bpm ${fmt(plan.bpm, 0)} · ${plan.notes.length} note(s) · ${timings.length} syllable(s)${args.harmony ? ` · harmony ${args.harmony}` : ''}`
+      `engine ${ENGINE_FORMANT} · voice ${voice} · bpm ${fmt(plan.bpm, 0)} · ${plan.notes.length} note(s) · ${timings.length} syllable(s)${args.harmony ? ` · harmony ${args.harmony}` : ''}`
     ]),
     pitchLine(accuracy, multiVoice),
     timingsLine(cappedTimings, timings.length),
@@ -480,7 +485,7 @@ async function singWithFormant (cwd, args, plan, warning) {
     sampleRate,
     bpm: plan.bpm,
     notes: plan.notes.length,
-    voice: String(args.voice ?? 'alto'),
+    voice,
     engine: ENGINE_FORMANT,
     voicebank: null,
     warning,

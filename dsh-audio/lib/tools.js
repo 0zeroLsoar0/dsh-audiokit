@@ -20,6 +20,7 @@ import {
   renderPreset,
   resolvePath,
   toWavBytes,
+  validateMixOptions,
   writeFileAtomic
 } from './audio.js'
 import { PRESETS } from './dsp.js'
@@ -47,6 +48,39 @@ function sessionCwd (ctx, exec) {
 
 function fmt (value, digits = 1) {
   return Number(value).toFixed(digits).replace(/\.0+$/, '')
+}
+
+function describeValue (value) {
+  if (typeof value === 'number') return String(value)
+  try {
+    return JSON.stringify(value) ?? String(value)
+  } catch {
+    return String(value)
+  }
+}
+
+/**
+ * Read an optional numeric argument, rejecting only values that have no meaning.
+ *
+ * `undefined`/`null` mean "use the default" and a numeric string is accepted
+ * because the host may send one. A literal NaN (or "abc") used to render a
+ * 0-frame file whose report was full of NaN; Infinity is left alone because the
+ * engine clamps it on purpose (`duration: 1e999` is the documented 30 s cap).
+ */
+function readNumber (tool, key, value) {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'number' && typeof value !== 'string') {
+    throw new Error(`${tool}: ${key} must be a number, got ${describeValue(value)}`)
+  }
+  const number = Number(value)
+  if (Number.isNaN(number)) throw new Error(`${tool}: ${key} must be a number, got ${describeValue(value)}`)
+  return number
+}
+
+function requirePreset (tool, preset) {
+  if (typeof preset !== 'string' || preset.trim() === '') {
+    throw new Error(`${tool}: preset is required and must be one of ${PRESET_NAMES.join(', ')}`)
+  }
 }
 
 /** Shared result summary: the numbers an agent needs to decide what to change. */
@@ -84,7 +118,7 @@ export function registerTools (ctx) {
       type: 'object',
       properties: {
         preset: { type: 'string', enum: PRESET_NAMES, description: 'Sound family. impact=weighty hit, whoosh=moving air, tick=very short click, chime=tonal bell, riser=tension build, zap=electric discharge, thud=soft low body, scrap=friction grains, texture=sustained bed (ambience).' },
-        params: { type: 'object', additionalProperties: true, description: 'Perceptual knobs in 0..1 (pitch is 0..1 for tick/chime/zap/thud/scrap and 0.5..2 for impact/whoosh): weight, hardness, metallic, space, tone, brightness, speed, rise, decay, density, roughness, movement, pitch, pitchJitter. For preset "texture" add kind: wind|rain|fire|room|hum.' },
+        params: { type: 'object', additionalProperties: true, description: 'Perceptual knobs in 0..1: weight, hardness, metallic, space, tone, speed, rise, decay, density, roughness, movement, pitchJitter. pitch is a frequency multiplier 0.5..2 on impact, whoosh, switch-click, water-drip, bubble, servo, motor-loop, alarm-beep, alarm-siren, hud-tick, creature-growl, insect-buzz, bell-toll and choir-pad; it is a 0..1 knob on tick, chime and zap; the other presets ignore it. For preset "texture" add kind: wind|rain|fire|room|hum.' },
         duration: { type: 'number', description: 'Length in seconds; defaults to the preset length (0.05 for tick, 1.6 for riser, 3 for texture).' },
         seed: { type: 'integer', description: 'Variation seed. Same seed reproduces the same take; change it to get a sibling variant.' },
         loop: { type: 'boolean', description: 'Render a seamless loop (for beds and hums). The file then repeats without a thump.' },
@@ -98,6 +132,9 @@ export function registerTools (ctx) {
     presentCall: (args) => ({ card: 'generic', title: `Render ${args.preset ?? 'sound'}`, kind: 'other', rawInput: args }),
     async execute (args, exec) {
       const cwd = sessionCwd(ctx, exec)
+      readNumber('audio_synth', 'duration', args.duration)
+      readNumber('audio_synth', 'sampleRate', args.sampleRate)
+      readNumber('audio_synth', 'seed', args.seed)
       const spec = { preset: args.preset, params: args.params ?? {}, duration: args.duration, seed: args.seed ?? 1, loop: args.loop === true, sampleRate: args.sampleRate ?? 44100 }
       const hash = hashSpec(spec)
       const rendered = renderPreset({ ...spec, params: spec.params })
@@ -128,9 +165,9 @@ export function registerTools (ctx) {
         preset: { type: 'string', enum: PRESET_NAMES, description: 'Preset repeated by the pattern.' },
         kind: { type: 'string', enum: ['train', 'scatter', 'riser'], description: 'train=evenly spaced (curve reshapes spacing), scatter=random positions, riser=one continuous rising sweep.' },
         from: { type: 'number', description: 'Start offset in seconds within the pattern file; defaults to 0.' },
-        to: { type: 'number', description: 'End of the span in seconds; defaults to 4.' },
+        to: { type: 'number', description: 'End of the span in seconds; defaults to 4. The span (to - from) is capped at 180 s.' },
         every: { type: 'number', description: 'Spacing between events in seconds; ignored when count is given.' },
-        count: { type: 'integer', description: 'Exact number of events instead of a spacing.' },
+        count: { type: 'integer', description: 'Exact number of events instead of a spacing; capped at 20000.' },
         curve: { type: 'string', enum: ['linear', 'accelerando', 'ritardando', 'ease'], description: 'How spacing changes across the span. accelerando crowds events toward the end.' },
         jitter: { type: 'number', description: '0..1 timing randomness; keeps a train from sounding mechanical.' },
         accentEvery: { type: 'integer', description: 'Accent every Nth event (e.g. 4 for a 4/4 feel).' },
@@ -148,6 +185,13 @@ export function registerTools (ctx) {
     presentCall: (args) => ({ card: 'generic', title: `Pattern ${args.preset ?? 'sound'}`, kind: 'other', rawInput: args }),
     async execute (args, exec) {
       const cwd = sessionCwd(ctx, exec)
+      requirePreset('audio_pattern', args.preset)
+      readNumber('audio_pattern', 'from', args.from)
+      readNumber('audio_pattern', 'to', args.to)
+      readNumber('audio_pattern', 'every', args.every)
+      readNumber('audio_pattern', 'count', args.count)
+      readNumber('audio_pattern', 'sampleRate', args.sampleRate)
+      readNumber('audio_pattern', 'seed', args.seed)
       const spec = {
         preset: args.preset,
         kind: args.kind ?? 'train',
@@ -190,9 +234,9 @@ export function registerTools (ctx) {
       type: 'object',
       properties: {
         inputs: { type: 'array', items: { type: 'string' }, description: 'Input .wav paths, relative to the working directory or absolute.' },
-        offsets: { type: 'array', items: { type: 'number' }, description: 'Start time of each input in seconds, same order as inputs. This is what turns a set of one-shots into a cue track; omit for 0.' },
-        gains: { type: 'array', items: { type: 'number' }, description: 'Per-input gain in dB, same order as inputs (e.g. -6 quiets an input by 6 dB).' },
-        durationSeconds: { type: 'number', description: 'Trim or pad the result to this length; defaults to the longest input.' },
+        offsets: { type: 'array', items: { type: 'number' }, description: 'Start time of each input in seconds, same order as inputs (finite, 0..180). This is what turns a set of one-shots into a cue track; omit for 0.' },
+        gains: { type: 'array', items: { type: 'number' }, description: 'Per-input gain in dB, same order as inputs (finite, -120..24; e.g. -6 quiets an input by 6 dB).' },
+        durationSeconds: { type: 'number', description: 'Trim or pad the result to this length (finite, > 0, at most 180 s); defaults to the longest input.' },
         fadeInSeconds: { type: 'number', description: 'Fade in length; omit for none.' },
         fadeOutSeconds: { type: 'number', description: 'Fade out length; omit for none.' },
         limiter: { type: 'boolean', description: 'Soft-limit the sum; defaults to true.' },
@@ -207,6 +251,13 @@ export function registerTools (ctx) {
     presentCall: (args) => ({ card: 'generic', title: `Mix ${args.inputs?.length ?? 0} tracks`, kind: 'other', rawInput: args }),
     async execute (args, exec) {
       const cwd = sessionCwd(ctx, exec)
+      // Reject a bad offset/duration before any file is opened: the same check
+      // runs inside mixTracks, but by then the inputs have already been read.
+      validateMixOptions({ offsets: args.offsets ?? [], gains: args.gains ?? [], durationSeconds: args.durationSeconds })
+      readNumber('audio_mix', 'sampleRate', args.sampleRate)
+      readNumber('audio_mix', 'peakDbfs', args.peakDbfs)
+      readNumber('audio_mix', 'fadeInSeconds', args.fadeInSeconds)
+      readNumber('audio_mix', 'fadeOutSeconds', args.fadeOutSeconds)
       const paths = (args.inputs ?? []).map((input) => resolvePath(cwd, input)).filter(Boolean)
       if (paths.length === 0) throw new Error('audio_mix needs at least one input path')
       const tracks = []

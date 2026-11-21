@@ -347,6 +347,29 @@ export function padSilence (track, options = {}) {
   return { samples: out, sampleRate }
 }
 
+/** A join gap/crossfade is an edit between takes; longer than this is a timeline move. */
+export const MAX_JOIN_SECONDS = 60
+
+/**
+ * Validate one join length.
+ *
+ * A negative length is documented as "no join" and clamps to 0, but a
+ * non-finite or absurd one used to reach `new Float32Array(Infinity)` and crash
+ * with `RangeError` instead of naming the argument.
+ * @param {string} key - option name, used in the message.
+ * @param {number} [value] - requested seconds.
+ * @returns {number} 0..MAX_JOIN_SECONDS.
+ */
+function joinSeconds (key, value) {
+  if (value === undefined || value === null) return 0
+  const number = Number(value)
+  if (!Number.isFinite(number) || number > MAX_JOIN_SECONDS) {
+    const shown = typeof value === 'number' ? String(value) : (JSON.stringify(value) ?? String(value))
+    throw new Error(`concat: ${key} must be a finite number of seconds at most ${MAX_JOIN_SECONDS}, got ${shown}`)
+  }
+  return Math.max(0, number)
+}
+
 /**
  * Join tracks in order, with a silent gap or an equal-power crossfade between
  * them.
@@ -367,8 +390,8 @@ export function concat (tracks, options = {}) {
   const parts = prepared.map((track) => (
     track.sampleRate === sampleRate ? track.samples : resampleHiFi(track.samples, track.sampleRate, sampleRate).samples
   ))
-  const gapFrames = Math.max(0, frame(numberOr(options.gapSeconds, 0), sampleRate))
-  const crossfadeFrames = Math.max(0, frame(numberOr(options.crossfadeSeconds, 0), sampleRate))
+  const gapFrames = frame(joinSeconds('gapSeconds', options.gapSeconds), sampleRate)
+  const crossfadeFrames = frame(joinSeconds('crossfadeSeconds', options.crossfadeSeconds), sampleRate)
   if (gapFrames > 0 && crossfadeFrames > 0) {
     throw new Error('concat: use gapSeconds or crossfadeSeconds, not both')
   }
