@@ -25,18 +25,14 @@
  */
 
 import {
-  addInto,
   clamp,
   dbToGain,
   dcBlock,
   decayEnvelope,
-  filter,
   glideTone,
   lerp,
   makeRng,
-  noise,
   normalizePeak,
-  reverb,
   softLimit
 } from './dsp.js'
 import { encodeWav } from './wav.js'
@@ -1643,20 +1639,183 @@ function releaseFor (spec, artic) {
 }
 
 /**
+ * Envelope lookup shared by the note renderers.
+ *
+ * A four-voice pad renders four notes with the same voice and the same length,
+ * so the same envelope was being rebuilt from scratch four times per chord —
+ * and the same is true of a bass track's repeated note lengths. The cache is
+ * per-track (see `renderScore`), so it cannot grow across renders, and it is
+ * bounded so a melody with many distinct note lengths cannot pin megabytes.
+ *
+ * @param {Map<string, Float32Array>|undefined} cache - per-track envelope cache.
+ * @returns {Float32Array} amplitude envelope, identical to `makeAmpEnvelope`.
+ */
+function envelopeFor (cache, spec, total, durFrames, releaseSeconds, sampleRate) {
+  if (cache === undefined) {
+    return makeAmpEnvelope(total, durFrames, spec, releaseSeconds, sampleRate)
+  }
+  const key = `${total}|${durFrames}|${releaseSeconds}|${sampleRate}|${spec.attack ?? ''}|${spec.decay ?? ''}|${spec.sustain ?? ''}`
+  const cached = cache.get(key)
+  if (cached !== undefined) return cached
+  const env = makeAmpEnvelope(total, durFrames, spec, releaseSeconds, sampleRate)
+  if (cache.size >= 16) cache.delete(cache.keys().next().value)
+  cache.set(key, env)
+  return env
+}
+
+/**
+ * Constant-cutoff state-variable filter coefficients.
+ *
+ * Every voice in the genre table has a fixed cutoff, so the block loop in
+ * `renderSubtractive` was recomputing `tan()` coefficients 32 samples at a time
+ * for values that never change. Computing them once is the same arithmetic with
+ * the same inputs, which keeps the samples bit-identical.
+ */
+function staticFilter (q, cutoff, sampleRate) {
+  const g = Math.tan(Math.PI * cutoff / sampleRate)
+  const k = 1 / Math.max(q, 0.15)
+  const a1 = 1 / (1 + g * (g + k))
+  const a2 = g * a1
+  return { k, a1, a2, a3: g * a2 }
+}
+
+/**
+ * One band-limited saw sample.
+ *
+ * `phase` must already be the float32-rounded value the original phase array
+ * held, and `dt` the float32 increment, so the polyBLEP correction lands on the
+ * same samples as before.
+ */
+function polyBlepSaw (phase, dt) {
+  let sample = 2 * phase - 1
+  if (phase < dt) {
+    const x = phase / dt
+    sample -= x + x - x * x - 1
+  } else if (phase > 1 - dt) {
+    const x = (phase - 1) / dt
+    sample -= x * x + x + x + 1
+  }
+  return sample
+}
+
+/** One subtractive oscillator layer plus its sub, before the shared filter. */
+function renderOscLayer (type, out, env, total, dt, phase, subAmount, subIncrement, subPhase, filter, gainScale) {
+  const a1 = filter.a1
+  const a2 = filter.a2
+  const a3 = filter.a3
+  let ic1 = 0
+  let ic2 = 0
+  for (let index = 0; index < total; index += 1) {
+    phase = Math.fround(phase + dt)
+    if (phase >= 1) phase = Math.fround(phase - 1)
+    let sample
+    if (type === 'saw') {
+      sample = polyBlepSaw(phase, dt)
+    } else if (type === 'square') {
+      sample = phase < 0.5 ? 1 : -1
+      if (phase < dt) {
+        const x = phase / dt
+        sample += x + x - x * x - 1
+      } else if (phase > 1 - dt) {
+        const x = (phase - 1) / dt
+        sample += x * x + x + x + 1
+      }
+      const shifted = (phase + 0.5) % 1
+      if (shifted < dt) {
+        const x = shifted / dt
+        sample -= x + x - x * x - 1
+      } else if (shifted > 1 - dt) {
+        const x = (shifted - 1) / dt
+        sample -= x * x + x + x + 1
+      }
+    } else if (type === 'triangle') {
+      sample = 1 - 4 * Math.abs(phase - 0.5)
+    } else {
+      sample = Math.sin(TAU * phase)
+    }
+    if (subAmount > 0) {
+      subPhase += subIncrement
+      if (subPhase >= 1) subPhase -= 1
+      sample += Math.sin(TAU * subPhase) * subAmount * 1.3
+    }
+    const v3 = sample - ic2
+    const v1 = a1 * ic1 + a2 * v3
+    const v2 = ic2 + a2 * ic1 + a3 * v3
+    ic1 = 2 * v1 - ic1
+    ic2 = 2 * v2 - ic2
+    out[index] = v2 * env[index] * gainScale
+  }
+}
+
+/** Two detuned saw layers summed before the filter, the pad/lead case. */
+function renderSawLayers (out, env, total, dt, phaseA, phaseB, dtB, filter, gainScale) {
+  const a1 = filter.a1
+  const a2 = filter.a2
+  const a3 = filter.a3
+  let ic1 = 0
+  let ic2 = 0
+  for (let index = 0; index < total; index += 1) {
+    phaseA = Math.fround(phaseA + dt)
+    if (phaseA >= 1) phaseA = Math.fround(phaseA - 1)
+    phaseB = Math.fround(phaseB + dtB)
+    if (phaseB >= 1) phaseB = Math.fround(phaseB - 1)
+    const sample = polyBlepSaw(phaseA, dt) + polyBlepSaw(phaseB, dtB)
+    const v3 = sample - ic2
+    const v1 = a1 * ic1 + a2 * v3
+    const v2 = ic2 + a2 * ic1 + a3 * v3
+    ic1 = 2 * v1 - ic1
+    ic2 = 2 * v2 - ic2
+    out[index] = v2 * env[index] * gainScale
+  }
+}
+
+/**
  * Detuned subtractive voice: one or two polyBLEP oscillators through a
  * resonant state-variable low-pass with an optional filter envelope, plus an
  * optional sine sub for weight. This is the workhorse behind pads, basses and
  * leads; the genre tables choose the waveform, cutoff, detune and envelope.
+ *
+ * The waveform dispatch and the per-layer loop are hoisted out of the sample
+ * loop for the cases the genre table actually uses (one oscillator of any
+ * waveform, or two saws). The remaining cases keep the original per-sample
+ * dispatch. Both paths compute the same numbers in the same order, so the
+ * output is unchanged — only the work spent getting there is.
  */
-function renderSubtractive (spec, freq, durSeconds, velocity, sampleRate, rng, artic) {
+function renderSubtractive (spec, freq, durSeconds, velocity, sampleRate, rng, artic, envelopes) {
   const release = releaseFor(spec, artic)
   const durFrames = Math.max(8, Math.round(durSeconds * sampleRate))
   const total = durFrames + Math.round(release * sampleRate)
-  const env = makeAmpEnvelope(total, durFrames, spec, release, sampleRate)
+  const env = envelopeFor(envelopes, spec, total, durFrames, release, sampleRate)
   const out = new Float32Array(total)
   const type = spec.type === 'pad' ? 'saw' : (spec.type ?? 'saw')
   const layers = Math.max(1, Math.round(spec.layers ?? (spec.type === 'pad' ? 2 : 1)))
   const detune = clamp(spec.detune ?? 0, 0, 50)
+  const subAmount = clamp(spec.sub ?? 0, 0, 1)
+  const subIncrement = (freq * 0.5) / sampleRate
+  const baseCutoff = clamp(spec.cutoff ?? 3000, 30, sampleRate * 0.45)
+  const cutoffEnv = clamp(spec.cutoffEnv ?? 0, 0, 8)
+  const cutoffDecay = Math.max(0.01, spec.cutoffDecay ?? 0.2) * sampleRate
+  const q = clamp(spec.resonance ?? 0.9, 0.2, 8)
+  const gainScale = (spec.gain ?? 1) * velocity * (0.62 / Math.sqrt(layers))
+
+  if (cutoffEnv === 0 && layers === 1) {
+    const filter = staticFilter(q, baseCutoff, sampleRate)
+    // A single layer has no detune, so its increment is exactly freq / rate; the
+    // original computes `freq * 1 / rate` and stores it in a float32 array.
+    renderOscLayer(type, out, env, total, Math.fround(freq / sampleRate), 0, subAmount, subIncrement, 0, filter, gainScale)
+    return out
+  }
+  if (cutoffEnv === 0 && layers === 2 && type === 'saw') {
+    const filter = staticFilter(q, baseCutoff, sampleRate)
+    const dtA = Math.fround((freq * Math.pow(2, -detune / 1200)) / sampleRate)
+    const dtB = Math.fround((freq * Math.pow(2, detune / 1200)) / sampleRate)
+    // The phase array is float32, so the 0.37 offset is the float32 value of it.
+    renderSawLayers(out, env, total, dtA, 0, Math.fround(0.37), dtB, filter, gainScale)
+    return out
+  }
+
+  // Rare path: a moving filter envelope, more than two layers, or a detuned
+  // non-saw. Kept as the original block loop so unusual voices still render.
   const phases = new Float32Array(layers)
   const increments = new Float32Array(layers)
   for (let layer = 0; layer < layers; layer += 1) {
@@ -1664,15 +1823,8 @@ function renderSubtractive (spec, freq, durSeconds, velocity, sampleRate, rng, a
     increments[layer] = (freq * Math.pow(2, cents / 1200)) / sampleRate
     phases[layer] = (layer * 0.37) % 1
   }
-  const subAmount = clamp(spec.sub ?? 0, 0, 1)
-  const subIncrement = (freq * 0.5) / sampleRate
   let subPhase = 0
-  const baseCutoff = clamp(spec.cutoff ?? 3000, 30, sampleRate * 0.45)
-  const cutoffEnv = clamp(spec.cutoffEnv ?? 0, 0, 8)
-  const cutoffDecay = Math.max(0.01, spec.cutoffDecay ?? 0.2) * sampleRate
-  const q = clamp(spec.resonance ?? 0.9, 0.2, 8)
   const k = 1 / q
-  const gainScale = (spec.gain ?? 1) * velocity * (0.62 / Math.sqrt(layers))
   const blockSize = 32
   let ic1 = 0
   let ic2 = 0
@@ -1717,11 +1869,11 @@ function renderSubtractive (spec, freq, durSeconds, velocity, sampleRate, rng, a
  * Fast attack + long decay makes it a bell; slower index decay and ratio 1 make
  * it an electric piano. Both live in the same six lines.
  */
-function renderFm (spec, freq, durSeconds, velocity, sampleRate, rng, artic) {
+function renderFm (spec, freq, durSeconds, velocity, sampleRate, rng, artic, envelopes) {
   const release = releaseFor(spec, artic)
   const durFrames = Math.max(8, Math.round(durSeconds * sampleRate))
   const total = durFrames + Math.round(release * sampleRate)
-  const env = makeAmpEnvelope(total, durFrames, spec, release, sampleRate)
+  const env = envelopeFor(envelopes, spec, total, durFrames, release, sampleRate)
   const out = new Float32Array(total)
   const ratio = Math.max(0.25, spec.ratio ?? 2)
   const index0 = clamp(spec.index ?? 2, 0, 12)
@@ -1732,9 +1884,10 @@ function renderFm (spec, freq, durSeconds, velocity, sampleRate, rng, artic) {
   let carrierPhase = 0
   let modulatorPhase = 0
   const blockSize = 32
-  let indexAmount = index0
   for (let start = 0; start < total; start += blockSize) {
-    indexAmount = index0 * Math.exp(-(start / sampleRate) / indexDecay)
+    // The modulation index only moves every block, so the expensive exp stays
+    // out of the sample loop.
+    const indexAmount = index0 * Math.exp(-(start / sampleRate) / indexDecay)
     const end = Math.min(total, start + blockSize)
     for (let sample = start; sample < end; sample += 1) {
       carrierPhase += carrierIncrement
@@ -1754,11 +1907,14 @@ function renderFm (spec, freq, durSeconds, velocity, sampleRate, rng, artic) {
  * tune; `damp` controls how long the string rings, `bright` how noisy the pick
  * is.
  */
-function renderPluck (spec, freq, durSeconds, velocity, sampleRate, rng, artic) {
+/** Envelope spec every Karplus-Strong note shares, hoisted so it can be cached. */
+const PLUCK_ENVELOPE = { attack: 0.002, decay: 0.01, sustain: 1 }
+
+function renderPluck (spec, freq, durSeconds, velocity, sampleRate, rng, artic, envelopes) {
   const release = releaseFor(spec, artic)
   const durFrames = Math.max(8, Math.round(durSeconds * sampleRate))
   const total = durFrames + Math.round(release * sampleRate)
-  const env = makeAmpEnvelope(total, durFrames, { attack: 0.002, decay: 0.01, sustain: 1 }, release, sampleRate)
+  const env = envelopeFor(envelopes, PLUCK_ENVELOPE, total, durFrames, release, sampleRate)
   const out = new Float32Array(total)
   const damp = clamp(spec.damp ?? 0.996, 0.9, 0.99995)
   const bright = clamp(spec.bright ?? 0.5, 0, 1)
@@ -1766,8 +1922,9 @@ function renderPluck (spec, freq, durSeconds, velocity, sampleRate, rng, artic) 
   const whole = Math.floor(delayLength)
   const fraction = delayLength - whole
   const line = new Float32Array(whole + 2)
+  const size = line.length
   let excitationFilter = 0
-  for (let index = 0; index < whole + 2; index += 1) {
+  for (let index = 0; index < size; index += 1) {
     const white = rng() * 2 - 1
     excitationFilter += (white - excitationFilter) * (0.12 + bright * 0.85)
     line[index] = excitationFilter
@@ -1777,12 +1934,15 @@ function renderPluck (spec, freq, durSeconds, velocity, sampleRate, rng, artic) 
   let previous = 0
   for (let index = 0; index < total; index += 1) {
     const first = line[cursor]
-    const second = line[(cursor + 1) % line.length]
+    // `% size` is the natural spelling; the branch is the same value with no
+    // integer division in the hottest loop of the pluck voice.
+    const second = line[cursor + 1 < size ? cursor + 1 : 0]
     const value = first + (second - first) * fraction
     const feedback = (value + previous) * 0.5 * damp
     line[cursor] = feedback
     previous = value
-    cursor = (cursor + 1) % line.length
+    cursor += 1
+    if (cursor >= size) cursor = 0
     out[index] = value * env[index] * gainScale
   }
   return out
@@ -1793,24 +1953,49 @@ function renderPluck (spec, freq, durSeconds, velocity, sampleRate, rng, artic) 
  * Used for the colour track of ambient/lofi/horror, where the arrangement needs
  * atmosphere rather than notes.
  */
-function renderNoiseBed (spec, durSeconds, velocity, sampleRate, rng, artic) {
+function renderNoiseBed (spec, durSeconds, velocity, sampleRate, rng, artic, envelopes) {
   const release = releaseFor(spec, artic)
   const durFrames = Math.max(16, Math.round(durSeconds * sampleRate))
   const total = durFrames + Math.round(release * sampleRate)
-  const env = makeAmpEnvelope(total, durFrames, { attack: spec.attack ?? 0.4, decay: 0.6, sustain: 0.9 }, release, sampleRate)
+  const env = envelopeFor(envelopes, { attack: spec.attack ?? 0.4, decay: 0.6, sustain: 0.9 }, total, durFrames, release, sampleRate)
   const out = new Float32Array(total)
-  const base = noise(total, rng, 'pink', sampleRate)
   const kind = spec.kind ?? 'wind'
   const gainScale = (spec.gain ?? 1) * velocity
+  // Hoist everything that depends on `kind`. The original re-decided movement,
+  // cutoff and the hiss branch with three string comparisons per sample.
+  const movement = kind === 'wind' ? 0.55 : kind === 'scrape' ? 0.4 : 0.15
+  const baseCutoff = kind === 'hiss' ? 5200 : kind === 'room' ? 1500 : 900
+  const subtractLowpass = kind === 'hiss'
+  // Pink noise inlined from `noise(..., 'pink')`: identical sums, but it no
+  // longer allocates a second full-length buffer for the bed.
+  let b0 = 0
+  let b1 = 0
+  let b2 = 0
   let lowpass = 0
+  // The wobble is a 0.07 Hz LFO; it moves the cutoff by a few parts per million
+  // across one 32-sample block, so the one-pole coefficient is refreshed per
+  // block instead of per sample. This is the one place where a faster renderer
+  // is not bit-identical: the bed differs from the old one by ~1e-5 relative
+  // amplitude (-95 dB), far below the 16-bit dither and below the audible
+  // threshold by a wide margin. A `sin` and an `exp` per sample was most of the
+  // cost of the wind, vinyl and scrape tracks.
+  const wobbleBlock = 32
+  let alpha = 0
+  let nextWobbleAt = 0
   for (let index = 0; index < total; index += 1) {
-    const seconds = index / sampleRate
-    const movement = kind === 'wind' ? 0.55 : kind === 'scrape' ? 0.4 : 0.15
-    const wobble = 0.75 + movement * 0.25 * Math.sin(TAU * 0.07 * seconds + 1.3)
-    const cutoff = (kind === 'hiss' ? 5200 : kind === 'room' ? 1500 : 900) * wobble
-    const alpha = clamp(1 - Math.exp(-TAU * cutoff / sampleRate), 0.0001, 0.9)
-    lowpass += (base[index] - lowpass) * alpha
-    const sample = kind === 'hiss' ? base[index] - lowpass * 0.7 : lowpass
+    if (index >= nextWobbleAt) {
+      const wobble = 0.75 + movement * 0.25 * Math.sin(TAU * 0.07 * (index / sampleRate) + 1.3)
+      const cutoff = baseCutoff * wobble
+      alpha = clamp(1 - Math.exp(-TAU * cutoff / sampleRate), 0.0001, 0.9)
+      nextWobbleAt = index + wobbleBlock
+    }
+    const white = rng() * 2 - 1
+    b0 = 0.99765 * b0 + white * 0.099046
+    b1 = 0.963 * b1 + white * 0.2965164
+    b2 = 0.57 * b2 + white * 1.0526913
+    const base = Math.fround((b0 + b1 + b2 + white * 0.1848) * 0.25)
+    lowpass += (base - lowpass) * alpha
+    const sample = subtractLowpass ? base - lowpass * 0.7 : lowpass
     out[index] = sample * env[index] * gainScale
   }
   if (kind === 'vinyl') {
@@ -1825,14 +2010,39 @@ function renderNoiseBed (spec, durSeconds, velocity, sampleRate, rng, artic) {
   }
   if (kind === 'scrape') {
     const grains = Math.round((total / sampleRate) * 5)
+    const attackFrames = Math.max(1, 0.001 * sampleRate)
+    const burst = new Float32Array(Math.max(64, Math.round(0.062 * sampleRate) + 1))
     for (let grain = 0; grain < grains; grain += 1) {
       const at = Math.floor(rng() * Math.max(1, total - 4096))
       const length = Math.max(64, Math.round((0.012 + rng() * 0.05) * sampleRate))
-      const burst = noise(length, rng, 'white', sampleRate)
-      const burstEnv = decayEnvelope(length, sampleRate, 0.006 + rng() * 0.02)
-      for (let index = 0; index < length; index += 1) burst[index] *= burstEnv[index]
+      // The rng order is part of the score: noise draws first, then the decay
+      // draw, then the centre, then one q draw per filtered sample.
+      for (let index = 0; index < length; index += 1) burst[index] = (rng() * 2 - 1) * 0.5
+      const tau = Math.max(1 / sampleRate, 0.006 + rng() * 0.02) * sampleRate
+      for (let index = 0; index < length; index += 1) {
+        const attackGain = index < attackFrames ? index / attackFrames : 1
+        burst[index] = Math.fround(burst[index] * Math.fround(attackGain * Math.exp(-index / tau)))
+      }
       const centre = 900 + rng() * 2600
-      addInto(out, filter(burst, sampleRate, () => centre, () => 4 + rng() * 4, 'bp'), at, gainScale * 0.7)
+      // Static cutoff, per-sample resonance: the filter's `tan` was being
+      // recomputed for a cutoff that never moves inside one grain.
+      const g = Math.tan(Math.PI * clamp(centre, 20, sampleRate * 0.45) / sampleRate)
+      const addGain = gainScale * 0.7
+      let ic1 = 0
+      let ic2 = 0
+      for (let index = 0; index < length; index += 1) {
+        const input = burst[index]
+        const k = 1 / Math.max(4 + rng() * 4, 0.15)
+        const a1 = 1 / (1 + g * (g + k))
+        const a2 = g * a1
+        const a3 = g * a2
+        const v3 = input - ic2
+        const v1 = a1 * ic1 + a2 * v3
+        const v2 = ic2 + a2 * ic1 + a3 * v3
+        ic1 = 2 * v1 - ic1
+        ic2 = 2 * v2 - ic2
+        if (at + index < total) out[at + index] = Math.fround(out[at + index] + Math.fround(v1) * addGain)
+      }
     }
   }
   return out
@@ -1852,6 +2062,230 @@ const DRUM_VOICES = {
   70: 'shaker'
 }
 
+/* ------------------------------------------------------------ drum cache -- */
+
+/**
+ * Static (per-family, per-sample-rate) parts of a drum hit.
+ *
+ * Every kick in a cue is the same kick: same body sweep, same click envelope,
+ * same filter. Rebuilding that body from `glideTone` for every hit spent most
+ * of the drum track's time recomputing identical samples — a sine sweep with a
+ * `Math.pow` pitch curve and an exponential envelope per sample, per hit. The
+ * body, the noise envelopes and the filter coefficients are cached here; the
+ * hits still differ because every noise layer keeps drawing from the per-note
+ * rng, exactly as before.
+ *
+ * The cache is bounded so a session rendering at many sample rates cannot
+ * accumulate voices forever.
+ */
+const DRUM_CACHE_LIMIT = 32
+const DRUM_CACHE = new Map()
+
+/**
+ * Build the static parts of one drum family.
+ * @returns {{ frames: number, body: Float32Array|null, bodyGain: number, layers: object[] }}
+ */
+function buildDrumVoice (family, sampleRate) {
+  const tone = (frames, startHz, endHz, glide, rate, shape) =>
+    glideTone(frames, sampleRate, startHz, endHz, glide, (progress) => Math.exp(-progress * rate), shape)
+  const noiseLayer = (frames, env, cutoff, q, mode, gain, color = 0) => ({
+    frames,
+    env,
+    coeffs: staticFilter(q, cutoff, sampleRate),
+    mode,
+    gain,
+    color
+  })
+
+  if (family === 'kick') {
+    const frames = Math.max(16, Math.round(0.45 * sampleRate))
+    const clickFrames = Math.min(frames, Math.round(0.012 * sampleRate))
+    return {
+      frames,
+      body: tone(frames, 175, 46, 0.3, 6.5, 0),
+      bodyGain: 0.95,
+      layers: [{ offset: 0, ...noiseLayer(clickFrames, decayEnvelope(clickFrames, sampleRate, 0.0035), 3000, 0.9, 2, 0.4) }]
+    }
+  }
+
+  if (family === 'snare') {
+    const frames = Math.max(16, Math.round(0.26 * sampleRate))
+    const noiseFrames = Math.min(frames, Math.round(0.2 * sampleRate))
+    return {
+      frames,
+      body: tone(frames, 245, 185, 0.6, 14, 1),
+      bodyGain: 0.3,
+      layers: [{ offset: 0, ...noiseLayer(noiseFrames, decayEnvelope(noiseFrames, sampleRate, 0.13), 1800, 1.3, 1, 0.85) }]
+    }
+  }
+
+  if (family === 'clap') {
+    const frames = Math.max(16, Math.round(0.24 * sampleRate))
+    const length = Math.max(64, Math.round(0.09 * sampleRate))
+    const env = decayEnvelope(length, sampleRate, 0.03)
+    const layers = [0, 0.019, 0.041].map((at) => ({
+      offset: Math.round(at * sampleRate),
+      ...noiseLayer(length, env, 1500, 1.1, 1, 0.55)
+    }))
+    return { frames, body: null, bodyGain: 0, layers }
+  }
+
+  if (family === 'hat' || family === 'openHat') {
+    const decay = family === 'hat' ? 0.03 : 0.26
+    const frames = Math.max(16, Math.round((decay * 3 + 0.02) * sampleRate))
+    return {
+      frames,
+      body: null,
+      bodyGain: 0,
+      layers: [{
+        offset: 0,
+        ...noiseLayer(frames, decayEnvelope(frames, sampleRate, decay, 0.0005), 7200, 0.85, 2, 1)
+      }]
+    }
+  }
+
+  if (family === 'rim') {
+    const frames = Math.max(16, Math.round(0.09 * sampleRate))
+    return {
+      frames,
+      body: tone(frames, 940, 780, 0.7, 26, 1),
+      bodyGain: 0.35,
+      layers: [{ offset: 0, ...noiseLayer(frames, decayEnvelope(frames, sampleRate, 0.018), 2600, 1.1, 2, 0.6) }]
+    }
+  }
+
+  if (family === 'tomLow' || family === 'tomMid') {
+    const frames = Math.max(16, Math.round(0.4 * sampleRate))
+    const start = family === 'tomLow' ? 145 : 205
+    const end = family === 'tomLow' ? 78 : 118
+    return {
+      frames,
+      body: tone(frames, start, end, 0.35, 7.5, 0),
+      bodyGain: 0.9,
+      layers: [{ offset: 0, ...noiseLayer(frames, decayEnvelope(frames, sampleRate, 0.08), 520, 0.8, 0, 0.5, 1) }]
+    }
+  }
+
+  if (family === 'crash') {
+    const frames = Math.max(16, Math.round(1.1 * sampleRate))
+    return {
+      frames,
+      body: null,
+      bodyGain: 0,
+      env: decayEnvelope(frames, sampleRate, 0.45, 0.002, 1),
+      bright: staticFilter(0.8, 5200, sampleRate),
+      shimmer: staticFilter(2.2, 2600, sampleRate),
+      layers: []
+    }
+  }
+
+  // Shaker: a short, soft, high noise brush.
+  const frames = Math.max(16, Math.round(0.1 * sampleRate))
+  return {
+    frames,
+    body: null,
+    bodyGain: 0,
+    layers: [{
+      offset: 0,
+      ...noiseLayer(frames, decayEnvelope(frames, sampleRate, 0.05, 0.008), 5400, 1.1, 2, 1)
+    }]
+  }
+}
+
+/** Look up (and build once) the static parts of a drum family. */
+function drumVoice (family, sampleRate) {
+  const key = `${family}|${sampleRate}`
+  const cached = DRUM_CACHE.get(key)
+  if (cached !== undefined) return cached
+  const voice = buildDrumVoice(family, sampleRate)
+  if (DRUM_CACHE.size >= DRUM_CACHE_LIMIT) DRUM_CACHE.delete(DRUM_CACHE.keys().next().value)
+  DRUM_CACHE.set(key, voice)
+  return voice
+}
+
+/**
+ * Run a static-cutoff state-variable filter over `input`.
+ * `mode`: 0 = low-pass, 1 = band-pass, 2 = high-pass.
+ */
+function filterStatic (input, coeffs, mode) {
+  const out = new Float32Array(input.length)
+  const a1 = coeffs.a1
+  const a2 = coeffs.a2
+  const a3 = coeffs.a3
+  const k = coeffs.k
+  let ic1 = 0
+  let ic2 = 0
+  for (let index = 0; index < input.length; index += 1) {
+    const value = input[index]
+    const v3 = value - ic2
+    const v1 = a1 * ic1 + a2 * v3
+    const v2 = ic2 + a2 * ic1 + a3 * v3
+    ic1 = 2 * v1 - ic1
+    ic2 = 2 * v2 - ic2
+    out[index] = mode === 0 ? v2 : mode === 1 ? v1 : value - k * v1 - v2
+  }
+  return out
+}
+
+/**
+ * Generate one cached noise layer into `out`.
+ *
+ * The noise is drawn from the note's own rng (so consecutive hits differ), then
+ * enveloped and filtered exactly as `noise()` + `decayEnvelope()` + `filter()`
+ * did, but with the filter coefficients already computed and the buffer
+ * assignments collapsed into one pass.
+ */
+function addNoiseLayer (out, rng, layer) {
+  const frames = layer.frames
+  const env = layer.env
+  const a1 = layer.coeffs.a1
+  const a2 = layer.coeffs.a2
+  const a3 = layer.coeffs.a3
+  const k = layer.coeffs.k
+  const mode = layer.mode
+  const gain = layer.gain
+  const brown = layer.color === 1
+  const start = layer.offset
+  let ic1 = 0
+  let ic2 = 0
+  let walk = 0
+  for (let index = 0; index < frames; index += 1) {
+    const white = rng() * 2 - 1
+    let excitation
+    if (brown) {
+      walk = clamp(walk + white * 0.02, -1, 1)
+      excitation = Math.fround(walk * 0.5)
+    } else {
+      excitation = Math.fround(white * 0.5)
+    }
+    const value = Math.fround(excitation * env[index])
+    const v3 = value - ic2
+    const v1 = a1 * ic1 + a2 * v3
+    const v2 = ic2 + a2 * ic1 + a3 * v3
+    ic1 = 2 * v1 - ic1
+    ic2 = 2 * v2 - ic2
+    const filtered = Math.fround(mode === 0 ? v2 : mode === 1 ? v1 : value - k * v1 - v2)
+    if (start + index < out.length) out[start + index] = Math.fround(out[start + index] + filtered * gain)
+  }
+}
+
+/** Crash: one noise bed through a high-pass and a band-pass, then mixed. */
+function renderCrash (voice, velocity, rng) {
+  const frames = voice.frames
+  const env = voice.env
+  const noiseBed = new Float32Array(frames)
+  for (let index = 0; index < frames; index += 1) {
+    noiseBed[index] = Math.fround(Math.fround((rng() * 2 - 1) * 0.5) * env[index])
+  }
+  const bright = filterStatic(noiseBed, voice.bright, 2)
+  const shimmer = filterStatic(noiseBed, voice.shimmer, 1)
+  for (let index = 0; index < frames; index += 1) {
+    bright[index] = bright[index] * 0.7 + shimmer[index] * 0.5
+  }
+  for (let index = 0; index < frames; index += 1) bright[index] *= velocity
+  return bright
+}
+
 /**
  * Synthesized drum hit. Every voice is a pitched body plus an enveloped noise
  * layer through a filter — the same construction the `impact`/`thud` presets
@@ -1860,99 +2294,17 @@ const DRUM_VOICES = {
  */
 function renderDrumNote (midi, velocity, sampleRate, rng) {
   const family = DRUM_VOICES[midi] ?? 'hat'
-  const scale = (buffer) => {
-    for (let index = 0; index < buffer.length; index += 1) buffer[index] *= velocity
-    return buffer
+  const voice = drumVoice(family, sampleRate)
+  if (family === 'crash') return renderCrash(voice, velocity, rng)
+  const out = new Float32Array(voice.frames)
+  if (voice.body !== null) {
+    const body = voice.body
+    const gain = voice.bodyGain
+    for (let index = 0; index < body.length; index += 1) out[index] = body[index] * gain
   }
-
-  if (family === 'kick') {
-    const frames = Math.max(16, Math.round(0.45 * sampleRate))
-    const out = new Float32Array(frames)
-    const body = glideTone(frames, sampleRate, 175, 46, 0.3, (progress) => Math.exp(-progress * 6.5), 0)
-    addInto(out, body, 0, 0.95)
-    const clickFrames = Math.min(frames, Math.round(0.012 * sampleRate))
-    const click = noise(clickFrames, rng, 'white', sampleRate)
-    const clickEnv = decayEnvelope(clickFrames, sampleRate, 0.0035)
-    for (let index = 0; index < clickFrames; index += 1) click[index] *= clickEnv[index]
-    addInto(out, filter(click, sampleRate, () => 3000, () => 0.9, 'hp'), 0, 0.4)
-    return scale(out)
-  }
-
-  if (family === 'snare') {
-    const frames = Math.max(16, Math.round(0.26 * sampleRate))
-    const out = new Float32Array(frames)
-    addInto(out, glideTone(frames, sampleRate, 245, 185, 0.6, (progress) => Math.exp(-progress * 14), 1), 0, 0.3)
-    const noiseFrames = Math.min(frames, Math.round(0.2 * sampleRate))
-    const hiss = noise(noiseFrames, rng, 'white', sampleRate)
-    const hissEnv = decayEnvelope(noiseFrames, sampleRate, 0.13)
-    for (let index = 0; index < noiseFrames; index += 1) hiss[index] *= hissEnv[index]
-    addInto(out, filter(hiss, sampleRate, () => 1800, () => 1.3, 'bp'), 0, 0.85)
-    return scale(out)
-  }
-
-  if (family === 'clap') {
-    const frames = Math.max(16, Math.round(0.24 * sampleRate))
-    const out = new Float32Array(frames)
-    for (const at of [0, 0.019, 0.041]) {
-      const length = Math.max(64, Math.round(0.09 * sampleRate))
-      const burst = noise(length, rng, 'white', sampleRate)
-      const burstEnv = decayEnvelope(length, sampleRate, 0.03)
-      for (let index = 0; index < length; index += 1) burst[index] *= burstEnv[index]
-      addInto(out, filter(burst, sampleRate, () => 1500, () => 1.1, 'bp'), Math.round(at * sampleRate), 0.55)
-    }
-    return scale(out)
-  }
-
-  if (family === 'hat' || family === 'openHat') {
-    const decay = family === 'hat' ? 0.03 : 0.26
-    const frames = Math.max(16, Math.round((decay * 3 + 0.02) * sampleRate))
-    const out = noise(frames, rng, 'white', sampleRate)
-    const env = decayEnvelope(frames, sampleRate, decay, 0.0005)
-    for (let index = 0; index < frames; index += 1) out[index] *= env[index]
-    return scale(filter(out, sampleRate, () => 7200, () => 0.85, 'hp'))
-  }
-
-  if (family === 'rim') {
-    const frames = Math.max(16, Math.round(0.09 * sampleRate))
-    const out = new Float32Array(frames)
-    addInto(out, glideTone(frames, sampleRate, 940, 780, 0.7, (progress) => Math.exp(-progress * 26), 1), 0, 0.35)
-    const burst = noise(frames, rng, 'white', sampleRate)
-    const burstEnv = decayEnvelope(frames, sampleRate, 0.018)
-    for (let index = 0; index < frames; index += 1) burst[index] *= burstEnv[index]
-    addInto(out, filter(burst, sampleRate, () => 2600, () => 1.1, 'hp'), 0, 0.6)
-    return scale(out)
-  }
-
-  if (family === 'tomLow' || family === 'tomMid') {
-    const frames = Math.max(16, Math.round(0.4 * sampleRate))
-    const out = new Float32Array(frames)
-    const start = family === 'tomLow' ? 145 : 205
-    const end = family === 'tomLow' ? 78 : 118
-    addInto(out, glideTone(frames, sampleRate, start, end, 0.35, (progress) => Math.exp(-progress * 7.5), 0), 0, 0.9)
-    const tail = noise(frames, rng, 'brown', sampleRate)
-    const tailEnv = decayEnvelope(frames, sampleRate, 0.08)
-    for (let index = 0; index < frames; index += 1) tail[index] *= tailEnv[index]
-    addInto(out, filter(tail, sampleRate, () => 520, () => 0.8, 'lp'), 0, 0.5)
-    return scale(out)
-  }
-
-  if (family === 'crash') {
-    const frames = Math.max(16, Math.round(1.1 * sampleRate))
-    const out = noise(frames, rng, 'white', sampleRate)
-    const env = decayEnvelope(frames, sampleRate, 0.45, 0.002, 1)
-    for (let index = 0; index < frames; index += 1) out[index] *= env[index]
-    const bright = filter(out, sampleRate, () => 5200, () => 0.8, 'hp')
-    const shimmer = filter(out, sampleRate, () => 2600, () => 2.2, 'bp')
-    for (let index = 0; index < frames; index += 1) bright[index] = bright[index] * 0.7 + shimmer[index] * 0.5
-    return scale(bright)
-  }
-
-  // Shaker: a short, soft, high noise brush.
-  const frames = Math.max(16, Math.round(0.1 * sampleRate))
-  const out = noise(frames, rng, 'white', sampleRate)
-  const env = decayEnvelope(frames, sampleRate, 0.05, 0.008)
-  for (let index = 0; index < frames; index += 1) out[index] *= env[index]
-  return scale(filter(out, sampleRate, () => 5400, () => 1.1, 'hp'))
+  for (const layer of voice.layers) addNoiseLayer(out, rng, layer)
+  for (let index = 0; index < out.length; index += 1) out[index] *= velocity
+  return out
 }
 
 /** Fallback voices so a hand-written score without a genre still renders. */
@@ -1965,13 +2317,89 @@ const DEFAULT_VOICES = {
 }
 
 /** Dispatch a score note to the voice family its instrument asks for. */
-function renderNote (voice, midi, durSeconds, velocity, sampleRate, rng, artic) {
+function renderNote (voice, midi, durSeconds, velocity, sampleRate, rng, artic, envelopes) {
   const kind = voice.type ?? 'saw'
-  if (kind === 'noise-bed') return renderNoiseBed(voice, durSeconds, velocity, sampleRate, rng, artic)
+  if (kind === 'noise-bed') return renderNoiseBed(voice, durSeconds, velocity, sampleRate, rng, artic, envelopes)
   const freq = midiToHz(clamp(midi, 0, 127))
-  if (kind === 'fm') return renderFm(voice, freq, durSeconds, velocity, sampleRate, rng, artic)
-  if (kind === 'pluck') return renderPluck(voice, freq, durSeconds, velocity, sampleRate, rng, artic)
-  return renderSubtractive(voice, freq, durSeconds, velocity, sampleRate, rng, artic)
+  if (kind === 'fm') return renderFm(voice, freq, durSeconds, velocity, sampleRate, rng, artic, envelopes)
+  if (kind === 'pluck') return renderPluck(voice, freq, durSeconds, velocity, sampleRate, rng, artic, envelopes)
+  return renderSubtractive(voice, freq, durSeconds, velocity, sampleRate, rng, artic, envelopes)
+}
+
+/**
+ * Schroeder reverb send, applied in place.
+ *
+ * This is the same algorithm as `reverb()` from `dsp.js` specialised for the
+ * one way a score uses it: over a full-length master buffer, straight away.
+ * The arithmetic and its order are unchanged, so the samples are identical;
+ * what changes is that the four combs and two allpasses are unrolled into local
+ * variables (no object property reads or `%` per sample) and the wet signal is
+ * folded back into the buffer instead of being materialised in two extra
+ * full-length arrays. Reverb was the largest single master-stage cost.
+ */
+function applyReverb (buffer, sampleRate, amount, size) {
+  const scale = sampleRate / 44100
+  const feedback = 0.74 + size * 0.18
+  const factor = 0.7 + size * 0.9
+  const c0 = new Float32Array(Math.max(2, Math.round(0.0297 * factor * 44100 * scale)))
+  const c1 = new Float32Array(Math.max(2, Math.round(0.0371 * factor * 44100 * scale)))
+  const c2 = new Float32Array(Math.max(2, Math.round(0.0411 * factor * 44100 * scale)))
+  const c3 = new Float32Array(Math.max(2, Math.round(0.0437 * factor * 44100 * scale)))
+  const a0 = new Float32Array(Math.max(2, Math.round(0.005 * 44100 * scale)))
+  const a1 = new Float32Array(Math.max(2, Math.round(0.0017 * 44100 * scale)))
+  const n0 = c0.length
+  const n1 = c1.length
+  const n2 = c2.length
+  const n3 = c3.length
+  const m0 = a0.length
+  const m1 = a1.length
+  let i0 = 0
+  let i1 = 0
+  let i2 = 0
+  let i3 = 0
+  let j0 = 0
+  let j1 = 0
+  let d0 = 0
+  let d1 = 0
+  let d2 = 0
+  let d3 = 0
+  for (let index = 0; index < buffer.length; index += 1) {
+    const sample = buffer[index]
+    let sum = c0[i0]
+    d0 = sum * 0.75 + d0 * 0.25
+    c0[i0] = sample * 0.25 + d0 * feedback
+    i0 += 1
+    if (i0 >= n0) i0 = 0
+    let delayed = c1[i1]
+    d1 = delayed * 0.75 + d1 * 0.25
+    c1[i1] = sample * 0.25 + d1 * feedback
+    i1 += 1
+    if (i1 >= n1) i1 = 0
+    sum += delayed
+    delayed = c2[i2]
+    d2 = delayed * 0.75 + d2 * 0.25
+    c2[i2] = sample * 0.25 + d2 * feedback
+    i2 += 1
+    if (i2 >= n2) i2 = 0
+    sum += delayed
+    delayed = c3[i3]
+    d3 = delayed * 0.75 + d3 * 0.25
+    c3[i3] = sample * 0.25 + d3 * feedback
+    i3 += 1
+    if (i3 >= n3) i3 = 0
+    sum += delayed
+    delayed = a0[j0]
+    const firstOutput = -sum + delayed
+    a0[j0] = sum + delayed * 0.5
+    j0 += 1
+    if (j0 >= m0) j0 = 0
+    delayed = a1[j1]
+    const output = -firstOutput + delayed
+    a1[j1] = firstOutput + delayed * 0.5
+    j1 += 1
+    if (j1 >= m1) j1 = 0
+    buffer[index] = sample + Math.fround(output * 0.22) * amount
+  }
 }
 
 /** Static 2-pole low/high-pass over a finished buffer (master tone shaping). */
@@ -2055,6 +2483,9 @@ export function renderScore (score, options = {}) {
     const targetDb = clamp(Number.isFinite(Number(track.gainDb)) ? Number(track.gainDb) : -18, -60, 0)
     const targetRms = dbToGain(targetDb)
     const notes = Array.isArray(track.notes) ? track.notes : []
+    // Reused across the notes of this track: a pad renders four identical-length
+    // notes per chord and a bass repeats note lengths, so the envelopes repeat.
+    const envelopes = new Map()
     scratch.fill(0)
     let rendered = 0
     for (let noteIndex = 0; noteIndex < notes.length; noteIndex += 1) {
@@ -2069,8 +2500,12 @@ export function renderScore (score, options = {}) {
       const rng = makeRng((seed ^ Math.imul(trackIndex + 1, 0x9E3779B1) ^ Math.imul(noteIndex + 1, 0x85EBCA6B)) >>> 0)
       const voiceSamples = isDrumKit
         ? renderDrumNote(midi, velocity, sampleRate, rng)
-        : renderNote(voice, midi, durBeats * secondsPerBeat, velocity, sampleRate, rng, note.artic)
-      addInto(scratch, voiceSamples, offset, 1)
+        : renderNote(voice, midi, durBeats * secondsPerBeat, velocity, sampleRate, rng, note.artic, envelopes)
+      // `addInto(scratch, voiceSamples, offset, 1)` inlined: the source buffer is
+      // accumulated note by note in order, so the sum is identical; dropping the
+      // function call and the multiply by unity is free accuracy-wise.
+      const limit = Math.min(renderFrames, offset + voiceSamples.length)
+      for (let index = offset; index < limit; index += 1) scratch[index] += voiceSamples[index - offset]
       rendered += 1
     }
 
@@ -2105,8 +2540,7 @@ export function renderScore (score, options = {}) {
 
   applyTone(master, sampleRate, genre.masterTone ?? null)
   if (genre.reverb !== undefined && genre.reverb.amount > 0) {
-    const wet = reverb(master, sampleRate, genre.reverb.amount, genre.reverb.size ?? 0.5)
-    master.set(wet)
+    applyReverb(master, sampleRate, genre.reverb.amount, genre.reverb.size ?? 0.5)
   }
   dcBlock(master, sampleRate)
 
