@@ -335,6 +335,7 @@ async function openaiSpeech (config, text, options = {}) {
     signal: AbortSignal.timeout(120000)
   })
   if (!response.ok) throw new Error(`TTS ${await readError(response)}`)
+  const contentType = String(response.headers.get('content-type') ?? '').toLowerCase()
   const bytes = Buffer.from(await response.arrayBuffer())
   const effective = { provider: 'openai-compatible', host: new URL(url).host, model, voice, speed, sampleRate: null, subtitle: 'unsupported' }
 
@@ -345,6 +346,14 @@ async function openaiSpeech (config, text, options = {}) {
   }
   if (bytes[0] === 0xff || bytes.subarray(0, 3).toString('ascii') === 'ID3') {
     throw new Error('TTS 返回的是 mp3。把 config.tts.format 改成 wav（端点支持时改成 pcm）。')
+  }
+  // A 200 that is not audio at all — a proxy's HTML error page, a JSON error
+  // body — must not be played as raw PCM: it would come out as a burst of noise
+  // and look like a synthesis bug instead of an endpoint problem.
+  const head = bytes.subarray(0, 512).toString('utf8').trimStart().toLowerCase()
+  if (contentType.includes('json') || contentType.startsWith('text/') || head.startsWith('{') || head.startsWith('<')) {
+    const snippet = bytes.subarray(0, 200).toString('utf8').replace(/\s+/g, ' ').trim()
+    throw new Error(`TTS 返回的不是音频（content-type: ${contentType || '未标注'}）：${snippet}`)
   }
   effective.sampleRate = sampleRate
   const decoded = pcmToWav(bytes, sampleRate, 1)
