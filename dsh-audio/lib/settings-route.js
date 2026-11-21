@@ -1,7 +1,7 @@
 /**
  * Host side of the settings page.
  *
- * Four endpoints on the browser HTTP carrier, all same-origin only:
+ * Five endpoints on the browser HTTP carrier, all same-origin only:
  *   GET  /dsh-audio/config  → config the running plugin uses; API keys reduced
  *                             to "is it set" flags, never echoed back;
  *   POST /dsh-audio/config  → merge a patch and persist it via the config editor;
@@ -12,23 +12,46 @@
  *                             instead of hiding a missing decoder behind an error;
  *   POST /dsh-audio/voices  → ask the configured provider for its voices
  *                             (MiniMax account list or the Edge catalogue), and
- *                             fall back to the static shortlist with a marker.
+ *                             fall back to the static shortlist with a marker;
+ *   POST /dsh-audio/validate → model self-check: probe the *saved* endpoint and
+ *                             push one real sample through it, reporting
+ *                             reachability, HTTP status, whether audio was
+ *                             accepted and the latency. It reads the captured
+ *                             config and nothing from the browser, so the page
+ *                             cannot aim it at a URL the user never saved — the
+ *                             point of a self-check is that it checks the
+ *                             settings that are actually in effect.
  *
  * Routes are registered inside `ctx.inject(['webServer'], …)`: on a cold boot
  * this plugin can activate before the HTTP carrier is mounted.
  */
 
 import { finalize, renderPreset, toWavBytes } from './audio.js'
-import { EDGE_VOICE_CATALOG, describeAudio, listVoices, speak } from './providers.js'
+import {
+  CHAT_AUDIO_DEFAULTS,
+  EDGE_VOICE_CATALOG,
+  MINIMAX_DEFAULTS,
+  OPENAI_TTS_DEFAULTS,
+  describeAudio,
+  listVoices,
+  speak
+} from './providers.js'
 import { findFfmpeg } from './providers-edge.js'
 
 const MAX_BODY = 64 * 1024
 
 const TTS_FIELDS = ['provider', 'baseUrl', 'model', 'voice', 'speed', 'pitch', 'sampleRate', 'groupId', 'ffmpegPath', 'apiKey', 'apiKeyEnv']
-const CHECK_FIELDS = ['provider', 'baseUrl', 'model', 'apiKey', 'apiKeyEnv']
+const CHECK_FIELDS = ['provider', 'baseUrl', 'model', 'apiKey', 'apiKeyEnv', 'autoValidate']
 
 /** Defaults used when the config leaves the env name empty. */
 const DEFAULT_ENV = { tts: 'MINIMAX_API_KEY', check: 'DASHSCOPE_API_KEY' }
+
+/** How long a reachability probe may take before it is reported as a timeout. */
+const PROBE_TIMEOUT_MS = 5000
+/** The page shows the model's answer on one line; anything longer is noise. */
+const ANSWER_LIMIT = 300
+/** A provider error is displayable text, never a stack: keep one paragraph. */
+const ERROR_LIMIT = 500
 
 function sendJson (res, status, payload) {
   const body = JSON.stringify(payload)
@@ -87,6 +110,8 @@ function pickFields (source, fields, numeric) {
       const number = Number(value)
       if (!Number.isFinite(number)) throw new Error(`${field} 必须是数字`)
       out[field] = number
+    } else if (typeof value === 'boolean') {
+      out[field] = value
     } else {
       if (value !== null && typeof value !== 'string') throw new Error(`${field} 必须是字符串`)
       out[field] = (value ?? '').trim()
@@ -123,6 +148,162 @@ function sampleWav (seconds = 0.6) {
   const rendered = renderPreset({ preset: 'chime', seed: 1, duration: seconds, sampleRate: 24000 })
   finalize(rendered.samples, rendered.sampleRate, -3)
   return { wav: toWavBytes(rendered.samples, rendered.sampleRate), durationSeconds: seconds }
+}
+
+/* ---- model self-check ---- */
+
+/**
+ * A thrown value as one displayable line.
+ *
+ * `fetch` says only "fetch failed" for network problems and hides the useful
+ * part in `cause` (`connect ECONNREFUSED 127.0.0.1:1`, `getaddrinfo ENOTFOUND
+ * …`). A self-check exists precisely to show that part, so it is appended.
+ * No stack: the page has a single row for the reason.
+ * @param {any} error - the thrown value.
+ * @returns {string} at most `ERROR_LIMIT` characters, never empty.
+ */
+function failureText (error) {
+  const message = error?.message ?? String(error)
+  const cause = error?.cause?.message
+  const text = typeof cause === 'string' && cause.length > 0 && !message.includes(cause)
+    ? `${message}（${cause}）`
+    : message
+  return text.slice(0, ERROR_LIMIT)
+}
+
+/** Trailing slashes would double up with the provider's `/v1/...` suffix. */
+function trimBaseUrl (url) {
+  return String(url ?? '').replace(/\/+$/, '')
+}
+
+/**
+ * The key a real provider call would present, without throwing.
+ *
+ * The reachability probe only needs *a* key to be representative — a 401 still
+ * proves the host answered — while the actual self-check call goes through
+ * `describeAudio` / `speak`, which fail with instructions when no key exists.
+ * So this mirrors their row-then-environment lookup but returns '' instead of
+ * throwing, and `requireKey` stays the only place that defines "missing key".
+ * @param {object} section - the saved provider row.
+ * @param {string} defaultEnv - env var to fall back to for this section.
+ * @returns {string} the key, or '' when none is configured.
+ */
+function probeKey (section, defaultEnv) {
+  const inline = typeof section?.apiKey === 'string' ? section.apiKey.trim() : ''
+  if (inline.length > 0) return inline
+  const envName = typeof section?.apiKeyEnv === 'string' && section.apiKeyEnv.trim().length > 0
+    ? section.apiKeyEnv.trim()
+    : defaultEnv
+  const value = process.env[envName]
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+/**
+ * The endpoint and model a self-check will really use, resolved from the
+ * *saved* section alone.
+ *
+ * The URL deliberately comes from the provider defaults rather than from the
+ * request body: the page may choose a section (`check` / `tts`) but never an
+ * address, otherwise the "check" would validate nothing that is in effect.
+ * `baseUrl: null` means this provider has no user-configurable HTTP base —
+ * Edge speaks WebSocket to a fixed service and `none` is off — so there is
+ * nothing honest to probe.
+ * @param {'check'|'tts'} target - section to resolve.
+ * @param {object} section - the saved config row for that section.
+ * @returns {{ provider: string|null, baseUrl: string|null, model: string|null }}
+ */
+function resolveSelfCheckTarget (target, section) {
+  const source = section ?? {}
+  if (target === 'check') {
+    // describeAudio always speaks the OpenAI-compatible chat shape; the row's
+    // `provider` field is cosmetic for this section.
+    return {
+      provider: null,
+      baseUrl: trimBaseUrl(source.baseUrl ?? CHAT_AUDIO_DEFAULTS.baseUrl),
+      model: source.model ?? CHAT_AUDIO_DEFAULTS.model
+    }
+  }
+  const provider = String(source.provider ?? 'minimax').toLowerCase()
+  if (provider === 'edge' || provider === 'none') {
+    return { provider, baseUrl: null, model: source.model ?? null }
+  }
+  if (provider === 'minimax') {
+    return {
+      provider,
+      baseUrl: trimBaseUrl(source.baseUrl ?? MINIMAX_DEFAULTS.baseUrl),
+      model: source.model ?? MINIMAX_DEFAULTS.model
+    }
+  }
+  if (provider === 'openai' || provider === 'custom' || provider === 'compatible') {
+    return {
+      provider,
+      baseUrl: trimBaseUrl(source.baseUrl ?? OPENAI_TTS_DEFAULTS.baseUrl),
+      model: source.model ?? OPENAI_TTS_DEFAULTS.model
+    }
+  }
+  // Unknown provider: speak() will reject it with its own message, and there is
+  // no default URL, so only a configured one can be probed.
+  return {
+    provider,
+    baseUrl: source.baseUrl === undefined || source.baseUrl === null ? null : trimBaseUrl(source.baseUrl),
+    model: source.model ?? null
+  }
+}
+
+/**
+ * Whether the saved endpoint answers at all.
+ *
+ * A GET on the base URL is enough: even 401/404 proves DNS, TLS and the host
+ * are fine, and that is the fact the settings page cannot see any other way.
+ * Never throws — the report exists to *show* a failure, not to become one.
+ * @param {string} baseUrl - absolute endpoint URL to probe.
+ * @param {string} [apiKey] - sent as a bearer when present; optional on purpose.
+ * @param {number} [timeoutMs] - abort budget; the abort is reported as a timeout.
+ * @returns {Promise<{ reachable: boolean, status: number, error?: string }>}
+ */
+export async function probeEndpoint (baseUrl, apiKey, timeoutMs = PROBE_TIMEOUT_MS) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const headers = {}
+    if (typeof apiKey === 'string' && apiKey.length > 0) headers.Authorization = `Bearer ${apiKey}`
+    const response = await fetch(String(baseUrl ?? ''), { method: 'GET', headers, signal: controller.signal })
+    // Any status counts as reachable: the host answered, which is all this
+    // claims. Cancel the body so a streamed response cannot keep a socket open.
+    try { await response.body?.cancel() } catch { /* the body is irrelevant here */ }
+    return { reachable: true, status: response.status }
+  } catch (error) {
+    if (controller.signal.aborted) return { reachable: false, status: 0, error: `超时 ${timeoutMs} ms` }
+    return { reachable: false, status: 0, error: failureText(error) }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * The `endpoint` row of the self-check report.
+ *
+ * A reachability probe only makes sense when the provider really speaks HTTP
+ * to a saved base URL; the remaining cases are reported as "not applicable" or
+ * "missing" instead of a fake failure, because that distinction decides what
+ * the user has to fix.
+ * @param {'check'|'tts'} target - section being validated.
+ * @param {{ provider: string|null, baseUrl: string|null }} resolved - saved target.
+ * @param {object} section - saved row, for the probe's bearer token.
+ * @returns {Promise<{ reachable: boolean|null, status: number, error: string|null }>}
+ */
+async function checkEndpoint (target, resolved, section) {
+  if (target === 'tts' && resolved.provider === 'none') {
+    return { reachable: null, status: 0, error: 'TTS 已关闭（provider = none），没有端点可探测' }
+  }
+  if (resolved.baseUrl === null) {
+    return { reachable: null, status: 0, error: `${resolved.provider} 没有 baseUrl（直连固定服务），端点探测不适用` }
+  }
+  if (resolved.baseUrl.length === 0) {
+    return { reachable: false, status: 0, error: '配置里没有 baseUrl' }
+  }
+  const probe = await probeEndpoint(resolved.baseUrl, probeKey(section, DEFAULT_ENV[target]))
+  return { reachable: probe.reachable, status: probe.status, error: probe.error ?? null }
 }
 
 /**
@@ -301,6 +482,68 @@ export function registerSettingsRoute (ctx, config, version) {
         }
       } catch (error) {
         sendJson(response, 400, { ok: false, error: error?.message ?? String(error) })
+      }
+    })
+
+    register('/dsh-audio/validate', async (request, response) => {
+      const started = Date.now()
+      try {
+        if (!sameOriginOnly(request, response)) return
+        if (request.method !== 'POST') {
+          sendJson(response, 405, { ok: false, error: `不支持 ${request.method}` })
+          return
+        }
+        const body = await readJson(request)
+        const requested = body.target
+        const target = requested === undefined || requested === null || requested === ''
+          ? 'check'
+          : String(requested).toLowerCase()
+        if (target !== 'check' && target !== 'tts') {
+          sendJson(response, 400, { ok: false, error: 'target 只能是 check 或 tts' })
+          return
+        }
+
+        // Only the saved row is consulted from here on: choosing the section is
+        // the page's job, choosing an address is not.
+        const section = target === 'check' ? (config.check ?? {}) : (config.tts ?? {})
+        const resolved = resolveSelfCheckTarget(target, section)
+        const report = {
+          ok: true,
+          target,
+          baseUrl: resolved.baseUrl,
+          model: resolved.model,
+          endpoint: await checkEndpoint(target, resolved, section),
+          audioAccepted: false
+        }
+
+        if (target === 'check') {
+          const sample = sampleWav(0.5)
+          try {
+            const answer = await describeAudio(section, sample.wav, '这是什么声音？用一句话回答。')
+            if (answer.length === 0) throw new Error('端点返回了空内容')
+            report.audioAccepted = true
+            report.answer = answer.slice(0, ANSWER_LIMIT)
+          } catch (error) {
+            report.error = failureText(error)
+          }
+        } else {
+          try {
+            const result = await speak(section, '自检。')
+            report.audioAccepted = true
+            report.durationSeconds = Number((result.samples.length / result.sampleRate).toFixed(2))
+          } catch (error) {
+            report.error = failureText(error)
+          }
+        }
+
+        // The page has to *display* a provider failure, so even a rejected key
+        // leaves here as HTTP 200 with the facts filled in.
+        report.latencyMs = Date.now() - started
+        sendJson(response, 200, report)
+      } catch (error) {
+        // Only an unreadable request is an HTTP error; everything the provider
+        // did or refused is data the page shows.
+        sendJson(response, 400, { ok: false, error: failureText(error) })
       }
     })
   })

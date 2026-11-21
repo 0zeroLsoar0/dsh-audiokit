@@ -184,7 +184,7 @@ window.__ModuleLoader__.load({
     ]
 
     const TTS_KEYS = ['provider', 'baseUrl', 'model', 'voice', 'speed', 'pitch', 'ffmpegPath']
-    const CHECK_KEYS = ['provider', 'baseUrl', 'model']
+    const CHECK_KEYS = ['provider', 'baseUrl', 'model', 'autoValidate']
 
     function pick (source, keys) {
       const out = {}
@@ -216,6 +216,8 @@ window.__ModuleLoader__.load({
       const [voices, setVoices] = useState({ items: [], source: 'static', note: null })
       const [testing, setTesting] = useState(null)
       const [testResult, setTestResult] = useState({ tts: null, check: null })
+      const [validating, setValidating] = useState(false)
+      const [validateText, setValidateText] = useState(null)
 
       const load = useCallback((attempt) => {
         const tries = attempt ?? 0
@@ -279,6 +281,7 @@ window.__ModuleLoader__.load({
             setConfig(body.config)
             setSaving(false)
             setStatus('已生效')
+            if (body.config?.check?.autoValidate === true) setTimeout(() => runValidate(), 400)
           })
           .catch(() => {
             if (tries >= 20) {
@@ -359,6 +362,40 @@ window.__ModuleLoader__.load({
           })
           .catch((cause) => setTestResult((current) => ({ ...current, [target]: `失败：${cause.message}` })))
           .finally(() => setTesting(null))
+      }
+
+      // Model self-check: an experimental, off-by-default probe that asks the
+      // *saved* audio-understanding endpoint one real question with a real sound,
+      // and reports what actually came back (reachability, HTTP status, latency)
+      // instead of guessing. The page cannot aim it at another URL on purpose.
+      const runValidate = () => {
+        setValidating(true)
+        setValidateText(null)
+        fetch('/dsh-audio/validate', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ target: 'check' })
+        })
+          .then(async (response) => {
+            const text = await response.text()
+            let body
+            try { body = JSON.parse(text) } catch { throw new Error(`接口返回的不是 JSON（HTTP ${response.status}）`) }
+            if (response.ok !== true || body?.ok !== true) throw new Error(body?.error ?? `HTTP ${response.status}`)
+            const endpoint = body.endpoint ?? {}
+            const parts = [
+              endpoint.reachable === true
+                ? `端点可达（HTTP ${endpoint.status}）`
+                : `端点不可达：${endpoint.error ?? '未知原因'}`,
+              body.audioAccepted === true
+                ? `模型接受音频输入（${body.latencyMs} ms）`
+                : `模型未通过：${body.error ?? '未知原因'}`
+            ]
+            if (body.answer) parts.push(`回答：${body.answer}`)
+            parts.push(`${body.model || '未填模型'}`)
+            setValidateText(parts.join(' · '))
+          })
+          .catch((cause) => setValidateText(`校验失败：${cause.message}`))
+          .finally(() => setValidating(false))
       }
 
       if (config === null) {
@@ -455,7 +492,25 @@ window.__ModuleLoader__.load({
               style: S.small,
               disabled: testing === 'check',
               onClick: () => runTest('check')
-            }, testing === 'check' ? '测试中…' : '试听并识别'))),
+            }, testing === 'check' ? '测试中…' : '试听并识别')),
+          h(Row, {
+            label: '模型自检（实验性）',
+            desc: validateText ?? '默认关闭。开启后每次保存都会用真实音频问模型一次，并显示端点状态、HTTP 状态与耗时；也可以点右边按钮立即校验。只校验已保存的配置。'
+          },
+            h(Dropdown, {
+              value: check.autoValidate === true ? 'on' : 'off',
+              options: [
+                { value: 'off', label: '关闭（默认）' },
+                { value: 'on', label: '保存后自动校验' }
+              ],
+              onChange: (value) => patch('check', 'autoValidate', value === 'on')
+            }),
+            h('button', {
+              type: 'button',
+              style: S.small,
+              disabled: validating,
+              onClick: runValidate
+            }, validating ? '校验中…' : '立即校验'))),
 
         h('div', { style: S.footer },
           h('button', {
