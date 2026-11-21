@@ -21,6 +21,7 @@ import { registerExtraPresets } from './lib/presets-extra.js'
 import { registerCheckTool } from './lib/check.js'
 import { registerBindTools } from './lib/tools-bind.js'
 import { registerConvertTools } from './lib/tools-convert.js'
+import { registerDesignTools } from './lib/tools-design.js'
 import { registerLoudnessTools } from './lib/tools-loudness.js'
 import { registerSettingsRoute } from './lib/settings-route.js'
 import { registerSingTools } from './lib/tools-sing.js'
@@ -67,6 +68,7 @@ export function apply (ctx, config = {}) {
   registerCheckTool(ctx, config)
   registerConvertTools(ctx)
   registerLoudnessTools(ctx)
+  registerDesignTools(ctx)
   registerVisualTools(ctx)
   registerBindTools(ctx)
   registerSingTools(ctx)
