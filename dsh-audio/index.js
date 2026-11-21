@@ -44,16 +44,24 @@ export const inject = ['tools']
 const PROMPT_SECTION = [
   '## Sound for HTML animation',
   '',
-  'A page you author is silent by default. When the deliverable is an animation, motion graphic, transition, or any',
-  'browser demo with visible movement, give it sound unless the user asked for silence:',
+  'A page you author is silent by default. When the deliverable is an animation, motion graphic, transition, video or',
+  'browser demo with visible movement, give it sound unless the user asked for silence. Pick the tool by what the',
+  'sound *is*, not by what it is made of:',
   '',
-  '- `audio_synth` renders one synthesized sound (impact, whoosh, tick, chime, riser, zap, thud, scrap, texture).',
-  '- `audio_pattern` fills a span with an event train or riser — use it for dense or repeated events instead of many renders.',
-  '- `audio_tts` renders narration or dialogue and returns timestamps for subtitles and lip-sync; `audio_voices` lists voice ids.',
-  '- `audio_mix` combines rendered files; `audio_probe` measures one; `audio_check` is the quality gate before delivery.',
+  '- one hit, texture or foley sound → `audio_synth` (38 presets; deterministic, same seed = same bytes)',
+  '- many events from one rule (typing, rain, accelerating ticks) → `audio_pattern`',
+  '- a designed object ("metal door slam", "magic sparkle") → `audio_design` (26 layered recipes)',
+  '- music: a cue with harmony and a groove → `audio_compose` (8 genres, returns beat times for sync)',
+  '- narration or dialogue → `audio_tts`; singing → `audio_sing` (zero assets)',
+  '- character mouth / lip-sync → `audio_lipsync` (per-frame viseme + jaw openness)',
+  '- motion that should land on the music → `audio_beats`',
+  '- assembling cues + the page player → `audio_bind` (generates the scheduling code, inline or external)',
+  '- fixing an existing file: trim/join/fade/re-encode → `audio_convert`; retime or transpose → `audio_stretch`',
+  '- before delivery: `audio_probe` (measure), `audio_loudness` (LUFS/true peak), `audio_check` (quality gate),',
+  '  `audio_regress` (prove a change did not break a sound)',
   '',
   'Call the `animation-sound` skill before the first render: it carries the timing contract that keeps picture and',
-  'sound in sync, the preset cheat sheet, and the recipe for inlining audio into a single-file HTML.'
+  'sound in sync, the preset and recipe cheat sheets, and the recipe for inlining audio into a single-file HTML.'
 ].join('\n')
 
 /**

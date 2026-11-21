@@ -8,7 +8,12 @@
       name: '@local/dsh-audio'
       config:
         tts:
-          # minimax (default) | openai | custom | none
+          # minimax (default) | edge | openai | custom | none
+          # edge = Microsoft read-aloud: free, no API key, 300+ voices. The
+          # service only returns compressed audio, so the plugin decodes it with
+          # a local ffmpeg; leave ffmpegPath empty to auto-detect
+          # ~/.dsh/tools/ffmpeg/bin. Without ffmpeg it still writes a playable
+          # .mp3 instead of failing.
           provider: minimax
           baseUrl: https://api.minimax.chat
           model: speech-2.8-hd
@@ -16,6 +21,7 @@
           apiKeyEnv: MINIMAX_API_KEY
           # groupId: ''      # only the legacy T2A endpoint needs this
           # apiKey: ''       # prefer the settings page or the env var
+          # ffmpegPath: ''   # edge only; empty means auto-detect
         check:
           # OpenAI-compatible audio-input endpoint. qwen2.5-omni-7b is the small
           # omni model; if your account exposes another id, type it in Settings.

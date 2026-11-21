@@ -177,12 +177,13 @@ window.__ModuleLoader__.load({
 
     const PROVIDERS = [
       { value: 'minimax', label: 'MiniMax' },
+      { value: 'edge', label: 'Edge 朗读（免费，无需密钥）' },
       { value: 'openai', label: 'OpenAI 兼容' },
       { value: 'custom', label: '自定义端点（OpenAI 兼容）' },
       { value: 'none', label: '关闭' }
     ]
 
-    const TTS_KEYS = ['provider', 'baseUrl', 'model', 'voice', 'speed', 'pitch']
+    const TTS_KEYS = ['provider', 'baseUrl', 'model', 'voice', 'speed', 'pitch', 'ffmpegPath']
     const CHECK_KEYS = ['provider', 'baseUrl', 'model']
 
     function pick (source, keys) {
@@ -422,6 +423,12 @@ window.__ModuleLoader__.load({
             h(NumberField, { value: tts.speed, min: 0.5, max: 2, step: 0.05, onChange: (value) => patch('tts', 'speed', value) })),
           h(Row, { label: '音调', desc: '半音，−12 – 12' },
             h(NumberField, { value: tts.pitch, min: -12, max: 12, onChange: (value) => patch('tts', 'pitch', value) })),
+          h(Row, { label: 'ffmpeg', desc: '仅 Edge 需要：它只提供压缩音频，用本机 ffmpeg 解码成波形。留空自动探测 ~/.dsh/tools/ffmpeg' },
+            h(Text, {
+              value: tts.ffmpegPath,
+              placeholder: '留空 = 自动探测',
+              onChange: (value) => patch('tts', 'ffmpegPath', value)
+            })),
           h(Row, { label: 'API 密钥', desc: keyDesc(tts) },
             h(Text, { value: keys.tts, type: 'password', placeholder: '留空则不修改', onChange: (value) => editKey('tts', value) })),
           h(Row, { label: '测试连接', desc: testResult.tts ?? '合成一句话并试听，用来确认密钥、模型、音色都对' },

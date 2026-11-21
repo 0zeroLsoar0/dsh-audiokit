@@ -10,182 +10,147 @@ export const SKILL_NAME = 'animation-sound'
 const CONTENT = `# 给 HTML 动画配音
 
 页面默认是静音的。你产出的动画、动效、演示页，除非用户明确说"不要声音"，都应当配音。
-本技能说明：什么时候配、怎么排拍点、怎么渲染、怎么接进页面、怎么自检。
+本技能说明：选哪个工具、怎么排拍点、怎么渲染、怎么接进页面、怎么自检。
 
 ## 什么时候用
 
-- 会动的画面：loading 动画、开场片头、角色/物体运动、数据可视化动效、交互 demo、转场。
+- 会动的画面：loading、开场片头、角色/物体运动、数据可视化动效、交互 demo、转场、短视频。
 - 不适用：纯静态页面、纯工具界面、API 文档页。
 
 ## 工作流（顺序不要跳）
 
-1. **先定拍子。** 从动画自己的时间轴读出"声音事件"：在几秒、发生了什么、有多重。
-   没有时间轴就先给动画建一个（见下面"同步契约"）。
-2. **写 cue 表。** 每行一个事件：\`{ "at": 0.82, "cue": "slam", "preset": "impact", "params": { "weight": 0.9 } }\`。
-   密集段不要写五十行，用一条 \`audio_pattern\`（train/scatter）表达。
-3. **渲染。** \`audio_synth\` 出单个音；\`audio_pattern\` 出密集段；需要叠层时最后 \`audio_mix\` 合并。
-4. **自检。** 用返回的度量判断，不要凭想象：
-   - 峰值不低于 -3 dBFS、且 \`clipping\` 为 0
-   - 循环底噪 \`loopSeam\` 小于 6 dB（超过就会"咚"一下）
-   - 打击类音色的 \`onsets\` 应当是 1；train 的 onsets ≈ 事件数
-   - \`centroid\` 太低 = 闷，太高 = 刺。画面越"重"，centroid 应越低。
-5. **接进页面。** 单文件交付见下面的内联配方。
-6. **报告。** 告诉用户每个 cue 用的预设和关键词，方便他改。
+1. **先定拍子。** 从动画自己的时间轴读出"声音事件"：第几秒、发生了什么、有多重。
+2. **查表选工具**（见下一节）。密集段不要写五十行，用一条 \`audio_pattern\`。
+3. **渲染。** 每个声音一个文件；复杂声音不要自己叠，用 \`audio_design\` 配方。
+4. **自检。** 用工具返回的度量判断，不要凭想象（见"验收"）。
+5. **接进页面。** 用 \`audio_bind\` 生成播放器，或按"单文件内联"配方手写。
+6. **报告。** 告诉用户每个 cue 用了什么、总时长、响度，方便他改。
 
-## 预设速查
+## 决策：这个声音该用哪个工具
 
-| preset | 听起来像 | 典型场景 | 关键参数 |
-|---|---|---|---|
-| \`impact\` | 有重量的撞击 | 碰撞、落地、碎裂、拳击 | weight, hardness, metallic, space |
-| \`whoosh\` | 掠过空气 | 划过、转场、镜头甩动、揭幕 | speed, tone, rise |
-| \`tick\` | 极短点击 | 打字、时钟、状态切换（密集段的基底） | pitch, hardness |
-| \`chime\` | 有音高的铃 | 通知、拾取、确认、魔法 | pitch, decay, metallic |
-| \`riser\` | 上扬的紧张感 | 冲击前的蓄力、升级、倒计时 | tone, tension |
-| \`zap\` | 放电 | 能量、传送、故障、受击 | pitch, roughness |
-| \`thud\` | 闷的低频体 | 脚步、远处震动、心跳、重量 | weight, softness |
-| \`scrap\` | 摩擦颗粒 | 刮擦、撕裂、碎屑、生物 | density, tone, roughness |
-| \`texture\` | 持续的底 | 环境声、风声、雨、火、电流嗡鸣 | kind, density, movement + \`loop:true\` |
+| 你要的是 | 用这个 | 为什么 |
+|---|---|---|
+| 一个音效、一层底噪 | \`audio_synth\` | 38 个预设，参数是 0..1 的感知量 |
+| 一条规则铺满一段时间 | \`audio_pattern\` | train/scatter/riser，一次调用几百个事件 |
+| 一个"东西"（门、玻璃、爆炸、魔法） | \`audio_design\` | 26 个配方，多层共享包络与混响 |
+| 一段音乐 | \`audio_compose\` | 真和声 + 声部进行 + 鼓，返回节拍表 |
+| 旁白/台词 | \`audio_tts\` | MiniMax / OpenAI 兼容 / 免费 Edge |
+| 唱歌 | \`audio_sing\` | 共振峰合成，零素材、零网络 |
+| 角色口型 | \`audio_lipsync\` | 每帧 viseme + 连续张嘴量 |
+| 画面卡在音乐上 | \`audio_beats\` | 从成品音乐里测出 bpm 与节拍网格 |
+| 把声音接到事件上 | \`audio_bind\` | 生成 cue 表 + 播放器代码 |
+| 改已有文件 | \`audio_convert\` / \`audio_stretch\` | 裁剪、拼接、淡入、转码 / 变速不变调 |
+| 交付前把关 | \`audio_probe\` / \`audio_loudness\` / \`audio_check\` / \`audio_regress\` | 度量、响度、质量闸、回归 |
 
-参数都是 0..1 的感知量：\`weight\` 重、\`hardness\` 硬、\`metallic\` 金属感、\`space\` 空间（混响）、\`tone\` 明暗、
-\`density\` 密度、\`roughness\` 粗糙度。\`pitch\` 在 impact/whoosh 上是 0.5..2 的倍频。
+## 同步契约（决定成片是"配过声"还是"贴上去的"）
 
-## 旁白与口型（\`audio_tts\`）
+1. **一个时钟。** 用 \`AudioContext.currentTime\` 驱动 \`requestAnimationFrame\`，不要一边 \`performance.now()\`
+   一边 \`audio.currentTime\`——两个时间源一定漂移。\`audio_bind\` 生成的播放器已经这么做，并暴露
+   \`window.dshAudio.currentTime()\`（启动前 80 ms 预滚是负值，正好给页面留出同步窗口）。
+2. **打击音对齐峰值，不是对齐起点。** 画面 0.82 秒破碎，"铛"要落在 0.82 秒；wav 第一个采样是瞬态开始，
+   所以 cue 一般提前 30–50 ms。
+3. **先解码再启动。** \`decodeAudioData\` await 完再起时钟，否则开头会被吞掉。
+4. **预调度。** 用 \`source.start(t0 + at)\` 排在音频时钟上，不要用 \`setTimeout\` 当计时器——
+   \`audio_bind\` 的 lookahead 调度就是为这个写的。
+5. **浏览器自动播放策略**：没有用户手势就不给声音。成品页要有一个「点击开始」，并在手势里
+   \`await ctx.resume()\`。在 DSH 里打开不受此限制。
 
-动画里有解说或台词时用它，不要自己拼音节。
+## 音效：audio_synth / audio_pattern / audio_design
 
-返回三样东西，缺一不可：**音频、时间戳、这次生效的参数**。
-时间戳是句级还是词级取决于模型和端点，**也可能完全没有**——拿到的 \`timestamps\` 是 \`null\` 就按时长估算，
-不要假装字幕是对齐的。有的话，\`items[i].start\`（秒）可以直接喂给字幕高亮或口型。
+\`audio_synth({ preset, params, duration, seed, loop, sampleRate, out })\`
+\`audio_pattern({ preset, kind, from, to, every|count, curve, jitter, accentEvery, pitchFrom, pitchTo, params, seed })\`
+\`audio_design({ recipe | layers, seed, variant, intensity, duration, loop })\`
 
-- **停顿用内联标记，不要拆调用**：MiniMax 支持 \`<#1.5#>\`（0.01–99.99 秒），一次请求里控制节奏。
-- **音色先查再填**：\`audio_voices\` 有密钥时返回账号的真实音色，没有时是未校验短名单；别凭记忆编 id。
-- **换供应商不改流程**：\`config.tts.provider\` 改成 \`openai\` 或 \`custom\`，指向任何 OpenAI 兼容的
-  \`/v1/audio/speech\` 即可；那种端点没有时间戳，返回值会明说 \`subtitle: "unsupported"\`。
+- **参数是感知量，不是物理量。** 0..1 的 \`weight/hardness/metallic/space/tone/brightness/speed/rise/decay/density/roughness/movement\`；
+  例外：\`impact\`/\`whoosh\` 的 \`pitch\` 是 0.5..2 的倍频，其余预设的 \`pitch\` 是 0..1。
+- **同一个 seed 出同样的字节。** 想要"另一版"改 \`seed\`；\`audio_design\` 的 \`variant\` 是同一设计的不同演奏。
+- **循环**用 \`loop: true\`，\`audio_probe\` 的 \`loopSeam\` 要 < 6 dB；已经渲成一次性音效的不要硬循环。
 
-## 交付前检查（\`audio_check\`）
+### 38 个预设速查
 
-技术层零配置，语义层可选。**判 \`fail\` 就不要交付。**
+| 组 | 预设 | 用途 |
+|---|---|---|
+| 核心 | \`impact\` \`whoosh\` \`tick\` \`chime\` \`riser\` \`zap\` \`thud\` \`scrap\` \`texture\` | 撞击/掠过/点击/铃/上升/放电/闷响/摩擦/环境 |
+| 拟音 | \`footstep-gravel\` \`footstep-wood\` \`footstep-water\` \`door-open\` \`door-close\` \`drawer\` \`switch-click\` \`cloth\` \`paper\` | 脚步、门、抽屉、开关、布料、纸 |
+| 水气 | \`water-drip\` \`water-splash\` \`bubble\` \`wind-gust\` \`breath-inhale\` | 水滴、溅水、气泡、阵风、吸气 |
+| 机械 | \`servo\` \`motor-start\` \`motor-loop\` \`alarm-beep\` \`alarm-siren\` \`hud-tick\` \`energy-charge\` | 伺服、电机、警报、HUD、充能 |
+| 生物 | \`heartbeat-double\` \`creature-growl\` \`insect-buzz\` \`bone-crack\` | 心跳、低吼、虫鸣、骨折 |
+| 音乐性 | \`bass-drop\` \`riser-short\` \`bell-toll\` \`choir-pad\` | 下潜贝斯、短上升、钟声、合唱垫 |
 
-- 单文件：削波、近乎无声、攻击前静音（声音会听起来晚）、直流偏移、时长不符。
-- 时间轴：cue 指向的文件不存在/是静音的；把所有 cue 按时间叠起来算**叠加峰值**——
-  单条都合规、合在一起削波，是动画配音最常见的翻车点。
-- 语义层：给 \`question\` 且配置了音频理解端点时，会问模型"这段配这个意图像不像"。
-  问可判定的问题（材质、空间、能量），不要问"好不好听"。
+可循环的：\`texture\`(\`kind: wind|rain|fire|room|hum\`)、\`motor-loop\`、\`alarm-siren\`、\`insect-buzz\`、\`choir-pad\`。
 
-## 同步契约（音画不同步的头号原因）
+### 26 个设计配方
 
-**一个时钟。** 音频用 \`AudioContext.currentTime\` 走，动画的 \`requestAnimationFrame\` 也从它取时间。
-绝对不要动画用 \`performance.now()\`、音频用 \`audio.currentTime\` —— 两个时间源一定漂移。
+\`door-slam-metal\` \`door-close-soft\` \`glass-break\` \`wood-crack\` \`explosion-far\` \`explosion-near\`
+\`whoosh-into-impact\` \`sci-fi-charge\` \`sci-fi-hum-loop\` \`magic-sparkle\` \`magic-dark\` \`water-drip\`
+\`water-splash\` \`footstep-gravel\` \`cloth-rustle\` \`ui-success\` \`ui-error\` \`ui-hover\` \`ui-toggle\`
+\`machinery-loop\` \`creature-scream\` \`creature-growl\` \`heartbeat\` \`alarm-loop\` \`coin-pickup\` \`thunder-distant\`
 
-**打击音对齐峰值，不是对齐起点。** 画面在 t=0.82 破碎，意思是"铛"的那一下在 0.82，
-而 wav 的第一个采样是瞬态的开始。把 cue 的 \`at\` 往前放 30~50ms，或者给 cue 加 \`preroll\`。
+配方自带分层、包络、混响与长度，用 \`intensity\`（0..1）微调轻重、\`variant\` 换一版演奏；
+只有在配方不够用时才自己写 \`layers\`（每层 \`{ preset, params, offsetMs, gainDb, duration, pitchScale, detuneCents, filter }\`）。
 
-**先解码再启动。** \`decodeAudioData\` 必须 \`await\` 完，再启动时钟，否则开头 100ms 会被吞掉。
+## 音乐：audio_compose
 
-## 为什么在浏览器里没声音（DSH 里却有）
+\`audio_compose({ genre, bpm, bars, key, mode, seed, intensity, loop, sections, sampleRate, out })\`
 
-宿主（Electron）默认放宽了自动播放策略，同一份文件在 DSH 里一打开就响；
-用 Edge/Chrome 双击打开时页面没有任何用户交互，\`AudioContext\` 会一直停在 suspended。三件事要同时做对：
+- 曲风：\`cinematic\` \`lofi\` \`chiptune\` \`ambient\` \`action\` \`horror\` \`fantasy\` \`ui-menu\`。
+- 返回 \`beatMap\`（秒）、\`chords\`（每小节和弦）、每轨统计、\`barMap\`：**动画的鼓点照这个排**。
+- 16 小节是一个完整 cue（intro/build/drop/outro）；循环用 \`loop: true\`（收尾转向 + 尾巴折回，无爆音）。
+- 想改情绪：先改 \`genre\` 和 \`mode\`，再改 \`bpm\`、\`intensity\`，最后才动 \`sections\`。
+- 一个项目里多个 cue 要用同一个 \`key\`/\`mode\`，否则转场会"跳调"。
 
-1. **在手势里先 \`resume()\`**，再 await 别的。点击回调第一行就调，中间不要隔 await。
-2. **页面要有一个明确的「点击开始」**。绝不要把点击做成 \`location.reload()\`——重载不给音频任何手势。
-3. **不要用 \`fetch(data:)\` 读内联音频**，自己 \`atob\` 解码。\`file://\` 下 data URL 的 fetch 在部分浏览器版本会被拦。
+## 人声：audio_tts / audio_sing
 
-判断方式：\`ctx.state === 'running'\` 就是已解锁。为 false 时不要静默失败——显示一个开始按钮，
-并保留一条静音也能跑的画面路径。
+- \`audio_tts({ text, voice, speed, pitch, subtitle, subtitleType, srt, out })\`：旁白与台词。
+  MiniMax 默认；填 \`provider\` 为 \`edge\` 就是免费免密钥的微软朗读（300+ 音色，**只给压缩音频**，
+  本机有 ffmpeg 时自动解码成 wav，没有则写出可直接播放的 .mp3）。返回时间戳，可直接喂给 \`audio_lipsync\`。
+- \`audio_sing({ notes|melody, lyric, bpm, voice, vibrato, breath, harmony, seed })\`：零素材唱歌。
+  \`melody: "C4:1 E4:1 G4:2"\`，\`lyric: "wo ai ni"\`（拼音；汉字没有字典，会退化成 "a" 并给出警告）。
+  它是合成嗓音——像"唱歌的合成器"，不是真人。要真人质感请用 TTS 或样本。
+- 时间戳缺失时不要编（MiniMax T2A v2 同步接口实测不返回时间戳）；用 \`audio_beats\`/\`audio_lipsync\` 自己测。
 
-## 页面里的最小运行时
+## 画面对齐：audio_lipsync / audio_beats
 
-在动画里放一个数据块和一个约 30 行的运行时：
+- \`audio_lipsync({ path|render, fps, format, sensitivity, leadMs, out })\` → 每帧 \`{ t, viseme, openness, energy, voiced }\`。
+  \`format\` 可选 \`json\`/\`srt\`/\`css\`/\`ae\`：\`css\` 直接给 CSS keyframes（嘴型分层 + 连续下颌缩放），
+  \`leadMs\` 用来补偿显示延迟。口型跟的是**人声**，音乐段落不要用。
+- \`audio_beats({ path|render, beatsPerBar, maxGrid, out })\` → \`bpm\`、置信度、节拍/小节网格、重拍推测。
+  置信度低（< 0.5）时不要硬用，说明该素材不适合卡点。
 
-\`\`\`html
-<script type="application/json" id="dsh-audio">
-{"cues":[
-  {"at":0.78,"cue":"slam","src":"__audio:slam__","gain":0.9},
-  {"at":2.30,"cue":"swell","src":"__audio:swell__","gain":0.7}
-]}
-</script>
-<script>
-const SOUND = (() => {
-  const data = JSON.parse(document.getElementById('dsh-audio').textContent)
-  const ctx = new AudioContext()
-  // 所有 cue 汇到一条总线：每个 wav 都归一到 -1 dBFS，直接相加会削波。
-  const master = ctx.createDynamicsCompressor()
-  master.threshold.value = -6; master.ratio.value = 12; master.attack.value = 0.003
-  master.connect(ctx.destination)
-  let buffers = null, t0 = 0
-  const active = []
-  // 自己解 base64：file:// 下 fetch(data:) 会被某些浏览器拦掉。
-  const toBuffer = (uri) => {
-    const bin = atob(uri.slice(uri.indexOf(',') + 1))
-    const bytes = new Uint8Array(bin.length)
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-    return bytes.buffer
-  }
-  function stop () {
-    for (const node of active) { try { node.stop() } catch {} ; try { node.disconnect() } catch {} }
-    active.length = 0
-  }
-  async function start () {
-    stop()                                 // 上一轮的循环底噪必须先掐掉
-    const resuming = ctx.resume()          // 必须在用户手势里同步调用
-    if (!buffers) buffers = await Promise.all(data.cues.map(c => ctx.decodeAudioData(toBuffer(c.src))))
-    await resuming
-    if (ctx.state !== 'running') throw new Error('audio blocked by autoplay policy')
-    t0 = ctx.currentTime + 0.06
-    data.cues.forEach((cue, i) => {
-      const src = ctx.createBufferSource()
-      const gain = ctx.createGain()
-      src.buffer = buffers[i]
-      src.loop = cue.loop === true
-      gain.gain.value = cue.gain ?? 1
-      src.connect(gain).connect(master)
-      src.start(Math.max(0, t0 + cue.at))
-      active.push(src)
-    })
-  }
-  return { start, stop, unlocked: ctx.state === 'running', time: () => ctx.currentTime - t0 }
-})()
-// 动画：render(SOUND.time()) 由 requestAnimationFrame 驱动
-\`\`\`
+## 交付：audio_bind 与单文件内联
 
-启动逻辑写成两段：\`SOUND.unlocked\` 为真（DSH 里）就直接开；为假就先显示一个「点击开始」，
-点击回调里 \`await SOUND.start()\` 成功后再启动 \`requestAnimationFrame\`。失败时降级为静音播放，
-但把按钮留着让人能重试——不要出现"页面在动但一直没声音、也没有任何提示"的状态。
+- \`audio_bind({ cues, out, inline, maxBytes, duration, basePath })\` 写出 \`<out>.json\` + \`<out>.js\`。
+  生成的播放器暴露 \`window.dshAudio = { play, stop, stopAll, pause, resume, setMuted, currentTime }\`，
+  自带手势解锁、音频时钟预调度、可见性暂停、循环防重入。**优先用它，不要自己写调度。**
+- 单文件交付：\`inline: true\` 把 wav 内嵌成 base64（有体积上限）。先用 \`audio_convert\` 转成
+  \`bitDepth: 8\` 或 \`sampleRate: 22050\` 再内联，通常能小一半以上。
 
-**播放一次，不要自动无限循环。** 演示页/交付页要能自己停下来：播完 \`SOUND.stop()\`、画面停在终态、
-露出一个「重播」按钮；\`document.hidden\` 时也停。加一个 \`setTimeout(play, 时长)\` 让自己反复重播，
-等于给用户一个关不掉的门铃——而且重播前没 \`stop()\` 的话，\`loop:true\` 的底噪会一层层叠上去，越放越响。
+## 后期：audio_convert / audio_stretch / audio_loudness
 
-## 单文件内联（交付给用户的那一份）
+- \`audio_convert\`：\`trim\`/\`gain\`/\`fade\`/\`reverse\`/\`concat\`/\`gain-scan\`/\`convert\`。
+  交付前用 \`gain-scan\` 把一组 cue 拉到同一峰值，否则切换时会忽大忽小。
+- \`audio_stretch\`：\`factor\` 或 \`targetSeconds\` 变速不变调；\`semitones\` 移调不变时长。
+  音画时长对不上时用它，不要用播放速率硬凑。
+- \`audio_loudness\`：BS.1770 的 LUFS 与真峰值。网页/短视频目标 −14 LUFS，播客 −16，广播 −23；
+  写文件时真峰值默认压到 −1 dBTP。
 
-渲染出来的是独立 wav。要变成"双击就能响的一个 HTML"，写一个 12 行的构建脚本：
+## 验收（不要跳过）
 
-\`\`\`js
-// build-sound.mjs —— 用法: node build-sound.mjs scene.html > final.html
-import { readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+1. \`audio_probe\`：峰值 ≤ −1、\`clipping\` = 0、\`dcOffset\` < 0.02、\`onsets\` 与意图一致、循环 \`loopSeam\` < 6。
+2. \`audio_loudness\`：整条 cue 的 LUFS 与目标差 ≤ 1；真峰值 ≤ −1。
+3. \`audio_check\`：多文件 + \`cues\` 时间轴，能抓"cue 指向静音/缺失文件"和"叠加后破音"；
+   有语义模型时用 \`question\` 问一句"这听起来像不像金属门在空房间关上"。
+4. \`audio_regress\`：改了一个音之后 \`snapshot\` + \`compare\`，证明没有把别的指标带歪。
+5. 最后核对：声音总长 = 画面时长（或明确更短）；第一帧不是静音起步（1–5 ms 淡入除外）。
 
-const source = process.argv[2]
-const html = readFileSync(source, 'utf8')
-const out = html.replace(/__audio:([a-z0-9_-]+)__/gi, (_, name) => {
-  const bytes = readFileSync(join(dirname(source), 'assets', 'audio', name + '.wav'))
-  return 'data:audio/wav;base64,' + bytes.toString('base64')
-})
-process.stdout.write(out)
-\`\`\`
+## 常见坑
 
-把要内联的音先复制成稳定名字（\`assets/audio/slam.wav\`），再跑脚本。
-体积参考：22.05 kHz 单声道 16bit ≈ 44 KB/秒，base64 后 ×1.33；一个 10 秒动画配 6 个短音通常在 200~400 KB。
-
-## 自检清单（交付前）
-
-- [ ] 每个画面事件都有声音，没有"该响却没响"的地方
-- [ ] 峰值 ≤ -1 dBFS，\`clipping\` 为 0
-- [ ] 循环底噪 \`loopSeam\` < 6 dB
-- [ ] 声音总长 = 动画时长（或明确更短）
-- [ ] 首帧不是静音起步（tiny fade-in 除外）
-- [ ] 用 \`audio_probe\` 复核过最终文件
+- **循环底噪越叠越响**：底噪用 \`loop: true\` 渲染，播放时只起一份；重复叠加同一文件会 +6 dB 每次。
+- **一次性音效硬循环**：会"咚"一下，因为头尾电平差太大（\`loopSeam\` 会告诉你）。
+- **削波来自叠加**：多个 cue 同时响要留 6–10 dB 余量，用 \`audio_check\` 的 summed peak 看总和。
+- **8-bit 只适合短促音效**：长垫音转 8-bit 会有明显底噪。
+- **不同 cue 响度不一致**：用 \`gain-scan\` 或 \`audio_loudness\` 统一，而不是逐个手调。
+- **改了一个音导致整条 cue 变差**：用 \`audio_regress\` 比对，不要凭感觉。
 `
 
 /**
@@ -196,7 +161,7 @@ process.stdout.write(out)
 export function registerSkill (skills) {
   const summary = {
     name: SKILL_NAME,
-    description: '给 HTML 动画配音：拍点、音效预设、同步契约、单文件内联。Whenever you build an HTML animation, motion graphic, or browser demo that should make sound, load this first.',
+    description: '给 HTML 动画配音：选型、拍点、音效/作曲/唱声、口型与节拍对齐、交付与验收。Whenever you build an HTML animation, motion graphic, or browser demo that should make sound, load this first.',
     invocation: { modelInvocable: true, userInvocable: true },
     provider: 'dsh-audio',
     source: 'bundled',
