@@ -62,7 +62,7 @@ function summaryLine (label, cwd, path, bytes, metrics, extra = []) {
     metrics.clipping > 0 ? `CLIPPING ${metrics.clipping} samples` : 'no clipping',
     ...extra
   ]
-  return parts.join(' 路 ')
+  return parts.join(' · ')
 }
 
 async function finish (cwd, samples, sampleRate, requestedOut, label, hash, options = {}) {
@@ -121,7 +121,7 @@ export function registerTools (ctx) {
 
   ctx.tools.register({
     name: 'audio_pattern',
-    description: 'Fill a span of time with a generated sequence of one preset: an even or accelerating train, a random scatter, or a riser. This is how dense textures are made without dozens of separate renders 鈥?one call with every=0.08 and an accelerating curve produces a hundred events that share a single coherent motion.',
+    description: 'Fill a span of time with a generated sequence of one preset: an even or accelerating train, a random scatter, or a riser. This is how dense textures are made without dozens of separate renders — one call with every=0.08 and an accelerating curve produces a hundred events that share a single coherent motion.',
     parameters: {
       type: 'object',
       properties: {
