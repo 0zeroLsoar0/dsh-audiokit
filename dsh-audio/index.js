@@ -13,6 +13,11 @@
  * machines and package stores.
  */
 
+// The extra preset table must be registered before the tool modules load: each
+// one snapshots `Object.keys(PRESETS)` when it builds its JSON schema, so a late
+// import would leave the enum at the original nine ids. Keep this import first.
+import { registerExtraPresets } from './lib/presets-extra.js'
+
 import { registerCheckTool } from './lib/check.js'
 import { registerConvertTools } from './lib/tools-convert.js'
 import { registerSettingsRoute } from './lib/settings-route.js'
@@ -51,6 +56,7 @@ const PROMPT_SECTION = [
  * @param {object} [config] - resolved Config: `tts` and `check` provider settings.
  */
 export function apply (ctx, config = {}) {
+  registerExtraPresets()
   registerTools(ctx)
   registerTtsTool(ctx, config)
   registerVoicesTool(ctx, config)
