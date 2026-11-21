@@ -35,10 +35,12 @@ const CONTENT = `# 给 HTML 动画配音
 | 一个"东西"（门、玻璃、爆炸、魔法） | \`audio_design\` | 26 个配方，多层共享包络与混响 |
 | 一段音乐 | \`audio_compose\` | 真和声 + 声部进行 + 鼓，返回节拍表 |
 | 旁白/台词 | \`audio_tts\` | MiniMax / OpenAI 兼容 / 免费 Edge |
+| 选音色 | \`audio_voices\` | 列出当前供应商可用的音色（不产出音频） |
 | 唱歌 | \`audio_sing\` | 共振峰合成，零素材、零网络 |
 | 角色口型 | \`audio_lipsync\` | 每帧 viseme + 连续张嘴量 |
 | 画面卡在音乐上 | \`audio_beats\` | 从成品音乐里测出 bpm 与节拍网格 |
 | 把声音接到事件上 | \`audio_bind\` | 生成 cue 表 + 播放器代码 |
+| 把几条声音混成一条 | \`audio_mix\` | 多轨叠加，逐条给增益与时间偏移 |
 | 改已有文件 | \`audio_convert\` / \`audio_stretch\` | 裁剪、拼接、淡入、转码 / 变速不变调 |
 | 交付前把关 | \`audio_probe\` / \`audio_loudness\` / \`audio_check\` / \`audio_regress\` | 度量、响度、质量闸、回归 |
 
@@ -61,8 +63,9 @@ const CONTENT = `# 给 HTML 动画配音
 \`audio_pattern({ preset, kind, from, to, every|count, curve, jitter, accentEvery, pitchFrom, pitchTo, params, seed })\`
 \`audio_design({ recipe | layers, seed, variant, intensity, duration, loop })\`
 
-- **参数是感知量，不是物理量。** 0..1 的 \`weight/hardness/metallic/space/tone/brightness/speed/rise/decay/density/roughness/movement\`；
-  例外：\`impact\`/\`whoosh\` 的 \`pitch\` 是 0.5..2 的倍频，其余预设的 \`pitch\` 是 0..1。
+- **参数是感知量，不是物理量。** 0..1 的 \`weight/hardness/metallic/space/tone/speed/rise/decay/density/roughness/movement\` 等，
+  每个预设还有自己的专有旋钮；\`pitch\` 是倍频——多数带音高的预设是 0.5..2，\`tick\`/\`chime\`/\`zap\` 是 0..1，
+  没有 \`pitch\` 的预设会忽略它。
 - **同一个 seed 出同样的字节。** 想要"另一版"改 \`seed\`；\`audio_design\` 的 \`variant\` 是同一设计的不同演奏。
 - **循环**用 \`loop: true\`，\`audio_probe\` 的 \`loopSeam\` 要 < 6 dB；已经渲成一次性音效的不要硬循环。
 
@@ -94,7 +97,7 @@ const CONTENT = `# 给 HTML 动画配音
 \`audio_compose({ genre, bpm, bars, key, mode, seed, intensity, loop, sections, sampleRate, out })\`
 
 - 曲风：\`cinematic\` \`lofi\` \`chiptune\` \`ambient\` \`action\` \`horror\` \`fantasy\` \`ui-menu\`。
-- 返回 \`beatMap\`（秒）、\`chords\`（每小节和弦）、每轨统计、\`barMap\`：**动画的鼓点照这个排**。
+- 返回 \`beatMap\`（秒）、\`chords\`（每小节和弦）、\`sections\`（每段起止小节与强度）、每轨统计：**动画的鼓点照这个排**。
 - 16 小节是一个完整 cue（intro/build/drop/outro）；循环用 \`loop: true\`（收尾转向 + 尾巴折回，无爆音）。
 - 想改情绪：先改 \`genre\` 和 \`mode\`，再改 \`bpm\`、\`intensity\`，最后才动 \`sections\`。
 - 一个项目里多个 cue 要用同一个 \`key\`/\`mode\`，否则转场会"跳调"。
@@ -102,8 +105,9 @@ const CONTENT = `# 给 HTML 动画配音
 ## 人声：audio_tts / audio_sing
 
 - \`audio_tts({ text, voice, speed, pitch, subtitle, subtitleType, srt, out })\`：旁白与台词。
-  MiniMax 默认；填 \`provider\` 为 \`edge\` 就是免费免密钥的微软朗读（300+ 音色，**只给压缩音频**，
-  本机有 ffmpeg 时自动解码成 wav，没有则写出可直接播放的 .mp3）。返回时间戳，可直接喂给 \`audio_lipsync\`。
+  供应商在「设置 → 声音」里选（不是工具参数）：MiniMax 默认，换成 Edge 就是免费免密钥的微软朗读
+  （300+ 音色，**只给压缩音频**，本机有 ffmpeg 时自动解码成 wav，没有则写出可直接播放的 .mp3）。
+  音色列表用 \`audio_voices\` 查。返回时间戳时可直接喂给 \`audio_lipsync\`；端点不返回时工具会如实说明。
 - \`audio_sing({ notes|melody, lyric, bpm, voice, vibrato, breath, harmony, seed })\`：零素材唱歌。
   \`melody: "C4:1 E4:1 G4:2"\`，\`lyric: "wo ai ni"\`（拼音；汉字没有字典，会退化成 "a" 并给出警告）。
   它是合成嗓音——像"唱歌的合成器"，不是真人。要真人质感请用 TTS 或样本。
@@ -125,8 +129,10 @@ const CONTENT = `# 给 HTML 动画配音
 - 单文件交付：\`inline: true\` 把 wav 内嵌成 base64（有体积上限）。先用 \`audio_convert\` 转成
   \`bitDepth: 8\` 或 \`sampleRate: 22050\` 再内联，通常能小一半以上。
 
-## 后期：audio_convert / audio_stretch / audio_loudness
+## 混音与后期：audio_mix / audio_convert / audio_stretch / audio_loudness
 
+- \`audio_mix({ inputs, offsets, gains, durationSeconds, fadeInSeconds, fadeOutSeconds, limiter, peakDbfs, sampleRate, out })\`：
+  多条 wav 叠成一条，逐条给增益与时间偏移，默认限幅并把峰值归一；旁白 + 底噪这种固定组合一次混好，别在页面里叠。
 - \`audio_convert\`：\`trim\`/\`gain\`/\`fade\`/\`reverse\`/\`concat\`/\`gain-scan\`/\`convert\`。
   交付前用 \`gain-scan\` 把一组 cue 拉到同一峰值，否则切换时会忽大忽小。
 - \`audio_stretch\`：\`factor\` 或 \`targetSeconds\` 变速不变调；\`semitones\` 移调不变时长。

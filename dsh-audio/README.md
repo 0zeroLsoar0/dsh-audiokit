@@ -112,9 +112,9 @@ audio_check({ paths: ['assets/audio/slam.wav'], cues: [{ at: 0.82, src: 'assets/
 `heartbeat-double` `creature-growl` `insect-buzz` `bone-crack`
 `bass-drop` `riser-short` `bell-toll` `choir-pad`
 
-参数是 0..1 的感知量（`weight` `hardness` `metallic` `space` `tone` `brightness` `speed` `rise` `decay`
-`density` `roughness` `movement`）。`pitch` 在 `impact`/`whoosh` 上是 0.5..2 的倍频，其余预设是 0..1。
-`texture` 额外支持 `kind: wind|rain|fire|room|hum`。
+参数是 0..1 的感知量（`weight` `hardness` `metallic` `space` `tone` `speed` `rise` `decay`
+`density` `roughness` `movement` 等）。`pitch` 是倍频：多数带音高的预设是 0.5..2，`tick`/`chime`/`zap` 是 0..1；
+没有 `pitch` 的预设会忽略它。`texture` 额外支持 `kind: wind|rain|fire|room|hum`。
 
 ### 设计配方
 
