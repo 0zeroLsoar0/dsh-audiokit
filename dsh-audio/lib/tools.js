@@ -100,7 +100,7 @@ function summaryLine (label, cwd, path, bytes, metrics, extra = []) {
 }
 
 async function finish (cwd, samples, sampleRate, requestedOut, label, hash, options = {}) {
-  finalize(samples, sampleRate, options.peakDbfs ?? -1)
+  finalize(samples, sampleRate, options.peakDbfs ?? -1, { loop: options.loop === true })
   const bytes = toWavBytes(samples, sampleRate)
   const target = resolvePath(cwd, requestedOut) ?? defaultOutputPath(cwd, label, hash)
   await writeFileAtomic(target, bytes)
@@ -138,7 +138,7 @@ export function registerTools (ctx) {
       const spec = { preset: args.preset, params: args.params ?? {}, duration: args.duration, seed: args.seed ?? 1, loop: args.loop === true, sampleRate: args.sampleRate ?? 44100 }
       const hash = hashSpec(spec)
       const rendered = renderPreset({ ...spec, params: spec.params })
-      const result = await finish(cwd, rendered.samples, rendered.sampleRate, args.out, args.preset, hash)
+      const result = await finish(cwd, rendered.samples, rendered.sampleRate, args.out, args.preset, hash, { loop: spec.loop })
       const loopNote = args.loop === true ? [`loop seam ${fmt(result.metrics.loopSeam)} dB`] : []
       return {
         path: result.target,

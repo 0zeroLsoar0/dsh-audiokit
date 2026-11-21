@@ -96,7 +96,7 @@ export function snapshot (specs, options = {}) {
       loop: spec.loop === true,
       sampleRate
     })
-    finalize(result.samples, result.sampleRate)
+    finalize(result.samples, result.sampleRate, -1, { loop: result.spec.loop === true })
     const bytes = encodeWav([result.samples], result.sampleRate, { dither: false })
     return {
       name,

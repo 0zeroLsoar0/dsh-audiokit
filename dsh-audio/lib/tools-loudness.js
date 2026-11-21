@@ -211,8 +211,9 @@ export function registerLoudnessTools (ctx) {
           loop: spec.loop === true
         })
         // Finalise exactly like audio_synth does before writing, so the numbers
-        // describe the file the caller would actually get.
-        mono = finalize(rendered.samples, rendered.sampleRate)
+        // describe the file the caller would actually get — including the
+        // loop-safe DC blocker for a loop render.
+        mono = finalize(rendered.samples, rendered.sampleRate, -1, { loop: rendered.spec.loop === true })
         channels = [mono]
         sampleRate = rendered.sampleRate
       } else {

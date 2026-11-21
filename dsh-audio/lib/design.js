@@ -39,7 +39,9 @@ import {
   clamp,
   dbToGain,
   dcBlock,
+  dcBlockLoop,
   filter,
+  filterLoop,
   lerp,
   makeRng,
   normalizePeak,
@@ -514,11 +516,14 @@ function planPitch (layer) {
  * Shared brightness/envelope tilt for `intensity`. Intensity is not a volume
  * knob bolted onto the end: a gentle version of a hit is darker and less
  * compressed than a huge one, so the tilt cuts air as the level comes down.
+ * On a loop the two band filters are warmed up across the wrap like every other
+ * stage on the loop path, so the tilt cannot put its own transient on the head.
  */
-function applyTilt (buffer, sampleRate, amount) {
+function applyTilt (buffer, sampleRate, amount, loop = false) {
   if (Math.abs(amount) < 1e-3) return buffer
-  const low = filter(buffer, sampleRate, () => TILT_HZ, () => 0.7, 'lp')
-  const high = filter(buffer, sampleRate, () => TILT_HZ, () => 0.7, 'hp')
+  const run = loop ? filterLoop : filter
+  const low = run(buffer, sampleRate, () => TILT_HZ, () => 0.7, 'lp')
+  const high = run(buffer, sampleRate, () => TILT_HZ, () => 0.7, 'hp')
   // Subtract a high-passed copy and add a little low-passed copy: a shelf with
   // no gain at the crossover. Recombining the two bands with gains instead
   // would notch the crossover frequency (the SVF's hp+lp sum carries a -k*bp
@@ -606,13 +611,14 @@ export function blendLayers (specs, options = {}) {
     let samples = repitch(rendered.samples, plan.ratio)
     if (layer.filter !== null) {
       const shape = layer.filter
-      samples = filter(
-        samples,
-        sampleRate,
-        (progress) => lerp(shape.cutoffHz, shape.toHz, progress),
-        () => shape.q,
-        shape.mode
-      )
+      const cutoffAt = (progress) => lerp(shape.cutoffHz, shape.toHz, progress)
+      const qAt = () => shape.q
+      // A bed is the whole loop, so its tone filter is part of the loop: without
+      // the circular warm-up the filter's startup transient lands on the head of
+      // every repeat. One-shot layers keep the plain filter.
+      samples = bed
+        ? filterLoop(samples, sampleRate, cutoffAt, qAt, shape.mode)
+        : filter(samples, sampleRate, cutoffAt, qAt, shape.mode)
     }
     const gain = dbToGain(layer.gainDb + intensityDb)
     const offset = Math.round(layer.offsetMs / 1000 * sampleRate)
@@ -627,8 +633,14 @@ export function blendLayers (specs, options = {}) {
 
   // Sub-20 Hz wander is inaudible but eats headroom and shows up as DC offset.
   // `dcBlock: false` is the escape hatch used to verify that the sum really is
-  // additive, by comparing it against a raw `renderPreset` result.
-  if (options.dcBlock !== false) dcBlock(output, sampleRate)
+  // additive, by comparing it against a raw `renderPreset` result. A loop takes
+  // the circular blocker: the file is one period, so the blocker is warmed up
+  // across the wrap instead of starting from zero state (a zero state leaves the
+  // head unfiltered while the tail is filtered, which is a step once per repeat).
+  if (options.dcBlock !== false) {
+    if (loop) dcBlockLoop(output, sampleRate)
+    else dcBlock(output, sampleRate)
+  }
 
   const trimmed = totalFrames < frameCount(naturalSeconds, sampleRate)
   if (!loop) {
@@ -642,7 +654,7 @@ export function blendLayers (specs, options = {}) {
 
   // The tilt only ever removes air, never adds it: a full-intensity design is
   // the recipe exactly as authored, and intensity below 1 makes it gentler.
-  applyTilt(output, sampleRate, clamp(intensity - 1, -1, 0))
+  applyTilt(output, sampleRate, clamp(intensity - 1, -1, 0), loop)
 
   // Same order as `finalize` in audio.js: normalise first, then shave the very
   // top. Limiting a still-loud sum would drive tanh saturation and add

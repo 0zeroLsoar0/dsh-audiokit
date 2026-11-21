@@ -85,7 +85,7 @@ async function loadSource (cwd, args) {
   })
   // Match audio_synth: a rendered source starts at the same ceiling the other
   // render tools produce, so the level after stretching is comparable.
-  finalize(rendered.samples, rendered.sampleRate, -1)
+  finalize(rendered.samples, rendered.sampleRate, -1, { loop: rendered.spec.loop === true })
   return {
     samples: rendered.samples,
     sampleRate: rendered.sampleRate,

@@ -150,7 +150,7 @@ async function readInput (cwd, entry) {
       loop: entry.loop === true
     }
     const rendered = renderPreset(spec)
-    finalize(rendered.samples, rendered.sampleRate, Number.isFinite(entry.peakDbfs) ? Number(entry.peakDbfs) : -1)
+    finalize(rendered.samples, rendered.sampleRate, Number.isFinite(entry.peakDbfs) ? Number(entry.peakDbfs) : -1, { loop: rendered.spec.loop === true })
     return {
       samples: rendered.samples,
       sampleRate: rendered.sampleRate,

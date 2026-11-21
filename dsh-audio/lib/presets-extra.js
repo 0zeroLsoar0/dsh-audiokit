@@ -836,12 +836,17 @@ export const EXTRA_PRESETS = {
     defaultDuration: 2,
     defaults: { pitch: 1, speed: 0.5, roughness: 0.3, space: 0.1 },
     params: { pitch: [0.5, 2], speed: [0, 1], roughness: [0, 1], space: [0, 1] },
-    render (params, frames, sampleRate, rand) {
+    render (params, frames, sampleRate, rand, timing) {
       const out = new Float32Array(frames)
       const seconds = frames / sampleRate
       // Every periodic layer is snapped to whole cycles, so the loop returns to
-      // its starting phase instead of clicking.
-      const f0 = loopFreq(58 * params.pitch * (0.85 + 0.3 * params.speed), frames, sampleRate)
+      // its starting phase instead of clicking. `timing.loopFrames` is the loop
+      // period of a loop render (the rendered buffer is one period plus the
+      // overlap-add tail, so snapping to the buffer length would leave a phase
+      // offset of exactly the crossfade). One-shots pass no timing and snap to
+      // the buffer length, which is what they always did.
+      const period = timing === undefined || !Number.isFinite(timing.loopFrames) ? frames : timing.loopFrames
+      const f0 = loopFreq(58 * params.pitch * (0.85 + 0.3 * params.speed), period, sampleRate)
       const partials = [1, 2, 3, 4, 6]
       const gains = [0.34, 0.22, 0.14, 0.09, 0.05]
       partials.forEach((ratio, index) => {
@@ -849,18 +854,18 @@ export const EXTRA_PRESETS = {
         for (let i = 0; i < frames; i += 1) out[i] += gains[index] * Math.sin(TAU * hz * (i / sampleRate))
       })
       // The whine sits above the hum; a slow wobble keeps it from sounding dead.
-      const whineHz = loopFreq(lerp(600, 1250, params.speed) * params.pitch, frames, sampleRate)
-      const wobble = loopFreq(4.1, frames, sampleRate)
+      const whineHz = loopFreq(lerp(600, 1250, params.speed) * params.pitch, period, sampleRate)
+      const wobble = loopFreq(4.1, period, sampleRate)
       for (let i = 0; i < frames; i += 1) {
         const t = i / sampleRate
         out[i] += (0.2 + 0.14 * params.roughness) * (0.75 + 0.25 * Math.sin(TAU * wobble * t)) * Math.sin(TAU * whineHz * t)
         out[i] += 0.05 * Math.sin(TAU * whineHz * 2 * t)
       }
       // Machine tone: a hum for the frame and a noise bed for the air.
-      const flutter = loopFreq(lerp(17, 37, params.roughness), frames, sampleRate)
+      const flutter = loopFreq(lerp(17, 37, params.roughness), period, sampleRate)
       for (let i = 0; i < frames; i += 1) {
         const t = i / sampleRate
-        out[i] *= 1 + 0.06 * Math.sin(TAU * loopFreq(2.3, frames, sampleRate) * t)
+        out[i] *= 1 + 0.06 * Math.sin(TAU * loopFreq(2.3, period, sampleRate) * t)
         out[i] += 0.016 * Math.sin(TAU * flutter * t)
       }
       addInto(out, filter(noise(frames, rand, 'pink', sampleRate), sampleRate, () => 1200, () => 0.6, 'lp'), 0, 0.05 + 0.09 * params.roughness)
@@ -897,24 +902,27 @@ export const EXTRA_PRESETS = {
     defaultDuration: 2,
     defaults: { pitch: 1, speed: 0.5, tone: 0.5, space: 0.3 },
     params: { pitch: [0.5, 2], speed: [0, 1], tone: [0, 1], space: [0, 1] },
-    render (params, frames, sampleRate, rand) {
+    render (params, frames, sampleRate, rand, timing) {
       const out = new Float32Array(frames)
       // Integer cycles for both the carrier and the sweep rate: the wail ends
-      // where it began, which is the whole trick of a loopable siren.
-      const f0 = loopFreq(640 * params.pitch, frames, sampleRate)
-      const rate = loopFreq(lerp(0.42, 0.95, params.speed), frames, sampleRate)
+      // where it began, which is the whole trick of a loopable siren. A loop
+      // render snaps against its loop period (`timing.loopFrames`), not against
+      // the rendered buffer, which is one period plus the overlap-add tail.
+      const period = timing === undefined || !Number.isFinite(timing.loopFrames) ? frames : timing.loopFrames
+      const f0 = loopFreq(640 * params.pitch, period, sampleRate)
+      const rate = loopFreq(lerp(0.42, 0.95, params.speed), period, sampleRate)
       const depth = 0.28 + 0.14 * params.tone
       // Even the partials are snapped to whole cycles: a partial that ends mid
       // cycle is a click the crossfade only half hides.
-      const harmonicHz = loopFreq(f0 * 2.02, frames, sampleRate)
-      const thirdHz = loopFreq(f0 * 3.04, frames, sampleRate)
+      const harmonicHz = loopFreq(f0 * 2.02, period, sampleRate)
+      const thirdHz = loopFreq(f0 * 3.04, period, sampleRate)
       const wail = sweepOsc(frames, sampleRate,
         (t) => f0 * (1 + depth * Math.sin(TAU * rate * t)), () => 0.55, 2)
       const harmonic = sweepOsc(frames, sampleRate,
         (t) => harmonicHz * (1 + depth * 0.85 * Math.sin(TAU * rate * t + 0.5)), () => 0.26, 0)
       const third = sweepOsc(frames, sampleRate,
         (t) => thirdHz * (1 + depth * 0.7 * Math.sin(TAU * rate * t + 1.1)), () => 0.12, 0)
-      const breathe = loopFreq(3.2, frames, sampleRate)
+      const breathe = loopFreq(3.2, period, sampleRate)
       for (let i = 0; i < frames; i += 1) {
         const t = i / sampleRate
         out[i] = wail[i] + harmonic[i] * (1 + 0.05 * Math.sin(TAU * breathe * t)) + third[i]
@@ -1059,14 +1067,17 @@ export const EXTRA_PRESETS = {
     defaultDuration: 1.4,
     defaults: { pitch: 1, movement: 0.5, tone: 0.5, space: 0.06 },
     params: { pitch: [0.5, 2], movement: [0, 1], tone: [0, 1], space: [0, 1] },
-    render (params, frames, sampleRate, rand) {
+    render (params, frames, sampleRate, rand, timing) {
       const out = new Float32Array(frames)
-      // Wing beat, tremolo and drift are all whole cycles across the buffer, so
-      // the buzz loops without a seam.
-      const f0 = loopFreq(190 * params.pitch, frames, sampleRate)
-      const buzzRate = loopFreq(lerp(30, 58, params.tone), frames, sampleRate)
-      const wobble = loopFreq(2.7, frames, sampleRate)
-      const drift = loopFreq(3.3, frames, sampleRate)
+      // Wing beat, tremolo and drift are all whole cycles across the loop, so
+      // the buzz loops without a seam. A loop render snaps against its loop
+      // period (`timing.loopFrames`), not against the rendered buffer, which is
+      // one period plus the overlap-add tail.
+      const period = timing === undefined || !Number.isFinite(timing.loopFrames) ? frames : timing.loopFrames
+      const f0 = loopFreq(190 * params.pitch, period, sampleRate)
+      const buzzRate = loopFreq(lerp(30, 58, params.tone), period, sampleRate)
+      const wobble = loopFreq(2.7, period, sampleRate)
+      const drift = loopFreq(3.3, period, sampleRate)
       const wing = sweepOsc(frames, sampleRate, (t) => f0 * (1 + 0.035 * Math.sin(TAU * wobble * t)), () => 1, 2)
       const wingHigh = sweepOsc(frames, sampleRate, (t) => f0 * 2 * (1 + 0.02 * Math.sin(TAU * wobble * t + 0.8)), () => 1, 0)
       for (let i = 0; i < frames; i += 1) {
@@ -1219,18 +1230,22 @@ export const EXTRA_PRESETS = {
     defaultDuration: 3.4,
     defaults: { pitch: 1, bright: 0.45, movement: 0.5, space: 0.2 },
     params: { pitch: [0.5, 2], bright: [0, 1], movement: [0, 1], space: [0, 1] },
-    render (params, frames, sampleRate, rand) {
+    render (params, frames, sampleRate, rand, timing) {
       const out = new Float32Array(frames)
-      const root = loopFreq(220 * params.pitch, frames, sampleRate)
-      const vibrato = loopFreq(4.2, frames, sampleRate)
-      const swellRate = loopFreq(0.26, frames, sampleRate)
+      // A loop render snaps every voice to the loop period (`timing.loopFrames`)
+      // rather than to the rendered buffer, which is one period plus the
+      // overlap-add tail.
+      const period = timing === undefined || !Number.isFinite(timing.loopFrames) ? frames : timing.loopFrames
+      const root = loopFreq(220 * params.pitch, period, sampleRate)
+      const vibrato = loopFreq(4.2, period, sampleRate)
+      const swellRate = loopFreq(0.26, period, sampleRate)
       // A minor stack plus an octave: voices, not a synth chord. Every voice is
       // a phase-spread detuned pair; without the spread all twelve start in
       // phase and the pad pokes out of the mix with a 12 dB crest.
       const ratios = [0.5, 1, 1.2, 1.5, 2, 2.4]
       const voicePhase = [0, 2.399, 4.799, 0.733, 3.142, 5.541]
       const copyPhase = [0.61, 2.05]
-      const voiceHz = ratios.map((ratio) => [0, 1].map((copy) => loopFreq(root * ratio * (copy === 0 ? 1 : 1.0018), frames, sampleRate)))
+      const voiceHz = ratios.map((ratio) => [0, 1].map((copy) => loopFreq(root * ratio * (copy === 0 ? 1 : 1.0018), period, sampleRate)))
       for (let i = 0; i < frames; i += 1) {
         const t = i / sampleRate
         let sum = 0

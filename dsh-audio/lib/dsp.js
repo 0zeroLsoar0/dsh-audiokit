@@ -101,6 +101,62 @@ export function filter (input, sampleRate, cutoffAt, qAt = () => 0.8, mode = 'lp
   return out
 }
 
+/* ------------------------------------------------------------- warm-up -- */
+
+/**
+ * A filter has state. Started from zero it treats the first samples of whatever
+ * it is given as "the beginning of the signal", so its startup transient lands
+ * at sample 0 — which for a loop is exactly where the listener hears it once per
+ * repeat. The fix is to hand the filter one full period of the buffer before the
+ * pass that counts: the buffer is periodic, so the state entering sample 0 after
+ * that pre-roll is (to within the tolerance below) the state leaving the last
+ * sample. That is the circular warm-up, and it is why a loop render and a
+ * one-shot render of the same preset can legitimately take different code paths.
+ */
+const WARM_UP_TOLERANCE = 1e-9
+/**
+ * Hard cap on pre-roll passes. A pass shrinks the startup error by the filter's
+ * own decay over one period, so real material converges in one or two passes;
+ * the cap only bounds the pathological case (a very short buffer under a very
+ * low corner, where the decay per pass is small but still non-zero).
+ */
+const WARM_UP_PASSES = 512
+
+/**
+ * Filter a periodic buffer with the state it would carry around the wrap.
+ *
+ * The pre-roll runs the identical time-varying schedule over a throwaway pass,
+ * so a filter whose cutoff sweeps also arrives at the state a loop needs. The
+ * returned buffer is the second pass, never the pre-roll.
+ * @param {Float32Array} input - one full period.
+ * @param {number} sampleRate - Hz.
+ * @param {(progress: number) => number} cutoffAt - Hz at normalised position.
+ * @param {(progress: number) => number} [qAt] - Q at normalised position.
+ * @param {'lp'|'hp'|'bp'} [mode] - response.
+ * @returns {Float32Array} filtered copy.
+ */
+export function filterLoop (input, sampleRate, cutoffAt, qAt = () => 0.8, mode = 'lp') {
+  const out = new Float32Array(input.length)
+  const svf = new Svf()
+  const pass = (write) => {
+    for (let i = 0; i < input.length; i += 1) {
+      const p = input.length > 1 ? i / (input.length - 1) : 0
+      const value = svf.process(input[i], cutoffAt(p), qAt(p), sampleRate, mode)
+      if (write !== null) write[i] = value
+    }
+  }
+  for (let attempt = 0; attempt < WARM_UP_PASSES; attempt += 1) {
+    const ic1 = svf.ic1
+    const ic2 = svf.ic2
+    pass(null)
+    const delta = Math.max(Math.abs(svf.ic1 - ic1), Math.abs(svf.ic2 - ic2))
+    const level = Math.max(1, Math.abs(svf.ic1), Math.abs(svf.ic2))
+    if (delta <= WARM_UP_TOLERANCE * level) break
+  }
+  pass(out)
+  return out
+}
+
 /**
  * Seeded noise generator.
  * @param {number} frames - sample count.
@@ -290,6 +346,62 @@ export function dcBlock (buffer, sampleRate, cutoff = 18) {
     buffer[i] = output
   }
   return buffer
+}
+
+/**
+ * DC-block a loop, with the blocker's state warmed up across the wrap.
+ *
+ * `dcBlock` starts from zero, so on a periodic buffer it filters the tail by the
+ * drift it removed but leaves sample 0 unfiltered: the file then ends with a
+ * one-sample step (the removed DC) and starts with a slightly louder head. The
+ * pre-roll here feeds the blocker its own period first, so the state entering
+ * sample 0 equals the state leaving the last sample and the wrap is a
+ * continuation. A one-shot keeps the plain `dcBlock` so its bytes do not move.
+ *
+ * The pre-roll repeats until the state stops changing: one period is enough for
+ * a normal-length loop, while a very short one (a 16-frame buffer under the
+ * 18 Hz corner) needs a few passes to settle. Output is deterministic — the
+ * pass count depends only on the samples.
+ * @param {Float32Array} buffer - one full period, modified in place.
+ * @param {number} sampleRate - Hz.
+ * @param {number} [cutoff] - corner frequency in Hz.
+ */
+export function dcBlockLoop (buffer, sampleRate, cutoff = 18) {
+  const r = Math.exp(-2 * Math.PI * cutoff / sampleRate)
+  let previousInput = 0
+  let previousOutput = 0
+  const pass = (write) => {
+    for (let i = 0; i < buffer.length; i += 1) {
+      const input = buffer[i]
+      previousOutput = input - previousInput + r * previousOutput
+      previousInput = input
+      if (write !== null) write[i] = previousOutput
+    }
+  }
+  for (let attempt = 0; attempt < WARM_UP_PASSES; attempt += 1) {
+    const before = previousOutput
+    pass(null)
+    if (Math.abs(previousOutput - before) <= WARM_UP_TOLERANCE * Math.max(1, Math.abs(previousOutput))) break
+  }
+  pass(buffer)
+  return buffer
+}
+
+/**
+ * Snap a frequency to a whole number of cycles across a buffer.
+ *
+ * A bed whose oscillator does not return to its starting phase cannot loop: the
+ * last sample and the first are then a fraction of a cycle apart, which is a
+ * step the ear reads as a click. Quantising every periodic layer to the loop
+ * period is what "seamless" means for a tonal bed.
+ * @param {number} hz - desired frequency.
+ * @param {number} frames - loop length in samples.
+ * @param {number} sampleRate - Hz.
+ * @returns {number}
+ */
+export function loopFreq (hz, frames, sampleRate) {
+  const cycles = Math.max(1, Math.round(hz * frames / sampleRate))
+  return cycles * sampleRate / frames
 }
 
 /* ---------------------------------------------------------------- presets -- */
@@ -511,29 +623,107 @@ export const PRESETS = {
     defaults: { kind: 'wind', density: 0.5, tone: 0.5, movement: 0.4 },
     kinds: ['wind', 'rain', 'fire', 'room', 'hum'],
     params: { density: [0, 1], tone: [0, 1], movement: [0, 1] },
-    render (params, frames, sampleRate, rand) {
+    render (params, frames, sampleRate, rand, timing) {
       const out = new Float32Array(frames)
       const seconds = frames / sampleRate
-      const base = noise(frames, rand, 'pink', sampleRate)
+      // `renderPreset` hands a loop render its loop period and a one-shot
+      // `undefined`. Every periodic layer below is snapped to that period, never
+      // to the rendered length, so the wrap returns to the same phase; the
+      // one-shot branch keeps the exact arithmetic it had before (its output is
+      // byte-identical), which is why the period is optional here.
+      const period = timing !== undefined && Number.isFinite(timing.loopFrames) ? timing.loopFrames : undefined
+      const snap = (hz) => (period === undefined ? hz : loopFreq(hz, period, sampleRate))
       const kind = params.kind
+      // One cycle of slow movement per buffer. Looping starts the cycle at phase
+      // zero (the head then sits at the mean level, not at a gust peak); a
+      // one-shot keeps the historical offset.
+      const slowHz = period === undefined
+        ? 1 / Math.max(seconds, 0.5)
+        : loopFreq(1 / Math.max(seconds, 0.5), period, sampleRate)
+      const slowPhase = period === undefined ? 0.7 : 0
+      const base = noise(frames, rand, 'pink', sampleRate)
       if (kind === 'hum') {
+        // Harmonics snapped to the loop: a mains hum that ends half a cycle
+        // outside its own period clicks once per repeat.
+        const f0 = snap(55)
+        const f1 = snap(110)
+        const f2 = snap(165)
         for (let i = 0; i < frames; i += 1) {
           const t = i / sampleRate
-          out[i] = 0.22 * Math.sin(TAU * 55 * t) + 0.1 * Math.sin(TAU * 110 * t) + 0.05 * Math.sin(TAU * 165 * t)
+          out[i] = 0.22 * Math.sin(TAU * f0 * t) + 0.1 * Math.sin(TAU * f1 * t) + 0.05 * Math.sin(TAU * f2 * t)
         }
         addInto(out, filter(base, sampleRate, () => 400, () => 0.6, 'lp'), 0, 0.15 * params.density)
         return out
       }
+      if (kind === 'fire') {
+        // A fire is a moving low roar with sparse bright pops. It has no hiss
+        // and no droplet patter, which is exactly what separates it from rain:
+        // the body is mid-bright rather than high, the movement is a fast
+        // flicker, and the transients are isolated crackles.
+        const roar = filter(noise(frames, rand, 'pink', sampleRate), sampleRate,
+          (t) => lerp(320, 1400, params.tone) * (0.85 + 0.3 * Math.sin(TAU * t + 0.4)), () => 0.8, 'lp')
+        const flickerHz = snap(lerp(4, 9, params.movement))
+        const depth = 0.18 + 0.3 * params.density
+        for (let i = 0; i < frames; i += 1) {
+          const t = i / sampleRate
+          const flicker = 1 - depth * (0.5 + 0.5 * Math.sin(TAU * flickerHz * t))
+          out[i] = roar[i] * 1.6 * flicker
+        }
+        // The air over the flames: the band that makes the pops read as fire and
+        // not as a hiss bed.
+        const air = noise(frames, rand, 'white', sampleRate)
+        addInto(out, filter(air, sampleRate, () => lerp(2200, 4200, params.tone), () => 0.7, 'hp'), 0, 0.035 + 0.02 * params.density)
+        const pops = Math.round(seconds * lerp(24, 90, params.density))
+        for (let p = 0; p < pops; p += 1) {
+          const length = Math.max(3, Math.round((0.0012 + rand() * 0.004) * sampleRate))
+          // A loop cannot cut a pop mid-decay: the truncation would be the click
+          // the loop was supposed to avoid. Every pop therefore ends inside the
+          // period.
+          const span = period === undefined ? Math.max(1, frames - 1) : Math.max(1, frames - length)
+          const at = Math.floor(rand() * span)
+          const grain = noise(length, rand, 'white', sampleRate)
+          const envelope = decayEnvelope(length, sampleRate, 0.0008 + rand() * 0.0018)
+          for (let i = 0; i < length; i += 1) grain[i] *= envelope[i]
+          addInto(out, filter(grain, sampleRate, () => lerp(1600, 5600, params.tone) * (0.7 + rand() * 0.6), () => 1.4, 'bp'), at, 0.10 + rand() * 0.16)
+        }
+        return out
+      }
+      if (kind === 'room') {
+        // Room tone is a space with nothing happening in it: the band sits below
+        // wind's, a narrow resonance gives the space a size, and the only
+        // movement is a slow drift — no gusts. It is deliberately the darkest
+        // and least eventful of the five.
+        const body = filter(noise(frames, rand, 'pink', sampleRate), sampleRate,
+          (t) => lerp(200, 420, params.tone) * (0.92 + 0.08 * Math.sin(TAU * t)), () => 0.65, 'lp')
+        const modes = filter(noise(frames, rand, 'pink', sampleRate), sampleRate, () => 190, () => 5, 'bp')
+        const sub = filter(noise(frames, rand, 'brown', sampleRate), sampleRate, () => 95, () => 0.6, 'lp')
+        for (let i = 0; i < frames; i += 1) {
+          const t = i / sampleRate
+          const drift = 1 + 0.1 * params.movement * Math.sin(TAU * slowHz * t + slowPhase)
+          out[i] = body[i] * 1.15 * drift + modes[i] * 0.28 + sub[i] * 0.45
+        }
+        // A trace of air keeps the low mass from reading as a DC rumble.
+        addInto(out, filter(base, sampleRate, () => lerp(700, 1600, params.tone), () => 0.6, 'lp'), 0, 0.006 + 0.01 * (1 - params.density))
+        return out
+      }
+      // Wind and rain share the moving low bed: wind *is* that bed, rain adds a
+      // droplet patter and a high hiss on top of it.
       const lowBed = filter(base, sampleRate, (p) => lerp(180, 900, params.tone), () => 0.7, 'lp')
       for (let i = 0; i < frames; i += 1) {
         const t = i / sampleRate
-        const slow = 1 + params.movement * 0.5 * Math.sin(TAU * (1 / Math.max(seconds, 0.5)) * t + 0.7)
+        const slow = 1 + params.movement * 0.5 * Math.sin(TAU * slowHz * t + slowPhase)
         out[i] = lowBed[i] * slow
       }
-      if (kind === 'rain' || kind === 'fire') {
+      if (kind === 'rain') {
         const drops = Math.round(frames / sampleRate * lerp(40, 220, params.density))
+        // Same rule as the fire pops: a drop whose decay is cut by the loop point
+        // is a transient ending in a step, so a loop render keeps every drop
+        // inside the period. One-shots keep the historical placement (the last
+        // drops may be trimmed by the buffer end, which is what they always did).
+        const longestDrop = Math.max(6, Math.round(0.0015 * sampleRate * 1.5))
+        const dropSpan = period === undefined ? Math.max(1, frames - 1) : Math.max(1, frames - longestDrop)
         for (let d = 0; d < drops; d += 1) {
-          const at = Math.floor(rand() * (frames - 1))
+          const at = Math.floor(rand() * dropSpan)
           const length = Math.max(6, Math.round(0.0015 * sampleRate * (0.5 + rand())))
           for (let i = 0; i < length && at + i < frames; i += 1) {
             out[at + i] += (rand() * 2 - 1) * 0.4 * Math.exp(-i / (length * 0.4))

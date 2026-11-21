@@ -15,6 +15,7 @@ import {
   clamp,
   dbToGain,
   dcBlock,
+  dcBlockLoop,
   decayEnvelope,
   lerp,
   makeRng,
@@ -28,7 +29,7 @@ import {
 import { decodeWav, encodeWav } from './wav.js'
 
 /** Bumped whenever synthesis changes in a way that alters output bytes. */
-export const ENGINE_VERSION = 1
+export const ENGINE_VERSION = 2
 
 /* ------------------------------------------------------------------ FFT -- */
 
@@ -208,6 +209,81 @@ function frameCount (seconds, sampleRate) {
 }
 
 /**
+ * Normalised correlation of two equal-length windows of one buffer.
+ *
+ * Used to decide how a loop head should be faded into the tail's continuation.
+ * Returns 0 when either window is silent: "no evidence of correlation" is the
+ * right answer there, and it keeps the equal-power branch.
+ * @param {Float32Array} buffer - source.
+ * @param {number} offsetA - start of the first window.
+ * @param {number} offsetB - start of the second window.
+ * @param {number} length - window length in samples.
+ * @returns {number} correlation in [-1, 1].
+ */
+function windowCorrelation (buffer, offsetA, offsetB, length) {
+  let meanA = 0
+  let meanB = 0
+  for (let i = 0; i < length; i += 1) { meanA += buffer[offsetA + i]; meanB += buffer[offsetB + i] }
+  meanA /= length
+  meanB /= length
+  let cross = 0
+  let energyA = 0
+  let energyB = 0
+  for (let i = 0; i < length; i += 1) {
+    const a = buffer[offsetA + i] - meanA
+    const b = buffer[offsetB + i] - meanB
+    cross += a * b
+    energyA += a * a
+    energyB += b * b
+  }
+  if (!(energyA > 0) || !(energyB > 0)) return 0
+  return cross / Math.sqrt(energyA * energyB)
+}
+
+/**
+ * Crossfade weight exponent for a measured correlation.
+ *
+ * The head of a loop is the tail's continuation faded into the renderer's own
+ * first 50 ms; the two sides are the *same signal* when the material is periodic,
+ * so amplitude-complementary weights (p = 1) reconstruct it exactly. They are
+ * independent when the material is noise, where equal power (p = 0.5) is the
+ * level-preserving choice. Equal power on the same signal sums two copies (+3 dB
+ * swell once per repeat); linear weights on noise dip 3 dB. Solving
+ * `a^2 + b^2 + 2*c*a*b = 1` at the midpoint, with `a = b = 2^-p`, gives the
+ * exponent whose level is correct for the material's own correlation; away from
+ * the midpoint the error is under 0.2 dB for any c because a^2 + b^2 stays
+ * within (1 - c) t(1-t) of unity.
+ * @param {number} correlation - measured head/continuation correlation.
+ * @returns {number} exponent in [0.5, 1].
+ */
+function crossfadeExponent (correlation) {
+  return clamp(Math.log(2 * (1 + clamp(correlation, -1, 1))) / Math.log(4), 0.5, 1)
+}
+
+/**
+ * Replace the head of a loop with a fade from the tail's natural continuation.
+ *
+ * At i = 0 the output is `rendered[main]`, i.e. the sample that continues the
+ * last sample of the loop, so the wrap is a continuation rather than a jump; by
+ * i = crossfade it is the renderer's own output, so the startup transient of any
+ * internal filter is gone. The weights preserve the level of the material
+ * itself, which is what keeps the head from swelling or dipping.
+ * @param {Float32Array} samples - destination loop buffer (length `main`).
+ * @param {Float32Array} rendered - renderer output (length `main + crossfade`).
+ * @param {number} main - loop length in samples.
+ * @param {number} crossfade - fade length in samples.
+ */
+function wrapCrossfade (samples, rendered, main, crossfade) {
+  if (crossfade <= 0) return
+  const correlation = clamp(windowCorrelation(rendered, 0, main, crossfade), -1, 1)
+  const exponent = crossfadeExponent(correlation)
+  for (let i = 0; i < crossfade; i += 1) {
+    const t = i / crossfade
+    samples[i] = rendered[i] * Math.pow(t, exponent) + rendered[main + i] * Math.pow(1 - t, exponent)
+  }
+}
+
+/**
  * Render one preset.
  * @param {object} request - preset, params, duration, seed, sampleRate, loop.
  * @returns {{ samples: Float32Array, sampleRate: number, durationSeconds: number, spec: object }}
@@ -225,7 +301,12 @@ export function renderPreset (request) {
   const crossfade = loop ? Math.min(Math.round(0.05 * sampleRate), Math.floor(main / 4)) : 0
   const frames = main + crossfade
   const rand = makeRng((seed ^ 0x9E3779B9) >>> 0)
-  const rendered = spec.render(params, frames, sampleRate, rand)
+  // A loop render tells the preset its loop period: periodic layers inside the
+  // preset snap to *that*, not to `main + crossfade`, or the wrap carries the
+  // crossfade's worth of phase and the fade cannot hide it. One-shots pass
+  // nothing, so their renderers take exactly the path they always took.
+  const timing = loop ? { loop: true, loopFrames: main, crossfade } : undefined
+  const rendered = spec.render(params, frames, sampleRate, rand, timing)
 
   let samples
   if (loop) {
@@ -234,10 +315,7 @@ export function renderPreset (request) {
     // Overlap-add: blend the natural continuation of the signal (samples past
     // `main`) into the head, so replaying the loop is a continuation rather
     // than a jump back to the initial transient.
-    for (let i = 0; i < crossfade; i += 1) {
-      const t = i / crossfade
-      samples[i] = rendered[i] * Math.sqrt(t) + rendered[main + i] * Math.sqrt(1 - t)
-    }
+    wrapCrossfade(samples, rendered, main, crossfade)
   } else {
     samples = rendered
     // Cutting a still-decaying tail clicks; every one-shot ends with a fade.
@@ -449,12 +527,20 @@ export function mixTracks (inputs, options = {}) {
 
 /**
  * Apply DC removal, peak normalisation and the ceiling used before encoding.
+ *
+ * `options.loop` puts the DC blocker into its circular mode: the file is a
+ * period, so the blocker is warmed up across the wrap instead of starting from
+ * zero state (which would leave the head unfiltered while the tail is filtered,
+ * i.e. a one-sample step at every repeat). One-shots keep the plain blocker and
+ * their output bytes do not move.
  * @param {Float32Array} samples - mono signal, modified in place.
  * @param {number} sampleRate - Hz, needed by the DC blocker.
  * @param {number} [peakDbfs] - target peak.
+ * @param {{ loop?: boolean }} [options] - `loop: true` for a seamless bed.
  */
-export function finalize (samples, sampleRate, peakDbfs = -1) {
-  dcBlock(samples, sampleRate)
+export function finalize (samples, sampleRate, peakDbfs = -1, options = {}) {
+  if (options !== null && typeof options === 'object' && options.loop === true) dcBlockLoop(samples, sampleRate)
+  else dcBlock(samples, sampleRate)
   normalizePeak(samples, peakDbfs)
   softLimit(samples)
   return samples
