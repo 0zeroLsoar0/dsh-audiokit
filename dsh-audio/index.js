@@ -22,6 +22,7 @@ import { registerCheckTool } from './lib/check.js'
 import { registerBindTools } from './lib/tools-bind.js'
 import { registerConvertTools } from './lib/tools-convert.js'
 import { registerSettingsRoute } from './lib/settings-route.js'
+import { registerSingTools } from './lib/tools-sing.js'
 import { registerSkill } from './lib/skill.js'
 import { registerTools } from './lib/tools.js'
 import { registerTtsTool, registerVoicesTool } from './lib/tts.js'
@@ -66,6 +67,7 @@ export function apply (ctx, config = {}) {
   registerConvertTools(ctx)
   registerVisualTools(ctx)
   registerBindTools(ctx)
+  registerSingTools(ctx)
   registerSettingsRoute(ctx, config, VERSION)
 
   // Optional seams: resolved through `ctx.get` so the plugin still activates in
