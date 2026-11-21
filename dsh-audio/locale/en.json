@@ -1,6 +1,7 @@
 {
   "meta": {
     "title": "Sound",
-    "description": "Synthesizes sound effects, event trains, ambience and narration for HTML animation, with measurements the agent can verify without listening."
+    "detail": "docs/DETAIL.md",
+    "description": "Sound for HTML animation: 38 synthesized presets, 26 layered design recipes, 8 compose genres, narration (MiniMax / OpenAI-compatible / free Edge) and zero-asset singing, plus viseme tracks, beat detection, a page player, mixing, loudness and delivery checks - 17 tools in all. Pick a provider under Settings → Sound; synthesis, composing, singing, alignment and the checks need no key, and the same request always renders the same bytes."
   }
 }
