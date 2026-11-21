@@ -159,7 +159,16 @@ for (const id of sceneIds) zhLabels[id] = sceneZh[id] || id;
 
 const embeddedSpec = {
   duration,
-  scenes: spec.scenes.map((s) => ({ id: s.id, from: s.from, to: s.to })),
+  // The copy travels with the scene so the canvas draws exactly what the
+  // storyboard says; the HUD's short labels stay a separate, shorter layer.
+  scenes: spec.scenes.map((s) => ({
+    id: s.id,
+    from: s.from,
+    to: s.to,
+    headline: s.headline ?? '',
+    caption: s.caption ?? '',
+    detail: s.detail ?? '',
+  })),
   cues: (spec.cues || []).map((c) => ({ name: c.name, at: c.at })),
   audio: audio.ready ? Object.keys(audioPayload) : [],
 };
