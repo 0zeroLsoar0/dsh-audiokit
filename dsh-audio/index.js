@@ -19,6 +19,7 @@
 import { registerExtraPresets } from './lib/presets-extra.js'
 
 import { registerCheckTool } from './lib/check.js'
+import { registerBindTools } from './lib/tools-bind.js'
 import { registerConvertTools } from './lib/tools-convert.js'
 import { registerSettingsRoute } from './lib/settings-route.js'
 import { registerSkill } from './lib/skill.js'
@@ -64,6 +65,7 @@ export function apply (ctx, config = {}) {
   registerCheckTool(ctx, config)
   registerConvertTools(ctx)
   registerVisualTools(ctx)
+  registerBindTools(ctx)
   registerSettingsRoute(ctx, config, VERSION)
 
   // Optional seams: resolved through `ctx.get` so the plugin still activates in
