@@ -29,3 +29,6 @@
           baseUrl: https://dashscope.aliyuncs.com/compatible-mode
           model: qwen2.5-omni-7b
           apiKeyEnv: DASHSCOPE_API_KEY
+          # autoValidate: false   # experimental: probe the saved model on save
+        # voicebankDir: ''        # optional recorded voicebank for audio_sing;
+        #                         # empty means ~/.dsh/dsh-audio/voicebank/

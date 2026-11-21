@@ -82,7 +82,7 @@ export function apply (ctx, config = {}) {
   registerVisualTools(ctx)
   registerBindTools(ctx)
   registerComposeTools(ctx)
-  registerSingTools(ctx)
+  registerSingTools(ctx, config)
   registerStretchTools(ctx)
   registerSettingsRoute(ctx, config, VERSION)
 
