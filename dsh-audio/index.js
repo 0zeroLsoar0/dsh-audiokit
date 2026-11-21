@@ -20,12 +20,14 @@ import { registerExtraPresets } from './lib/presets-extra.js'
 
 import { registerCheckTool } from './lib/check.js'
 import { registerBindTools } from './lib/tools-bind.js'
+import { registerComposeTools } from './lib/tools-compose.js'
 import { registerConvertTools } from './lib/tools-convert.js'
 import { registerDesignTools } from './lib/tools-design.js'
 import { registerLoudnessTools } from './lib/tools-loudness.js'
 import { registerSettingsRoute } from './lib/settings-route.js'
 import { registerSingTools } from './lib/tools-sing.js'
 import { registerSkill } from './lib/skill.js'
+import { registerStretchTools } from './lib/tools-stretch.js'
 import { registerTools } from './lib/tools.js'
 import { registerTtsTool, registerVoicesTool } from './lib/tts.js'
 import { registerVisualTools } from './lib/tools-visual.js'
@@ -71,7 +73,9 @@ export function apply (ctx, config = {}) {
   registerDesignTools(ctx)
   registerVisualTools(ctx)
   registerBindTools(ctx)
+  registerComposeTools(ctx)
   registerSingTools(ctx)
+  registerStretchTools(ctx)
   registerSettingsRoute(ctx, config, VERSION)
 
   // Optional seams: resolved through `ctx.get` so the plugin still activates in
