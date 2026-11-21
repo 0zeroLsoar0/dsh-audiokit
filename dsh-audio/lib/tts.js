@@ -5,6 +5,12 @@
  * The return value carries three things on purpose: the audio, the timestamps
  * (when the provider gives them) and the parameters that actually took effect.
  * Without the last two a caller can only play the file, not sync anything to it.
+ *
+ * Two output formats exist because providers differ in what they can deliver:
+ * every provider that returns samples gets the normal `.wav` path, while the
+ * free Edge engine — whose service only serves MP3 and whose decoder may be
+ * absent — falls back to writing the service's MP3 frames to an `.mp3` file.
+ * The fallback never claims a `.wav` that does not exist.
  */
 
 import { stat } from 'node:fs/promises'
@@ -18,7 +24,7 @@ import {
   toWavBytes,
   writeFileAtomic
 } from './audio.js'
-import { VOICE_CATALOG, listVoices, speak } from './providers.js'
+import { EDGE_VOICE_CATALOG, VOICE_CATALOG, listVoices, speak } from './providers.js'
 
 const MAX_TEXT = 8000
 const CHUNK = 600
@@ -100,27 +106,188 @@ export function toSrt (items) {
   }).join('\n')
 }
 
+/**
+ * Frame geometry of the MP3 the Edge service returns, from its format name.
+ *
+ * Every format Edge accepts is MPEG-2 Layer III at 24 kHz (576 samples/frame),
+ * i.e. `frameBytes = 72 * bitrate / sampleRate`. The service writes the padding
+ * bit as 0, so the frame size is exact and the total size is a multiple of it —
+ * which is what lets chunk concatenation stay at frame level.
+ * @returns {{ frameBytes: number, frames: number, aligned: boolean }|null}
+ */
+function mp3FrameInfo (format, bytes) {
+  const khz = /^audio-(\d+)khz/i.exec(String(format))?.[1]
+  const kbps = /(\d+)kbitrate/i.exec(String(format))?.[1]
+  if (khz === undefined || kbps === undefined) return null
+  const sampleRate = Number(khz) * 1000
+  const bitrate = Number(kbps) * 1000
+  if (!(sampleRate > 0) || !(bitrate > 0)) return null
+  const frameBytes = Math.floor((sampleRate <= 24000 ? 72 : 144) * bitrate / sampleRate)
+  if (frameBytes <= 0) return null
+  return { frameBytes, frames: bytes.length / frameBytes, aligned: bytes.length % frameBytes === 0 }
+}
+
+/** Keep the caller's extension only when it is already `.mp3`. */
+function withMp3Extension (target) {
+  if (/\.mp3$/i.test(target)) return target
+  if (/\.wav$/i.test(target)) return target.replace(/\.wav$/i, '.mp3')
+  return `${target}.mp3`
+}
+
+/**
+ * Join per-chunk encoded clips into one playable stream.
+ *
+ * Concatenation is at MP3-frame level (no decode, no transcode): each service
+ * response is a whole frame-aligned MP3 stream, so plain byte concatenation is
+ * a valid MP3. Chunk offsets for the subtitle timeline come from each chunk's
+ * container duration (which includes the service's trailing silence), because
+ * no silence is inserted between chunks — the file must not grow frames that
+ * are not encoded.
+ * @param {{ bytes: Buffer, durationSeconds: number|null, timestamps: object|null }[]} clips
+ * @returns {{ bytes: Buffer, durationSeconds: number, timestamps: object|null }}
+ */
+function joinEncodedClips (clips) {
+  const parts = []
+  const items = []
+  let offset = 0
+  let complete = true
+  let source = null
+  for (const clip of clips) {
+    parts.push(clip.bytes)
+    if (clip.timestamps === null || clip.timestamps === undefined) {
+      complete = false
+    } else {
+      source = source ?? clip.timestamps.source
+      for (const item of clip.timestamps.items) {
+        items.push({
+          text: item.text,
+          start: Number((item.start + offset).toFixed(3)),
+          end: Number((item.end + offset).toFixed(3))
+        })
+      }
+    }
+    offset += Number(clip.durationSeconds ?? 0)
+  }
+  return {
+    bytes: Buffer.concat(parts),
+    durationSeconds: offset,
+    timestamps: items.length > 0 ? { unit: 'seconds', complete, source, items } : null
+  }
+}
+
+/**
+ * Write the encoded (MP3) output when no decoder could produce samples.
+ *
+ * This is the honest second delivery path: the browser can play the MP3 the
+ * service produced, and the subtitle timeline still comes from the provider's
+ * word boundaries. `format: 'mp3'` in the result is the contract callers check;
+ * a `.wav` is never written or claimed here.
+ * @param {{ cwd: string, args: object, clips: object[], chunks: number, ttsConfig: object }} input
+ * @returns {Promise<object>} the same bounded summary shape as the WAV path.
+ */
+async function writeEncodedOutput ({ cwd, args, clips, chunks, ttsConfig }) {
+  const joined = joinEncodedClips(clips)
+  const format = clips[0].format
+  const frame = mp3FrameInfo(format, joined.bytes)
+  const hash = hashSpec({
+    text: String(args.text ?? ''),
+    voice: args.voice ?? ttsConfig.voice,
+    model: args.model ?? ttsConfig.model,
+    speed: Number(args.speed ?? 1),
+    pitch: Number(args.pitch ?? 0),
+    subtitleType: args.subtitleType ?? ttsConfig.subtitleType,
+    sampleRate: args.sampleRate ?? ttsConfig.sampleRate,
+    provider: ttsConfig.provider ?? 'edge',
+    format: 'mp3'
+  })
+  const requested = resolvePath(cwd, args.out)
+  const target = requested === undefined
+    ? defaultOutputPath(cwd, 'voice', hash).replace(/\.wav$/i, '.mp3')
+    : withMp3Extension(requested)
+  await writeFileAtomic(target, joined.bytes)
+  const info = await stat(target)
+
+  let srtPath = null
+  if (args.srt === true && joined.timestamps !== null) {
+    srtPath = target.replace(/\.(wav|mp3)$/i, '') + '.srt'
+    await writeFileAtomic(srtPath, Buffer.from(toSrt(joined.timestamps.items), 'utf8'))
+  }
+
+  const metrics = {
+    sampleRate: null,
+    durationSeconds: Number(joined.durationSeconds.toFixed(3)),
+    peakDbfs: null,
+    rmsDbfs: null,
+    format: 'mp3',
+    mp3FrameBytes: frame === null ? null : frame.frameBytes,
+    mp3Frames: frame === null ? null : frame.frames,
+    mp3FrameAligned: frame === null ? null : frame.aligned
+  }
+  const effective = {
+    provider: 'edge',
+    model: 'edge-readaloud',
+    voice: args.voice ?? ttsConfig.voice ?? null,
+    speed: Number(args.speed ?? 1),
+    pitch: Number(args.pitch ?? 0),
+    sampleRate: null,
+    format: 'mp3',
+    outputFormat: format,
+    chunks,
+    gapSeconds: 0,
+    decoder: null
+  }
+  const stampNote = joined.timestamps === null
+    ? '时间戳：无（服务没返回；字幕只能按容器时长估算）'
+    : `时间戳：${joined.timestamps.items.length} 条，${joined.timestamps.complete ? '完整' : '部分 chunk 缺失'}，来源 ${joined.timestamps.source}`
+  const frameNote = frame === null
+    ? ''
+    : ` · MP3 ${frame.aligned ? '帧对齐' : '未对齐'}（${frame.frameBytes} B/帧 × ${frame.frames.toFixed(0)}）`
+  const text2 = [
+    `Wrote ${displayPath(cwd, target)} (${metrics.durationSeconds.toFixed(2)}s, MP3, ${Math.round(info.size / 1024)} KB)${frameNote}`,
+    `${chunks} chunk(s) · format mp3（服务只返回压缩音频，未解码；浏览器可直接播放）`,
+    stampNote,
+    srtPath === null
+      ? (args.srt === true ? 'SRT：未生成（没有时间戳）' : 'SRT：未要求')
+      : `SRT：${displayPath(cwd, srtPath)}`,
+    `生效参数：edge · mp3 · ${effective.voice} · speed=${effective.speed} · pitch=${effective.pitch}`
+  ].join('\n')
+
+  return {
+    path: target,
+    relativePath: displayPath(cwd, target),
+    bytes: info.size,
+    chunks,
+    format: 'mp3',
+    durationSeconds: metrics.durationSeconds,
+    metrics,
+    timestamps: joined.timestamps,
+    srtPath,
+    effective,
+    text: text2
+  }
+}
+
 /** Register the `audio_tts` tool. */
 export function registerTtsTool (ctx, config = {}) {
   const ttsConfig = config.tts ?? {}
 
   ctx.tools.register({
     name: 'audio_tts',
-    description: 'Render narration or dialogue to a .wav file with MiniMax T2A (default) or any OpenAI-compatible speech endpoint. Returns the file plus sentence/word timestamps when the provider supplies them, and the parameters that actually took effect — so subtitles, lip-sync or typewriter effects can be driven from the same call. Text accepts inline pauses like <#1.5#> (0.01–99.99 s).',
+    description: 'Render narration or dialogue to a file with MiniMax T2A (default), any OpenAI-compatible speech endpoint, or the free keyless Microsoft Edge engine. Returns the file plus sentence/word timestamps when the provider supplies them, and the parameters that actually took effect — so subtitles, lip-sync or typewriter effects can be driven from the same call. Output is .wav when the provider returns samples; the Edge engine writes a playable .mp3 when no PCM decoder is available. Text accepts inline pauses like <#1.5#> (0.01–99.99 s).',
     parameters: {
       type: 'object',
       properties: {
         text: { type: 'string', description: 'What to say (≤8000 chars; longer scripts are split at sentence boundaries). Supports MiniMax inline pauses: <#1.5#> for a 1.5 s pause.' },
-        voice: { type: 'string', description: `Voice id. Shortlist: ${VOICE_CATALOG.map((voice) => voice.id).join(', ')}. Any other id from the MiniMax console also works; call audio_voices to see the shortlist with descriptions.` },
+        voice: { type: 'string', description: `Voice id. MiniMax shortlist: ${VOICE_CATALOG.map((voice) => voice.id).join(', ')}. For the Edge provider use ids from audio_voices (e.g. ${EDGE_VOICE_CATALOG[0].id}, ${EDGE_VOICE_CATALOG[8]?.id ?? 'en-US-AriaNeural'}); call audio_voices to see the active provider's list.` },
         speed: { type: 'number', description: 'Speaking rate, 0.5..2.0. Defaults to 1.' },
         pitch: { type: 'number', description: 'Pitch shift in semitones, -12..12. Defaults to 0.' },
         subtitle: { type: 'boolean', description: 'Ask the provider for timestamps. Defaults to true; the result says whether any came back.' },
         subtitleType: { type: 'string', enum: ['sentence', 'word'], description: 'Timestamp granularity to request. Word level is finer but not every model or endpoint returns it — check the result before relying on it.' },
-        model: { type: 'string', description: 'Provider model. Defaults to speech-2.8-hd.' },
-        gapSeconds: { type: 'number', description: 'Silence inserted between chunks of a long script; defaults to 0.15.' },
-        sampleRate: { type: 'integer', description: 'Output rate; defaults to the provider setting (MiniMax 32000).' },
-        srt: { type: 'boolean', description: 'Also write an .srt subtitle file next to the wav when the provider returned timestamps. Defaults to false.' },
-        out: { type: 'string', description: 'Output path; defaults to assets/audio/voice-<hash>.wav.' }
+        model: { type: 'string', description: 'Provider model id. Defaults to the provider setting (MiniMax speech-2.8-hd).' },
+        gapSeconds: { type: 'number', description: 'Silence inserted between chunks of a long script; defaults to 0.15. Not used on the MP3 path (chunks are joined frame-to-frame).' },
+        sampleRate: { type: 'integer', description: 'Output rate for providers that accept it; the Edge engine fixes PCM at 24000.' },
+        srt: { type: 'boolean', description: 'Also write an .srt subtitle file next to the audio file when the provider returned timestamps. Defaults to false.' },
+        out: { type: 'string', description: 'Output path; defaults to assets/audio/voice-<hash>.wav (or .mp3 when only encoded audio is available).' }
       },
       required: ['text'],
       additionalProperties: false
@@ -140,16 +307,35 @@ export function registerTtsTool (ctx, config = {}) {
       const cwd = sessionCwd(ctx, exec)
       const chunks = splitScript(text)
       const rendered = []
+      const encodedClips = []
       for (const chunk of chunks) {
-        rendered.push(await speak(ttsConfig, chunk, {
-          voice: args.voice,
-          model: args.model,
-          speed,
-          pitch,
-          subtitle: args.subtitle !== false,
-          subtitleType: args.subtitleType,
-          sampleRate: args.sampleRate
-        }))
+        try {
+          rendered.push(await speak(ttsConfig, chunk, {
+            voice: args.voice,
+            model: args.model,
+            speed,
+            pitch,
+            subtitle: args.subtitle !== false,
+            subtitleType: args.subtitleType,
+            sampleRate: args.sampleRate
+          }))
+        } catch (error) {
+          // The Edge service only serves MP3. When no decoder is available the
+          // provider hands back the encoded bytes instead of samples, and this
+          // tool writes a playable .mp3 rather than failing the request.
+          if (error?.edgeCode === 'undecodable' && error.encoded !== undefined) {
+            encodedClips.push(error.encoded)
+            continue
+          }
+          throw error
+        }
+      }
+
+      if (encodedClips.length > 0) {
+        if (rendered.length > 0) {
+          throw new Error('audio_tts: 各 chunk 解码状态不一致（部分返回 samples、部分只有编码音频），无法拼接；请给所有 chunk 提供解码器')
+        }
+        return await writeEncodedOutput({ cwd, args, clips: encodedClips, chunks: chunks.length, ttsConfig })
       }
 
       const sampleRate = rendered[0].sampleRate
@@ -226,6 +412,7 @@ export function registerTtsTool (ctx, config = {}) {
         relativePath: displayPath(cwd, target),
         bytes: info.size,
         chunks: chunks.length,
+        format: 'wav',
         durationSeconds: metrics.durationSeconds,
         metrics,
         timestamps,
@@ -244,27 +431,32 @@ export function registerTtsTool (ctx, config = {}) {
 /** Register the `audio_voices` tool: live list when possible, shortlist otherwise. */
 export function registerVoicesTool (ctx, config = {}) {
   const ttsConfig = config.tts ?? {}
+  const provider = String(ttsConfig.provider ?? 'minimax').toLowerCase()
+  const edge = provider === 'edge'
+  const catalog = edge ? EDGE_VOICE_CATALOG : VOICE_CATALOG
+  const liveLabel = edge ? 'Edge 实时音色（来自微软公开列表）' : 'MiniMax 实时音色（来自当前账号）'
+  const staticLabel = edge
+    ? 'Edge 常用音色（静态短名单；联网后这里会换成实时列表）：'
+    : 'MiniMax 常用音色（静态短名单，未联网校验；配置密钥后这里会换成账号的实时列表）：'
 
   ctx.tools.register({
     name: 'audio_voices',
-    description: 'List the MiniMax voice ids available to this account. With a configured key it asks the provider for the live list; without one it returns a static shortlist that has not been verified against any account.',
+    description: 'List the voice ids available for the configured TTS provider: the live MiniMax account list, or the free Edge catalogue with ~318 voices. Falls back to a static shortlist when the endpoint cannot be reached.',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     isConcurrencySafe: true,
     async execute () {
-      if ((ttsConfig.provider ?? 'minimax') === 'minimax') {
-        try {
-          const items = await listVoices(ttsConfig)
-          const lines = [`MiniMax 实时音色（${items.length} 个，来自当前账号）：`]
-          for (const voice of items.slice(0, 80)) lines.push(`  ${voice.id.padEnd(38)} ${voice.name}`)
-          if (items.length > 80) lines.push(`  … 共 ${items.length} 个`)
-          return { source: 'live', voices: items, text: lines.join('\n') }
-        } catch {
-          // fall through to the static shortlist
-        }
+      try {
+        const items = await listVoices(ttsConfig)
+        const lines = [`${liveLabel}（${items.length} 个）：`]
+        for (const voice of items.slice(0, 80)) lines.push(`  ${voice.id.padEnd(38)} ${voice.name}`)
+        if (items.length > 80) lines.push(`  … 共 ${items.length} 个`)
+        return { source: 'live', provider, voices: items, text: lines.join('\n') }
+      } catch {
+        // fall through to the static shortlist
       }
-      const lines = ['MiniMax 常用音色（静态短名单，未联网校验；配置密钥后这里会换成账号的实时列表）：']
-      for (const voice of VOICE_CATALOG) lines.push(`  ${voice.id.padEnd(38)} ${voice.note}`)
-      return { source: 'static', voices: VOICE_CATALOG, text: lines.join('\n') }
+      const lines = [staticLabel]
+      for (const voice of catalog) lines.push(`  ${voice.id.padEnd(38)} ${voice.note}`)
+      return { source: 'static', provider, voices: catalog, text: lines.join('\n') }
     },
     output: {
       schema: { type: 'object' },

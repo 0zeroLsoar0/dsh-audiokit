@@ -3,7 +3,9 @@
  *
  * MiniMax T2A v2 is the default speech provider; anything speaking the OpenAI
  * `/v1/audio/speech` shape goes through the same path, so "custom" needs no
- * separate code.
+ * separate code. The free Microsoft Edge "read aloud" engine lives in
+ * `providers-edge.js` and is dispatched here whenever `config.provider` is
+ * `edge`, so callers only ever talk to this module.
  *
  * Timestamps are the part that cannot be guessed: MiniMax returns them in a
  * shape that differs by endpoint and by `subtitle_type`, and the exact field
@@ -12,6 +14,7 @@
  * read — or reports `null` and says why, instead of inventing times.
  */
 
+import { EDGE_VOICE_CATALOG, edgeProvider } from './providers-edge.js'
 import { decodeWav, encodeWav } from './wav.js'
 
 export const MINIMAX_DEFAULTS = {
@@ -87,11 +90,18 @@ export function normalizeVoiceList (payload) {
 }
 
 /**
- * Ask MiniMax for the account's system voices.
- * @throws when no key is configured or the endpoint refuses.
+ * Ask the configured provider for its voices.
+ *
+ * MiniMax needs a key and answers with the account's system voices; Edge needs
+ * no key and answers with its public catalogue (~318 voices). The provider row
+ * decides, so callers do not branch.
+ * @throws when the endpoint refuses or no key is configured.
  * @returns {Promise<{ id: string, name: string }[]>}
  */
 export async function listVoices (config) {
+  if (String(config?.provider ?? 'minimax').toLowerCase() === 'edge') {
+    return edgeProvider.listVoices(config ?? {})
+  }
   const key = requireKey('MiniMax', config, 'MINIMAX_API_KEY')
   const baseUrl = trimUrl(config?.baseUrl ?? MINIMAX_DEFAULTS.baseUrl)
   const response = await fetch(`${baseUrl}/v1/get_voice`, {
@@ -343,14 +353,37 @@ async function openaiSpeech (config, text, options = {}) {
 
 /**
  * Speak one chunk with the configured provider.
+ *
+ * `edge` is the keyless Microsoft Edge engine. Its service only returns MP3, so
+ * it either decodes through ffmpeg / `config.decodeAudio` and returns samples,
+ * or throws an `edgeCode: 'undecodable'` error carrying the encoded bytes for
+ * callers that can deliver an `.mp3` file instead (see `audio_tts`).
  */
 export async function speak (config, text, options = {}) {
   const provider = String(options.provider ?? config?.provider ?? 'minimax').toLowerCase()
   if (provider === 'minimax') return minimaxSpeech(config ?? {}, text, options)
+  if (provider === 'edge') {
+    // The plugin's option names are MiniMax/OpenAI flavoured; translate the
+    // two that mean something on this provider, leave the rest to its defaults.
+    const wordBoundary = options.subtitle === false
+      ? false
+      : options.subtitleType === 'sentence'
+        ? false
+        : undefined
+    return edgeProvider.speak({
+      text,
+      voice: options.voice,
+      speed: options.speed,
+      pitch: options.pitch,
+      volume: options.volume,
+      sampleRate: options.sampleRate,
+      wordBoundary
+    }, config ?? {})
+  }
   if (provider === 'openai' || provider === 'custom' || provider === 'compatible') {
     return openaiSpeech(config ?? {}, text, options)
   }
-  throw new Error(`未知的 TTS provider "${provider}"，支持 minimax / openai / custom。`)
+  throw new Error(`未知的 TTS provider "${provider}"，支持 minimax / edge / openai / custom。`)
 }
 
 /**
@@ -382,3 +415,6 @@ export async function describeAudio (config, wavBytes, question) {
 export function toWav (samples, sampleRate) {
   return encodeWav([samples], sampleRate)
 }
+
+/** Edge metadata re-exported so callers need only import this module. */
+export { EDGE_VOICE_CATALOG, edgeProvider }

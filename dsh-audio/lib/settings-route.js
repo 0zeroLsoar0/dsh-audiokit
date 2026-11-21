@@ -7,8 +7,11 @@
  *   POST /dsh-audio/config  → merge a patch and persist it via the config editor;
  *   POST /dsh-audio/test    → really talk to the provider (synthesize a sentence,
  *                             or describe a sample) and return the audio so the
- *                             page can play what it just produced;
- *   POST /dsh-audio/voices  → ask MiniMax for the account's system voices, and
+ *                             page can play what it just produced. For the Edge
+ *                             provider it reports protocolOk/supported/reason
+ *                             instead of hiding a missing decoder behind an error;
+ *   POST /dsh-audio/voices  → ask the configured provider for its voices
+ *                             (MiniMax account list or the Edge catalogue), and
  *                             fall back to the static shortlist with a marker.
  *
  * Routes are registered inside `ctx.inject(['webServer'], …)`: on a cold boot
@@ -16,11 +19,12 @@
  */
 
 import { finalize, renderPreset, toWavBytes } from './audio.js'
-import { describeAudio, listVoices, speak } from './providers.js'
+import { EDGE_VOICE_CATALOG, describeAudio, listVoices, speak } from './providers.js'
+import { findFfmpeg } from './providers-edge.js'
 
 const MAX_BODY = 64 * 1024
 
-const TTS_FIELDS = ['provider', 'baseUrl', 'model', 'voice', 'speed', 'pitch', 'sampleRate', 'groupId', 'apiKey', 'apiKeyEnv']
+const TTS_FIELDS = ['provider', 'baseUrl', 'model', 'voice', 'speed', 'pitch', 'sampleRate', 'groupId', 'ffmpegPath', 'apiKey', 'apiKeyEnv']
 const CHECK_FIELDS = ['provider', 'baseUrl', 'model', 'apiKey', 'apiKeyEnv']
 
 /** Defaults used when the config leaves the env name empty. */
@@ -93,8 +97,8 @@ function pickFields (source, fields, numeric) {
 
 function validate (section) {
   const tts = section.tts ?? {}
-  if (tts.provider !== undefined && !['minimax', 'openai', 'custom', 'none'].includes(tts.provider)) {
-    throw new Error('供应商只能是 minimax / openai / custom / none')
+  if (tts.provider !== undefined && !['minimax', 'openai', 'custom', 'edge', 'none'].includes(tts.provider)) {
+    throw new Error('供应商只能是 minimax / openai / custom / edge / none')
   }
   if (tts.speed !== undefined && (tts.speed < 0.5 || tts.speed > 2)) throw new Error('语速必须在 0.5–2.0 之间')
   if (tts.pitch !== undefined && (tts.pitch < -12 || tts.pitch > 12)) throw new Error('音调必须在 −12..12 半音之间')
@@ -194,6 +198,50 @@ export function registerSettingsRoute (ctx, config, version) {
         const body = await readJson(request)
         const target = body.target === 'check' ? 'check' : 'tts'
 
+        if (target === 'tts' && (config.tts?.provider ?? 'minimax') === 'edge') {
+          // Edge needs no key. Whether it works depends on the service handshake
+          // and on a decoder (ffmpeg or config.decodeAudio) being present, so
+          // report those facts instead of collapsing them into one error.
+          try {
+            const result = await speak(config.tts ?? {}, '这是一次连接测试。')
+            finalize(result.samples, result.sampleRate, -3)
+            const wav = toWavBytes(result.samples, result.sampleRate)
+            sendJson(response, 200, {
+              ok: true,
+              target,
+              provider: 'edge',
+              supported: true,
+              protocolOk: true,
+              reason: null,
+              decoder: result.effective?.decoder ?? null,
+              ffmpegPath: findFfmpeg({ ffmpegPath: config.tts?.ffmpegPath }),
+              durationSeconds: Number((result.samples.length / result.sampleRate).toFixed(2)),
+              sampleRate: result.sampleRate,
+              effective: result.effective,
+              timestamps: result.timestamps === null ? null : result.timestamps.items.length,
+              wavBase64: wav.toString('base64')
+            })
+          } catch (error) {
+            const undecodable = error?.edgeCode === 'undecodable'
+            const networkCodes = ['handshake', 'closed', 'timeout', 'empty']
+            sendJson(response, 200, {
+              ok: true,
+              target,
+              provider: 'edge',
+              supported: false,
+              protocolOk: undecodable ? true : !networkCodes.includes(error?.edgeCode),
+              reason: error?.message ?? String(error),
+              decoder: null,
+              ffmpegPath: findFfmpeg({ ffmpegPath: config.tts?.ffmpegPath }),
+              format: undecodable ? error.encoded?.format ?? null : null,
+              encodedBytes: undecodable ? error.encoded?.bytes?.length ?? null : null,
+              timestamps: undecodable && error.encoded?.timestamps ? error.encoded.timestamps.items.length : null,
+              durationSeconds: undecodable ? error.encoded?.durationSeconds ?? null : null
+            })
+          }
+          return
+        }
+
         if (target === 'tts') {
           const result = await speak(config.tts ?? {}, '这是一次连接测试。')
           finalize(result.samples, result.sampleRate, -3)
@@ -233,15 +281,23 @@ export function registerSettingsRoute (ctx, config, version) {
         }
         const body = await readJson(request)
         const ttsConfig = { ...(config.tts ?? {}), ...(body.tts ?? {}) }
-        if ((ttsConfig.provider ?? 'minimax') !== 'minimax') {
-          sendJson(response, 200, { ok: true, source: 'static', items: [], note: '只有 MiniMax 提供音色列表' })
+        const provider = String(ttsConfig.provider ?? 'minimax').toLowerCase()
+        if (provider !== 'minimax' && provider !== 'edge') {
+          sendJson(response, 200, { ok: true, source: 'static', provider, items: [], note: `provider ${provider} 不提供音色列表` })
           return
         }
         try {
           const items = await listVoices(ttsConfig)
-          sendJson(response, 200, { ok: true, source: 'live', items, note: null })
+          sendJson(response, 200, { ok: true, source: 'live', provider, items, note: null })
         } catch (error) {
-          sendJson(response, 200, { ok: true, source: 'static', items: [], note: `实时查询失败：${error?.message ?? error}` })
+          const fallback = provider === 'edge' ? EDGE_VOICE_CATALOG : []
+          sendJson(response, 200, {
+            ok: true,
+            source: 'static',
+            provider,
+            items: fallback,
+            note: `实时查询失败：${error?.message ?? error}`
+          })
         }
       } catch (error) {
         sendJson(response, 400, { ok: false, error: error?.message ?? String(error) })
