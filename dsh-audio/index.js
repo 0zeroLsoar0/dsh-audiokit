@@ -14,6 +14,7 @@
  */
 
 import { registerCheckTool } from './lib/check.js'
+import { registerConvertTools } from './lib/tools-convert.js'
 import { registerSettingsRoute } from './lib/settings-route.js'
 import { registerSkill } from './lib/skill.js'
 import { registerTools } from './lib/tools.js'
@@ -54,6 +55,7 @@ export function apply (ctx, config = {}) {
   registerTtsTool(ctx, config)
   registerVoicesTool(ctx, config)
   registerCheckTool(ctx, config)
+  registerConvertTools(ctx)
   registerSettingsRoute(ctx, config, VERSION)
 
   // Optional seams: resolved through `ctx.get` so the plugin still activates in
