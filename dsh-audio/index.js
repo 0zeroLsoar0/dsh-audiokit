@@ -24,6 +24,7 @@ import { registerSettingsRoute } from './lib/settings-route.js'
 import { registerSkill } from './lib/skill.js'
 import { registerTools } from './lib/tools.js'
 import { registerTtsTool, registerVoicesTool } from './lib/tts.js'
+import { registerVisualTools } from './lib/tools-visual.js'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'dsh-audio'
@@ -62,6 +63,7 @@ export function apply (ctx, config = {}) {
   registerVoicesTool(ctx, config)
   registerCheckTool(ctx, config)
   registerConvertTools(ctx)
+  registerVisualTools(ctx)
   registerSettingsRoute(ctx, config, VERSION)
 
   // Optional seams: resolved through `ctx.get` so the plugin still activates in
