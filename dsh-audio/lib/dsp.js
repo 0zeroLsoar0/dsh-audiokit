@@ -390,7 +390,7 @@ export const PRESETS = {
       const burst = noise(burstFrames, rand, 'white', sampleRate)
       const burstEnv = decayEnvelope(burstFrames, sampleRate, decay)
       for (let i = 0; i < burstFrames; i += 1) burst[i] *= burstEnv[i]
-      addInto(filter(burst, sampleRate, () => lerp(1200, 6000, params.hardness), () => 0.9, 'hp'), 0, 0.45)
+      addInto(out, filter(burst, sampleRate, () => lerp(1200, 6000, params.hardness), () => 0.9, 'hp'), 0, 0.45)
       return out
     }
   },
@@ -459,7 +459,7 @@ export const PRESETS = {
       const crackle = noise(crackleFrames, rand, 'white', sampleRate)
       const env = decayEnvelope(crackleFrames, sampleRate, 0.02)
       for (let i = 0; i < crackleFrames; i += 1) crackle[i] *= env[i] * (rand() > 0.85 ? 1 : 0.25)
-      addInto(filter(crackle, sampleRate, () => 3200, () => 1.2, 'hp'), 0, 0.5 * lerp(0.5, 1, params.roughness))
+      addInto(out, filter(crackle, sampleRate, () => 3200, () => 1.2, 'hp'), 0, 0.5 * lerp(0.5, 1, params.roughness))
       return reverb(out, sampleRate, params.space * 0.4, 0.3)
     }
   },
@@ -479,7 +479,7 @@ export const PRESETS = {
       const bodyFrames = Math.round(frames * lerp(0.3, 0.7, params.softness))
       const env = decayEnvelope(bodyFrames, sampleRate, lerp(0.05, 0.16, params.softness))
       for (let i = 0; i < bodyFrames; i += 1) tail[i] *= env[i]
-      addInto(filter(tail, sampleRate, () => lerp(180, 420, 1 - params.weight), () => 0.7, 'lp'), 0, 0.35)
+      addInto(out, filter(tail, sampleRate, () => lerp(180, 420, 1 - params.weight), () => 0.7, 'lp'), 0, 0.35)
       return reverb(out, sampleRate, params.space * 0.45, 0.3)
     }
   },
