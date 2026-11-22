@@ -17,22 +17,39 @@
  * seconds). The report is the point: a model cannot listen, so the effect of a
  * knob has to arrive as a number it can reason about.
  *
- * The module imports nothing. Like `lib/wav-encode.js` it is safe to load on its
- * own — no render kernel, no filesystem, no clock, no randomness — so identical
- * input always produces identical output bytes.
+ * The only import is `lib/multichannel.js`, the channel-arithmetic vocabulary:
+ * no render kernel, no filesystem, no clock, no randomness, so identical input
+ * always produces identical output bytes.
  *
- * A track is `{ samples: Float32Array, sampleRate: number }`. For convenience a
- * processor also accepts a bare sample buffer when `options.sampleRate` is
- * given (the "pure function over Float32Array" shape). A result is always
- * track-shaped — `{ samples, sampleRate, report }` — except `pan`, the one
- * processor whose output is a stereo pair: `{ channels: [left, right],
- * sampleRate, report }`.
+ * A track is `{ samples: Float32Array, sampleRate: number }` for a mono layer,
+ * or `{ channels: Float32Array[], sampleRate: number }` for a stereo/surround
+ * layer. For convenience a processor also accepts a bare sample buffer when
+ * `options.sampleRate` is given (the "pure function over Float32Array" shape).
+ * A result is track-shaped in the same way — `{ samples, sampleRate, report }`
+ * for a mono input, `{ channels, sampleRate, report }` for a multichannel one —
+ * except `pan`, the one processor whose output is always a stereo pair:
+ * `{ channels: [left, right], sampleRate, report }`.
+ *
+ * Multichannel policy, stated once because it is what makes a surround bus
+ * possible at all:
+ *
+ * - dynamics processors (compressor, duck) use one **linked** detector across
+ *   every channel and apply its gain to all of them — a per-channel detector
+ *   would pump the channels differently and move the image;
+ * - EQ runs per channel (the same filter design, independent state), because a
+ *   spectrum is per channel by nature;
+ * - `pan` is refused on a multichannel track: a stereo/surround layer already
+ *   has an image, and moving it is `fitChannels`' decision, not a pan knob's;
+ * - silence trimming, gain and placement operate on the frame axis, which is
+ *   shared by every channel, so they are channel-agnostic.
  *
  * Time constants. `attackMs` and `releaseMs` are *settle* times: the envelope
  * reaches within 5 % of its target within the stated milliseconds. Internally
  * that is one pole with a time constant of one third of the settle time, which
  * is what makes the numbers in a report checkable against the request.
  */
+
+import { CHANNEL_COUNTS, conversionKind, fitChannels, layoutFor, linkStemGain } from './multichannel.js'
 
 /* --------------------------------------------------------------- limits -- */
 
@@ -132,6 +149,10 @@ function isSampleBuffer (value) {
   return ArrayBuffer.isView(value) && typeof value.length === 'number'
 }
 
+function isChannelArray (value) {
+  return Array.isArray(value) && value.length > 0 && value.every(isSampleBuffer)
+}
+
 function peakOf (samples) {
   let peak = 0
   for (let index = 0; index < samples.length; index += 1) {
@@ -155,6 +176,45 @@ function dcOffsetOf (samples) {
   return sum / samples.length
 }
 
+/** Loudest sample of any channel: what a file peak is for a multichannel bus. */
+function peakOfChannels (channels) {
+  let peak = 0
+  for (const channel of channels) {
+    const channelPeak = peakOf(channel)
+    if (channelPeak > peak) peak = channelPeak
+  }
+  return peak
+}
+
+/**
+ * RMS averaged over every sample of every channel.
+ *
+ * Dividing by frames x channels rather than by frames means a dual-mono signal
+ * reads the same level as the mono signal it came from: the layout must not
+ * change the number a report prints. (An energy *sum* would read +3 dB for two
+ * identical channels, which is a property of the fold, not of the cue.)
+ */
+function rmsOfChannels (channels) {
+  let sum = 0
+  let count = 0
+  for (const channel of channels) {
+    for (let index = 0; index < channel.length; index += 1) sum += channel[index] * channel[index]
+    count += channel.length
+  }
+  return count > 0 ? Math.sqrt(sum / count) : 0
+}
+
+/** Mean DC across every channel; zero for a clean file of any width. */
+function dcOffsetOfChannels (channels) {
+  let sum = 0
+  let count = 0
+  for (const channel of channels) {
+    for (let index = 0; index < channel.length; index += 1) sum += channel[index]
+    count += channel.length
+  }
+  return count > 0 ? sum / count : 0
+}
+
 /** One-pole coefficient for a settle time, or 1 (instant) for 0 ms. */
 function settleCoefficient (settleMs, sampleRate) {
   if (!(settleMs > 0)) return 1
@@ -165,29 +225,61 @@ function settleCoefficient (settleMs, sampleRate) {
 /* --------------------------------------------------------------- tracks -- */
 
 /**
- * Validate a track and return its parts. A bare sample buffer is accepted when
- * a rate is supplied through `options.sampleRate`.
- * @param {object|Float32Array|Float64Array} track - `{ samples, sampleRate }` or a sample buffer.
+ * Validate a track and return its channels.
+ *
+ * Accepted shapes: a bare sample buffer plus `options.sampleRate` (mono), a
+ * `{ samples, sampleRate }` track (mono), or a `{ channels: [...], sampleRate }`
+ * track (2/4/6/8 channels). An array handed in as `samples` is treated as a
+ * channel list too, so a decoded file can be passed straight through. The
+ * channel count is checked against the layouts this plugin can mean: a
+ * three-channel track has no WAVE order to name, and silently treating it as
+ * "stereo plus something" would put the wrong channel in the wrong speaker.
+ *
+ * @param {object|Float32Array|Float64Array} track - track or bare sample buffer.
  * @param {{ sampleRate?: number }} [options] - rate used when `track` is a bare buffer.
  * @param {string} caller - processor name for error messages.
- * @returns {{ samples: Float32Array|Float64Array, sampleRate: number }}
+ * @returns {{ channels: (Float32Array|Float64Array)[], sampleRate: number }}
  */
-function readTrack (track, options, caller) {
+function readTrackChannels (track, options, caller) {
   if (isSampleBuffer(track)) {
     const requested = numberArg(caller, 'sampleRate', options?.sampleRate, undefined)
     if (requested === undefined || requested <= 0) {
       throw new Error(`${caller}: a bare sample buffer needs options.sampleRate in Hz (e.g. ${caller}(samples, { sampleRate: 48000 }))`)
     }
-    return { samples: track, sampleRate: Math.round(requested) }
+    return { channels: [track], sampleRate: Math.round(requested) }
   }
-  if (track === null || typeof track !== 'object' || !isSampleBuffer(track.samples)) {
-    throw new Error(`${caller}: expected a track shaped { samples: Float32Array, sampleRate }, got ${describeValue(track)}`)
+  if (track === null || typeof track !== 'object') {
+    throw new Error(`${caller}: expected a track shaped { samples: Float32Array, sampleRate } or { channels: Float32Array[], sampleRate }, got ${describeValue(track)}`)
   }
   const requested = numberArg(caller, 'sampleRate', track.sampleRate, undefined)
   if (requested === undefined || requested <= 0) {
     throw new Error(`${caller}: track sampleRate must be a positive number, got ${describeValue(track.sampleRate)}`)
   }
-  return { samples: track.samples, sampleRate: Math.round(requested) }
+  const rawChannels = track.channels !== undefined ? track.channels : (Array.isArray(track.samples) ? track.samples : null)
+  if (rawChannels === null) {
+    if (!isSampleBuffer(track.samples)) {
+      throw new Error(`${caller}: expected a track shaped { samples: Float32Array, sampleRate } or { channels: Float32Array[], sampleRate }, got ${describeValue(track)}`)
+    }
+    return { channels: [track.samples], sampleRate: Math.round(requested) }
+  }
+  const channels = isChannelArray(rawChannels) ? rawChannels : null
+  if (channels === null) {
+    throw new Error(`${caller}: channels must be a non-empty array of same-length Float32Arrays`)
+  }
+  if (channels.some((channel) => channel.length !== channels[0].length)) {
+    throw new Error(`${caller}: every channel must have the same length`)
+  }
+  if (!CHANNEL_COUNTS.includes(channels.length)) {
+    throw new Error(`${caller}: ${channels.length} channels has no WAVE layout; supported counts are ${CHANNEL_COUNTS.join(', ')}`)
+  }
+  return { channels, sampleRate: Math.round(requested) }
+}
+
+/** Build a result whose shape matches the input: mono stays `samples`, multichannel is `channels`. */
+function shapeResult (channels, sampleRate, report) {
+  return channels.length === 1
+    ? { samples: channels[0], sampleRate, report }
+    : { channels, sampleRate, report }
 }
 
 function monoResult (samples, sampleRate, report) {
@@ -201,17 +293,21 @@ function stereoResult (channels, sampleRate, report) {
 /**
  * The measurements every processor reports: what the level was before, what it
  * is after, and how much the overall RMS moved. `rmsChangeDb` is the one number
- * that tells an author a filter did something at all.
+ * that tells an author a filter did something at all. For a multichannel input
+ * the peak is the loudest channel's and the RMS is averaged over all channels,
+ * so the number means the same thing at any width.
  */
 function levelReport (type, input, output, sampleRate, extra) {
-  const rmsChange = linearToDb(rmsOf(output)) - linearToDb(rmsOf(input))
+  const rmsChange = linearToDb(rmsOfChannels(output)) - linearToDb(rmsOfChannels(input))
+  const frames = output[0] === undefined ? 0 : output[0].length
   return {
     type,
     sampleRate,
-    frames: output.length,
-    durationSeconds: roundTo(output.length / sampleRate, 6),
-    inputPeakDbfs: toDb(peakOf(input)),
-    outputPeakDbfs: toDb(peakOf(output)),
+    frames,
+    durationSeconds: roundTo(frames / sampleRate, 6),
+    channelCount: output.length,
+    inputPeakDbfs: toDb(peakOfChannels(input)),
+    outputPeakDbfs: toDb(peakOfChannels(output)),
     rmsChangeDb: roundTo(rmsChange, 2),
     ...extra
   }
@@ -333,9 +429,11 @@ function runBiquad (samples, design) {
 }
 
 function filterProcessor (type, track, options, caller) {
-  const { samples, sampleRate } = readTrack(track, options, caller)
+  const { channels, sampleRate } = readTrackChannels(track, options, caller)
   const design = designBiquad(type, sampleRate, options, caller)
-  const out = runBiquad(samples, design)
+  // One design, one independent filter state per channel: a spectrum belongs to
+  // one channel, so a shared state would smear the image.
+  const out = channels.map((channel) => runBiquad(channel, design))
   const extra = {
     hz: roundTo(design.hz, 2),
     q: roundTo(design.q, 4),
@@ -345,10 +443,10 @@ function filterProcessor (type, track, options, caller) {
     slopeDbPerOctave: type === 'highpass' || type === 'lowpass' ? 12 : null
   }
   if (type === 'highpass') {
-    extra.dcBefore = roundTo(dcOffsetOf(samples), 6)
-    extra.dcAfter = roundTo(dcOffsetOf(out), 6)
+    extra.dcBefore = roundTo(dcOffsetOfChannels(channels), 6)
+    extra.dcAfter = roundTo(dcOffsetOfChannels(out), 6)
   }
-  return monoResult(out, sampleRate, levelReport(type, samples, out, sampleRate, extra))
+  return shapeResult(out, sampleRate, levelReport(type, channels, out, sampleRate, extra))
 }
 
 /* ----------------------------------------------------------- processors -- */
@@ -405,10 +503,10 @@ export function shelf (track, options = {}) {
   if (kind !== 'low' && kind !== 'high') {
     throw new Error(`${caller}: kind must be "low" or "high", got ${describeValue(options.kind)}`)
   }
-  const { samples, sampleRate } = readTrack(track, options, caller)
+  const { channels, sampleRate } = readTrackChannels(track, options, caller)
   const design = designBiquad(kind === 'low' ? 'lowshelf' : 'highshelf', sampleRate, options, caller)
-  const out = runBiquad(samples, design)
-  return monoResult(out, sampleRate, levelReport('shelf', samples, out, sampleRate, {
+  const out = channels.map((channel) => runBiquad(channel, design))
+  return shapeResult(out, sampleRate, levelReport('shelf', channels, out, sampleRate, {
     kind,
     hz: roundTo(design.hz, 2),
     gainDb: roundTo(design.gainDb, 2),
@@ -463,7 +561,7 @@ function staticGainReduction (levelDb, thresholdDb, ratio, kneeDb) {
  */
 export function compressor (track, options = {}) {
   const caller = 'compressor'
-  const { samples, sampleRate } = readTrack(track, options, caller)
+  const { channels, sampleRate } = readTrackChannels(track, options, caller)
   const thresholdDb = clamp(numberArg(caller, 'thresholdDb', options.thresholdDb, -18), BUS_LIMITS.minThresholdDb, BUS_LIMITS.maxThresholdDb)
   const ratio = clamp(numberArg(caller, 'ratio', options.ratio, 4), 1, BUS_LIMITS.maxRatio)
   const attackMs = clamp(numberArg(caller, 'attackMs', options.attackMs, 10), 0, BUS_LIMITS.maxAttackMs)
@@ -474,15 +572,24 @@ export function compressor (track, options = {}) {
   const attackCoefficient = settleCoefficient(attackMs, sampleRate)
   const releaseCoefficient = settleCoefficient(releaseMs, sampleRate)
 
-  const out = new Float32Array(samples.length)
+  const channelCount = channels.length
+  const frames = channels[0].length
+  const out = channels.map(() => new Float32Array(frames))
   let power = 0
   let gainReductionDb = 0
   let maxGainReductionDb = 0
   let sumGainReductionDb = 0
   let samplesReduced = 0
-  for (let index = 0; index < samples.length; index += 1) {
-    const input = samples[index]
-    power += (input * input - power) * detectorCoefficient
+  for (let index = 0; index < frames; index += 1) {
+    // One detector sees the loudest channel at each instant, so a hard-panned
+    // hit ducks the whole layer instead of only the channel it is in.
+    let square = 0
+    for (let channel = 0; channel < channelCount; channel += 1) {
+      const value = channels[channel][index]
+      const valueSquare = value * value
+      if (valueSquare > square) square = valueSquare
+    }
+    power += (square - power) * detectorCoefficient
     const levelDb = power > 1e-20 ? 10 * Math.log10(power) : -200
     const target = staticGainReduction(levelDb, thresholdDb, ratio, kneeDb)
     // Attack when the reduction has to deepen, release when it can let go.
@@ -491,10 +598,11 @@ export function compressor (track, options = {}) {
     if (gainReductionDb > maxGainReductionDb) maxGainReductionDb = gainReductionDb
     if (gainReductionDb > 0.01) samplesReduced += 1
     sumGainReductionDb += gainReductionDb
-    out[index] = input * dbToGain(makeupDb - gainReductionDb)
+    const gain = dbToGain(makeupDb - gainReductionDb)
+    for (let channel = 0; channel < channelCount; channel += 1) out[channel][index] = channels[channel][index] * gain
   }
 
-  return monoResult(out, sampleRate, levelReport('compressor', samples, out, sampleRate, {
+  return shapeResult(out, sampleRate, levelReport('compressor', channels, out, sampleRate, {
     thresholdDb: roundTo(thresholdDb, 2),
     ratio: roundTo(ratio, 3),
     attackMs: roundTo(attackMs, 2),
@@ -502,9 +610,9 @@ export function compressor (track, options = {}) {
     makeupDb: roundTo(makeupDb, 2),
     kneeDb: roundTo(kneeDb, 2),
     maxGainReductionDb: roundTo(maxGainReductionDb, 2),
-    meanGainReductionDb: roundTo(samples.length > 0 ? sumGainReductionDb / samples.length : 0, 2),
+    meanGainReductionDb: roundTo(frames > 0 ? sumGainReductionDb / frames : 0, 2),
     samplesReduced,
-    reducedPercent: roundTo(samples.length > 0 ? (samplesReduced / samples.length) * 100 : 0, 1)
+    reducedPercent: roundTo(frames > 0 ? (samplesReduced / frames) * 100 : 0, 1)
   }))
 }
 
@@ -536,20 +644,24 @@ export function compressor (track, options = {}) {
  */
 export function duck (track, sidechain, options = {}) {
   const caller = 'duck'
-  const target = readTrack(track, options, caller)
-  const side = readTrack(sidechain, { sampleRate: target.sampleRate }, `${caller} sidechain`)
+  const target = readTrackChannels(track, options, caller)
+  const side = readTrackChannels(sidechain, { sampleRate: target.sampleRate }, `${caller} sidechain`)
   const amountDb = clamp(numberArg(caller, 'amountDb', options.amountDb, 12), 0, BUS_LIMITS.maxDuckDb)
   const attackMs = clamp(numberArg(caller, 'attackMs', options.attackMs, 10), 0, BUS_LIMITS.maxAttackMs)
   const releaseMs = clamp(numberArg(caller, 'releaseMs', options.releaseMs, 250), 0, BUS_LIMITS.maxReleaseMs)
   const detectorCoefficient = settleCoefficient(DETECTOR_SETTLE_MS, target.sampleRate)
   const attackCoefficient = settleCoefficient(attackMs, target.sampleRate)
   const releaseCoefficient = settleCoefficient(releaseMs, target.sampleRate)
-  const frames = target.samples.length
-  const sideSamples = side.samples
-  const sideScale = side.sampleRate === target.sampleRate ? 1 : target.sampleRate / side.sampleRate
+  const frames = target.channels[0].length
+  const sideChannels = side.channels
+  const sideChannelCount = sideChannels.length
+  const sideRate = side.sampleRate
+  const sideScale = sideRate === target.sampleRate ? 1 : target.sampleRate / sideRate
 
   // Pass one measures the sidechain: its peak (for the report) and its running
-  // mean square, which is monotone in a pulse and ripple-free on a tone.
+  // mean square, which is monotone in a pulse and ripple-free on a tone. A
+  // multichannel sidechain is detected as its loudest channel, the same linked
+  // rule the compressor uses.
   const level = new Float64Array(frames)
   let levelMax = 0
   let sidePeak = 0
@@ -558,7 +670,13 @@ export function duck (track, sidechain, options = {}) {
     // A sidechain at another rate is read by nearest sample: this is a level
     // detector, so interpolation buys nothing and would blur the attack.
     const at = sideScale === 1 ? index : Math.floor(index * sideScale)
-    const magnitude = at < sideSamples.length ? Math.abs(sideSamples[at]) : 0
+    let magnitude = 0
+    if (at < sideChannels[0].length) {
+      for (let channel = 0; channel < sideChannelCount; channel += 1) {
+        const value = Math.abs(sideChannels[channel][at])
+        if (value > magnitude) magnitude = value
+      }
+    }
     if (magnitude > sidePeak) sidePeak = magnitude
     power += (magnitude * magnitude - power) * detectorCoefficient
     const amplitude = Math.sqrt(power)
@@ -585,8 +703,11 @@ export function duck (track, sidechain, options = {}) {
 
   // Pass two turns that level into a dip: the full amount at the sidechain's
   // reference level, proportional below it, then smoothed so the attack and
-  // release times apply to the audible gain rather than to the measurement.
-  const out = new Float32Array(frames)
+  // release times apply to the audible gain rather than to the measurement. One
+  // gain per instant is applied to every target channel, so the duck cannot
+  // move the image.
+  const channelCount = target.channels.length
+  const out = target.channels.map(() => new Float32Array(frames))
   let duckDb = 0
   let maxDuckDb = 0
   let sumDuckDb = 0
@@ -599,16 +720,18 @@ export function duck (track, sidechain, options = {}) {
     if (duckDb > maxDuckDb) maxDuckDb = duckDb
     if (duckDb > 0.01) samplesDucked += 1
     sumDuckDb += duckDb
-    out[index] = target.samples[index] * dbToGain(-duckDb)
+    const gain = dbToGain(-duckDb)
+    for (let channel = 0; channel < channelCount; channel += 1) out[channel][index] = target.channels[channel][index] * gain
   }
 
-  return monoResult(out, target.sampleRate, levelReport('duck', target.samples, out, target.sampleRate, {
+  return shapeResult(out, target.sampleRate, levelReport('duck', target.channels, out, target.sampleRate, {
     amountDb: roundTo(amountDb, 2),
     attackMs: roundTo(attackMs, 2),
     releaseMs: roundTo(releaseMs, 2),
     maxDuckDb: roundTo(maxDuckDb, 2),
     meanDuckDb: roundTo(frames > 0 ? sumDuckDb / frames : 0, 2),
     sidechainPeakDbfs: toDb(sidePeak),
+    sidechainChannels: sideChannelCount,
     duckedPercent: roundTo(frames > 0 ? (samplesDucked / frames) * 100 : 0, 1)
   }))
 }
@@ -625,6 +748,11 @@ export function duck (track, sidechain, options = {}) {
  * `width` is the mid/side width: 0 folds the panned image to mono at the mid
  * level, 1 leaves it alone, 2 doubles the side component. At centre the sides
  * are zero and width therefore does nothing, which is the correct behaviour.
+ *
+ * A multichannel track is refused: panning means placing a point source on a
+ * stereo pair, and a 5.1/7.1 layer is already a layout. Changing that layout is
+ * `fitChannels`' job (up/downmix) or `audio_spatial`'s (place a source), not a
+ * pan knob's.
  * @param {{ samples: Float32Array, sampleRate: number }|Float32Array} track - mono source.
  * @param {{ pan?: number, width?: number, sampleRate?: number }} [options] - pan -1..1
  *   (default 0), width 0..2 (default 1).
@@ -632,7 +760,11 @@ export function duck (track, sidechain, options = {}) {
  */
 export function pan (track, options = {}) {
   const caller = 'pan'
-  const { samples, sampleRate } = readTrack(track, options, caller)
+  const { channels, sampleRate } = readTrackChannels(track, options, caller)
+  if (channels.length > 1) {
+    throw new Error(`${caller}: pan places a mono track; this track already has ${channels.length} channels, and a stereo/surround layer has an image to fit rather than a position to set (use fitChannels to change the layout)`)
+  }
+  const samples = channels[0]
   const panValue = clamp(numberArg(caller, 'pan', options.pan, 0), -1, 1)
   const width = clamp(numberArg(caller, 'width', options.width, 1), 0, BUS_LIMITS.maxWidth)
   const theta = (panValue + 1) * Math.PI / 4
@@ -700,22 +832,26 @@ export function pan (track, options = {}) {
  */
 export function trimSilence (track, options = {}) {
   const caller = 'trimSilence'
-  const { samples, sampleRate } = readTrack(track, options, caller)
+  const { channels, sampleRate } = readTrackChannels(track, options, caller)
   const thresholdDb = clamp(numberArg(caller, 'thresholdDb', options.thresholdDb, -60), -120, 0)
   const padMs = clamp(numberArg(caller, 'padMs', options.padMs, 0), 0, 5000)
   const threshold = dbToGain(thresholdDb)
-  const frames = samples.length
+  const frames = channels[0].length
+  // A frame is audible if *any* channel carries signal: trimming a surround
+  // layer by its mono fold could cut a rear-only effect at the head or tail.
+  const audible = (index) => channels.some((channel) => Math.abs(channel[index]) > threshold)
   let first = -1
   let last = -1
   for (let index = 0; index < frames; index += 1) {
-    if (Math.abs(samples[index]) > threshold) { first = index; break }
+    if (audible(index)) { first = index; break }
   }
   if (first === -1) {
-    return monoResult(new Float32Array(0), sampleRate, {
+    return shapeResult(channels.map(() => new Float32Array(0)), sampleRate, {
       type: 'trimSilence',
       sampleRate,
       frames: 0,
       durationSeconds: 0,
+      channelCount: channels.length,
       thresholdDb: roundTo(thresholdDb, 2),
       padMs: roundTo(padMs, 2),
       framesBefore: frames,
@@ -727,24 +863,25 @@ export function trimSilence (track, options = {}) {
     })
   }
   for (let index = frames - 1; index >= 0; index -= 1) {
-    if (Math.abs(samples[index]) > threshold) { last = index; break }
+    if (audible(index)) { last = index; break }
   }
   const padFrames = Math.round(padMs / 1000 * sampleRate)
   const start = Math.max(0, first - padFrames)
   const end = Math.min(frames, last + 1 + padFrames)
-  const out = samples.slice(start, end)
-  return monoResult(out, sampleRate, {
+  const out = channels.map((channel) => channel.slice(start, end))
+  return shapeResult(out, sampleRate, {
     type: 'trimSilence',
     sampleRate,
-    frames: out.length,
-    durationSeconds: roundTo(out.length / sampleRate, 6),
+    frames: end - start,
+    durationSeconds: roundTo((end - start) / sampleRate, 6),
+    channelCount: channels.length,
     thresholdDb: roundTo(thresholdDb, 2),
     padMs: roundTo(padMs, 2),
     framesBefore: frames,
-    framesAfter: out.length,
+    framesAfter: end - start,
     removedStartSeconds: roundTo(start / sampleRate, 6),
     removedEndSeconds: roundTo((frames - end) / sampleRate, 6),
-    removedSeconds: roundTo((frames - out.length) / sampleRate, 6),
+    removedSeconds: roundTo((frames - (end - start)) / sampleRate, 6),
     allSilent: false
   })
 }
@@ -771,20 +908,21 @@ export const PROCESSORS = Object.freeze({
  * compressor react to the rumble first and then throws the rumble away, which is
  * a different sound and a different peak. The report keeps every step in order so
  * the difference is visible.
- * @param {{ samples: Float32Array, sampleRate: number }} track - mono source track.
+ * @param {{ samples: Float32Array, sampleRate: number }|{ channels: Float32Array[], sampleRate: number }} track - source track.
  * @param {Array<{ type: string, [key: string]: any }>} [chain] - processors in order,
  *   e.g. `[{ type: 'highpass', hz: 120 }, { type: 'compressor', thresholdDb: -24 }]`.
- *   `pan` may only appear last; `duck` needs a `sidechain` field.
+ *   `pan` may only appear last and only on a mono track; `duck` needs a
+ *   `sidechain` field.
  * @returns {{ samples?: Float32Array, channels?: Float32Array[], sampleRate: number, report: object }}
- *   mono when the chain does not pan, stereo when it ends in `pan`.
+ *   the same shape as the input, or stereo when the chain ends in `pan`.
  */
 export function processTrack (track, chain = []) {
   const caller = 'processTrack'
   if (!Array.isArray(chain)) {
     throw new Error(`${caller}: chain must be an array of { type, ...options }, got ${describeValue(chain)}`)
   }
-  const start = readTrack(track, {}, caller)
-  let current = start
+  const start = readTrackChannels(track, {}, caller)
+  let current = { channels: start.channels, sampleRate: start.sampleRate }
   let lastStereo = null
   let stereo = false
   const steps = []
@@ -815,7 +953,7 @@ export function processTrack (track, chain = []) {
       result = PROCESSORS[type](current, entry)
     }
     steps.push(result.report)
-    if (!stereo) current = { samples: result.samples, sampleRate: result.sampleRate }
+    if (!stereo) current = { channels: result.channels ?? [result.samples], sampleRate: result.sampleRate }
   }
 
   let gainReductionDb = 0
@@ -824,21 +962,21 @@ export function processTrack (track, chain = []) {
     if (Number.isFinite(step.maxGainReductionDb) && step.maxGainReductionDb > gainReductionDb) gainReductionDb = step.maxGainReductionDb
     if (Number.isFinite(step.maxDuckDb) && step.maxDuckDb > maxDuckDb) maxDuckDb = step.maxDuckDb
   }
-  const output = stereo ? lastStereo.channels[0] : current.samples
+  const outputChannels = stereo ? lastStereo.channels : current.channels
   const report = {
     types: steps.map((step) => step.type),
     steps,
     stereo,
+    channelCount: outputChannels.length,
     sampleRate: start.sampleRate,
-    frames: output.length,
-    durationSeconds: roundTo(output.length / start.sampleRate, 6),
+    frames: outputChannels[0] === undefined ? 0 : outputChannels[0].length,
+    durationSeconds: roundTo((outputChannels[0] === undefined ? 0 : outputChannels[0].length) / start.sampleRate, 6),
     gainReductionDb: roundTo(gainReductionDb, 2),
     maxDuckDb: roundTo(maxDuckDb, 2)
   }
-  if (stereo) return stereoResult(lastStereo.channels, start.sampleRate, report)
   // An empty chain is a no-op and hands the input buffer back rather than
   // copying it: the bus copies before it processes, so ownership stays clear.
-  return monoResult(current.samples, start.sampleRate, report)
+  return shapeResult(outputChannels, start.sampleRate, report)
 }
 
 /* ------------------------------------------------------------------ bus -- */
@@ -882,7 +1020,9 @@ function resolveMaster (master, caller) {
 function readChannels (caller, requested) {
   if (requested === undefined || requested === null) return undefined
   const value = numberArg(caller, 'channels', requested, undefined)
-  if (value !== 1 && value !== 2) throw new Error(`${caller}: channels must be 1 or 2, got ${describeValue(requested)}`)
+  if (!CHANNEL_COUNTS.includes(value)) {
+    throw new Error(`${caller}: channels must be one of ${CHANNEL_COUNTS.join(', ')} (1 mono, 2 stereo, 4 quad, 6 5.1, 8 7.1), got ${describeValue(requested)}`)
+  }
   return value
 }
 
@@ -925,30 +1065,40 @@ function uniqueId (base, used) {
   return id
 }
 
-/** Resolve one track request into a processed mono layer plus its meters. */
+/** Resolve one track request into a processed layer (one or more channels) plus its meters. */
 function renderOneTrack (spec, sampleRate, caller) {
-  const source = resampleLinear(spec.samples, spec.sampleRate, sampleRate)
+  const sourceChannels = spec.channels.map((channel) => resampleLinear(channel, spec.sampleRate, sampleRate))
   const gain = dbToGain(spec.gainDb)
   // Gain lands before the chain so a compressor sees the level the caller set,
-  // which is the behaviour a fader feeding an insert chain has.
-  const driven = new Float32Array(source.length)
-  for (let index = 0; index < source.length; index += 1) driven[index] = source[index] * gain
+  // which is the behaviour a fader feeding an insert chain has. One gain for
+  // every channel: a per-channel gain would move the image before the chain
+  // even ran.
+  const driven = sourceChannels.map((channel) => {
+    const out = new Float32Array(channel.length)
+    for (let index = 0; index < channel.length; index += 1) out[index] = channel[index] * gain
+    return out
+  })
 
   const chain = spec.chain.map((entry) => {
     if (entry !== null && typeof entry === 'object' && entry.type === 'duck' && entry.sidechain !== undefined && entry.sidechain !== null) {
-      const side = readTrack(entry.sidechain, { sampleRate }, `${caller} tracks[i] duck sidechain`)
-      return { ...entry, sidechain: { samples: resampleLinear(side.samples, side.sampleRate, sampleRate), sampleRate } }
+      const side = readTrackChannels(entry.sidechain, { sampleRate }, `${caller} tracks[i] duck sidechain`)
+      return {
+        ...entry,
+        sidechain: { channels: side.channels.map((channel) => resampleLinear(channel, side.sampleRate, sampleRate)), sampleRate }
+      }
     }
     return entry
   })
-  const processed = processTrack({ samples: driven, sampleRate }, chain)
+  const processed = processTrack({ channels: driven, sampleRate }, chain)
   if (processed.report.stereo) {
     throw new Error(`${caller}: a track chain must not end in pan; set the track's own pan/width instead`)
   }
+  const outputChannels = processed.channels ?? [processed.samples]
 
   return {
     id: spec.id,
-    samples: processed.samples,
+    channels: outputChannels,
+    channelCount: outputChannels.length,
     sampleRate,
     offsetSeconds: spec.offsetSeconds,
     startFrame: Math.round(spec.offsetSeconds * sampleRate),
@@ -956,11 +1106,44 @@ function renderOneTrack (spec, sampleRate, caller) {
     pan: spec.pan,
     width: spec.width,
     report: processed.report,
-    peakInDbfs: toDb(peakOf(source)),
-    rmsInDbfs: toDb(rmsOf(source)),
-    peakOutDbfs: toDb(peakOf(processed.samples)),
-    rmsOutDbfs: toDb(rmsOf(processed.samples))
+    peakInDbfs: toDb(peakOfChannels(sourceChannels)),
+    rmsInDbfs: toDb(rmsOfChannels(sourceChannels)),
+    peakOutDbfs: toDb(peakOfChannels(outputChannels)),
+    rmsOutDbfs: toDb(rmsOfChannels(outputChannels))
   }
+}
+
+/**
+ * Fit one processed layer onto the bus's channel count.
+ *
+ * The legacy mono paths are bit-identical to the pre-multichannel bus: a mono
+ * layer into a 1- or 2-channel bus is panned exactly as before (pan 0 is unity
+ * in both channels, and the 1-channel fold is the average of the panned pair).
+ * A mono layer into a surround bus goes to the centre speaker when it is
+ * unpanned, which is what an upmix of a point source should do, and across the
+ * front pair when it is panned. A multichannel layer is up/downmixed by
+ * `fitChannels`, so a stereo layer in a 5.1 bus keeps its image in FL/FR and a
+ * 5.1 layer in a stereo bus folds down with LFE dropped.
+ *
+ * @param {object} layer - processed layer from `renderOneTrack`.
+ * @param {number} channels - bus channel count.
+ * @param {number} sampleRate - Hz.
+ * @returns {Float32Array[]} exactly `channels` buffers.
+ */
+function fitLayerToBus (layer, channels, sampleRate) {
+  if (layer.channels.length === 1) {
+    if (channels <= 2) {
+      const panned = pan({ samples: layer.channels[0], sampleRate }, { pan: layer.pan, width: layer.width })
+      return channels === 2 ? panned.channels : [averageChannels(panned.channels[0], panned.channels[1])]
+    }
+    const front = layer.pan === 0
+      ? layer.channels
+      : pan({ samples: layer.channels[0], sampleRate }, { pan: layer.pan, width: layer.width }).channels
+    return fitChannels(front, channels)
+  }
+  // A pan/width knob on a multichannel layer was rejected while the request was
+  // validated, so the layer arrives here as a layout and is only re-laid-out.
+  return fitChannels(layer.channels, channels)
 }
 
 /**
@@ -977,22 +1160,33 @@ function renderOneTrack (spec, sampleRate, caller) {
  * filter's group delay, and the timeline is bounded before anything is
  * allocated: an offset of 1e6 seconds is a bug, not a long cue.
  *
- * @param {Array<object>} tracks - per layer: `{ id?, samples, sampleRate?, gainDb?,
- *   offsetSeconds?, pan?, width?, chain? }`. `chain` is an ordered processor list
- *   (see `processTrack`). The source rate defaults to the bus rate.
- * @param {{ sampleRate?: number, channels?: 1|2, master?: { peakDbfs?: number|null,
+ * Channel count. A request may name 1/2/4/6/8 output channels. With no request
+ * the bus infers it: the widest layer wins (so a project with one 5.1 layer is a
+ * 5.1 bus), otherwise the historical rule (stereo when anything is panned, mono
+ * when not). Every layer is then fitted to that count with `fitChannels`, so a
+ * stereo input into a 6-channel master is upmixed instead of being rejected, and
+ * the report names each layer's fit. The master stage is joint over all
+ * channels: one drive gain, one soft limiter shape, one peak normalisation, so
+ * the image is preserved and the peak printed is the file's real peak.
+ *
+ * @param {Array<object>} tracks - per layer: `{ id?, samples, channels?, sampleRate?, gainDb?,
+ *   offsetSeconds?, pan?, width?, chain? }`. `samples` is a mono buffer; `channels`
+ *   is one buffer per channel for a stereo/surround layer. `chain` is an ordered
+ *   processor list (see `processTrack`). The source rate defaults to the bus rate.
+ * @param {{ sampleRate?: number, channels?: 1|2|4|6|8, master?: { peakDbfs?: number|null,
  *   limiter?: boolean, drive?: number } }} [options] - bus rate (default 48 kHz),
- *   output channels (default: 2 when any track is panned, else 1) and the master
- *   stage (default: limiter on, peak -1 dBFS, no drive).
+ *   output channels (default: the widest layer, else 2 when any track is panned,
+ *   else 1) and the master stage (default: limiter on, peak -1 dBFS, no drive).
  * @returns {{ sampleRate: number, channels: number, frames: number,
  *   durationSeconds: number, stems: object[], master: object, meter: object }} the
- *   rendered bus. `stems[i].samples` are mono layers (post-chain, pre-pan), the
- *   master is stereo when panned and its `samples` are the mono fold.
+ *   rendered bus. `stems[i].samples` is the layer's first channel (mono layers
+ *   keep the old shape), `stems[i].channels` is the full processed layer, and the
+ *   master's `samples` is the mono fold of the real channels.
  */
 export function renderBus (tracks, options = {}) {
   const caller = 'renderBus'
   if (!Array.isArray(tracks) || tracks.length === 0) {
-    throw new Error(`${caller}: tracks must be a non-empty array of { samples, sampleRate, gainDb?, offsetSeconds?, pan?, chain? }`)
+    throw new Error(`${caller}: tracks must be a non-empty array of { samples | channels, sampleRate, gainDb?, offsetSeconds?, pan?, chain? }`)
   }
   if (tracks.length > BUS_LIMITS.maxTracks) {
     throw new Error(`${caller}: ${tracks.length} tracks exceeds the ${BUS_LIMITS.maxTracks}-track limit; render the cue in parts`)
@@ -1010,8 +1204,18 @@ export function renderBus (tracks, options = {}) {
     if (track === null || typeof track !== 'object') {
       throw new Error(`${caller}: tracks[${index}] must be an object, got ${describeValue(track)}`)
     }
-    if (!isSampleBuffer(track.samples)) {
-      throw new Error(`${caller}: tracks[${index}] needs samples (a Float32Array), got ${describeValue(track.samples)}`)
+    const rawChannels = track.channels !== undefined
+      ? track.channels
+      : (Array.isArray(track.samples) ? track.samples : (isSampleBuffer(track.samples) ? [track.samples] : null))
+    if (!isChannelArray(rawChannels)) {
+      throw new Error(`${caller}: tracks[${index}] needs samples (a Float32Array) or channels (a non-empty array of them), got ${describeValue(track.samples)}`)
+    }
+    const sourceFrames = rawChannels[0].length
+    if (rawChannels.some((channel) => channel.length !== sourceFrames)) {
+      throw new Error(`${caller}: tracks[${index}] channels must all have the same length`)
+    }
+    if (!CHANNEL_COUNTS.includes(rawChannels.length)) {
+      throw new Error(`${caller}: tracks[${index}] has ${rawChannels.length} channels, which has no WAVE layout; supported counts are ${CHANNEL_COUNTS.join(', ')}`)
     }
     const sourceRate = Math.round(numberArg(caller, `tracks[${index}].sampleRate`, track.sampleRate, sampleRate))
     if (sourceRate < BUS_LIMITS.minSampleRate || sourceRate > BUS_LIMITS.maxSampleRate) {
@@ -1021,6 +1225,9 @@ export function renderBus (tracks, options = {}) {
     const offsetSeconds = clamp(numberArg(caller, `tracks[${index}].offsetSeconds`, track.offsetSeconds, 0), 0, BUS_LIMITS.maxSeconds)
     const panValue = clamp(numberArg(caller, `tracks[${index}].pan`, track.pan, 0), -1, 1)
     const width = clamp(numberArg(caller, `tracks[${index}].width`, track.width, 1), 0, BUS_LIMITS.maxWidth)
+    if (rawChannels.length > 1 && (panValue !== 0 || width !== 1)) {
+      throw new Error(`${caller}: tracks[${index}] is a ${rawChannels.length}-channel layer; pan/width place a mono layer, so a multichannel layer must be laid out with fitChannels (or the bus's channels option) instead`)
+    }
     const rawChain = track.chain === undefined || track.chain === null ? [] : track.chain
     if (!Array.isArray(rawChain)) {
       throw new Error(`${caller}: tracks[${index}].chain must be an array of processors, got ${describeValue(track.chain)}`)
@@ -1028,7 +1235,7 @@ export function renderBus (tracks, options = {}) {
     const baseId = String(track.id ?? track.name ?? `track-${index + 1}`).trim() || `track-${index + 1}`
     return {
       id: uniqueId(baseId, usedIds),
-      samples: track.samples,
+      channels: rawChannels,
       sampleRate: sourceRate,
       gainDb,
       offsetSeconds,
@@ -1039,7 +1246,7 @@ export function renderBus (tracks, options = {}) {
   })
 
   const layers = specs.map((spec) => renderOneTrack(spec, sampleRate, caller))
-  const longest = layers.reduce((max, layer) => Math.max(max, layer.startFrame + layer.samples.length), 0)
+  const longest = layers.reduce((max, layer) => Math.max(max, layer.startFrame + layer.channels[0].length), 0)
   const frames = Math.max(1, longest)
   const maximumFrames = BUS_LIMITS.maxSeconds * sampleRate
   if (frames > maximumFrames) {
@@ -1047,28 +1254,30 @@ export function renderBus (tracks, options = {}) {
   }
 
   const needsStereo = layers.some((layer) => layer.pan !== 0 || layer.width !== 1)
-  const channels = requestedChannels ?? (needsStereo ? 2 : 1)
+  const widestLayer = layers.reduce((widest, layer) => Math.max(widest, layer.channelCount), 1)
+  // The widest layer wins, so handing the bus a 5.1 render makes a 5.1 bus and a
+  // stereo layer keeps its two channels. Only a bus made of mono layers falls
+  // back to the historical rule (stereo when something is panned, else mono).
+  const channels = requestedChannels ?? (widestLayer > 1 ? widestLayer : (needsStereo ? 2 : 1))
   // Float32 buses, like `mixTracks`: it is the precision the mixer has always
   // summed in, so a bus and a mix of the same inputs agree at the bit level.
-  const leftBus = new Float32Array(frames)
-  const rightBus = new Float32Array(frames)
+  const buses = Array.from({ length: channels }, () => new Float32Array(frames))
   for (const layer of layers) {
-    const panned = pan({ samples: layer.samples, sampleRate }, { pan: layer.pan, width: layer.width })
-    const left = panned.channels[0]
-    const right = panned.channels[1]
-    const limit = Math.min(frames, layer.startFrame + left.length)
-    for (let index = layer.startFrame; index < limit; index += 1) {
-      const at = index - layer.startFrame
-      leftBus[index] += left[at]
-      rightBus[index] += right[at]
+    const fitted = fitLayerToBus(layer, channels, sampleRate)
+    layer.fit = { from: layer.channelCount, to: channels, kind: conversionKind(layer.channelCount, channels) }
+    const sourceFrames = fitted[0].length
+    const limit = Math.min(frames, layer.startFrame + sourceFrames)
+    for (let channel = 0; channel < channels; channel += 1) {
+      const bus = buses[channel]
+      const source = fitted[channel]
+      for (let index = layer.startFrame; index < limit; index += 1) bus[index] += source[index - layer.startFrame]
     }
   }
 
-  const buses = channels === 2 ? [leftBus, rightBus] : [averageChannels(leftBus, rightBus)]
-  const driveGain = dbToGain(masterOptions.drive)
-  if (driveGain !== 1) {
-    for (const bus of buses) for (let index = 0; index < frames; index += 1) bus[index] *= driveGain
-  }
+  // One linked fader for every channel of the master: a per-channel gain here
+  // would tilt the image, and the drive knob is a level into the limiter, not a
+  // balance control.
+  linkStemGain(buses, masterOptions.drive)
 
   let limiterEngaged = false
   let preLimitPeak = 0
@@ -1105,7 +1314,12 @@ export function renderBus (tracks, options = {}) {
 
   // The encoded files own their buffers; the caller may mutate them freely.
   const channelSamples = buses.map((bus) => bus.slice())
-  const monoFold = channels === 1 ? channelSamples[0].slice() : averageChannels(channelSamples[0], channelSamples[1])
+  // The mono fold is a real downmix, not an average of the first pair: it drops
+  // LFE and folds the centre and surrounds at their standard gains, so a probe
+  // of a 5.1 bus and a probe of its mono fold describe the same signal. For a
+  // stereo bus this is exactly the old average of L and R.
+  const monoFold = channels === 1 ? channelSamples[0].slice() : fitChannels(channelSamples, 1)[0]
+  const layout = layoutFor(channels)
 
   let clipping = 0
   let sumSquares = 0
@@ -1130,6 +1344,9 @@ export function renderBus (tracks, options = {}) {
   const masterMetrics = {
     sampleRate,
     channels,
+    channelLayout: layout.id,
+    channelNames: [...layout.names],
+    channelMask: layout.mask,
     frames,
     durationSeconds: roundTo(frames / sampleRate, 6),
     // The peak of the *file* is the loudest sample in any channel; `audio_probe`
@@ -1153,6 +1370,8 @@ export function renderBus (tracks, options = {}) {
       gainDb: roundTo(layer.gainDb, 2),
       pan: roundTo(layer.pan, 3),
       width: roundTo(layer.width, 3),
+      channels: layer.channelCount,
+      fit: layer.fit,
       chain: layer.report.types,
       peakInDbfs: layer.peakInDbfs,
       rmsInDbfs: layer.rmsInDbfs,
@@ -1166,17 +1385,25 @@ export function renderBus (tracks, options = {}) {
   return {
     sampleRate,
     channels,
+    channelLayout: layout.id,
+    channelNames: [...layout.names],
+    channelMask: layout.mask,
     frames,
     durationSeconds: roundTo(frames / sampleRate, 6),
     stems: layers.map((layer) => ({
       id: layer.id,
-      samples: layer.samples,
+      // `samples` is the layer's first channel so mono callers keep the old
+      // shape; `channels` is the full processed layer, post-chain and pre-fit.
+      samples: layer.channels[0],
+      channels: layer.channels,
+      channelCount: layer.channelCount,
       sampleRate,
       offsetSeconds: layer.offsetSeconds,
       startFrame: layer.startFrame,
       gainDb: layer.gainDb,
       pan: layer.pan,
       width: layer.width,
+      fit: layer.fit,
       peakDbfs: layer.peakOutDbfs,
       rmsDbfs: layer.rmsOutDbfs,
       report: layer.report
@@ -1184,6 +1411,9 @@ export function renderBus (tracks, options = {}) {
     master: {
       sampleRate,
       channels,
+      channelLayout: layout.id,
+      channelNames: [...layout.names],
+      channelMask: layout.mask,
       frames,
       durationSeconds: roundTo(frames / sampleRate, 6),
       samples: monoFold,
@@ -1196,6 +1426,8 @@ export function renderBus (tracks, options = {}) {
       monoFoldPeakDbfs: masterMetrics.monoFoldPeakDbfs,
       monoFoldRmsDbfs: masterMetrics.monoFoldRmsDbfs,
       driveDb: roundTo(masterOptions.drive, 2),
+      /** The linked master fader: one gain for every channel (normalisation). */
+      mixGainDb: roundTo(linearToDb(masterGain), 2),
       gainDb: roundTo(linearToDb(masterGain), 2),
       limiter: masterOptions.limiter,
       limiterEngaged,
@@ -1209,6 +1441,7 @@ export function renderBus (tracks, options = {}) {
         rmsDbfs: masterMetrics.rmsDbfs,
         crestDb: masterMetrics.crestDb,
         clipping: masterMetrics.clipping,
+        mixGainDb: roundTo(linearToDb(masterGain), 2),
         gainDb: roundTo(linearToDb(masterGain), 2),
         limiterEngaged,
         limiterReductionDb

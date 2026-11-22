@@ -105,7 +105,7 @@ window.__ModuleLoader__.load({
     // `test/client-locale.mjs` fails when the two disagree. Regenerate with
     // `node test/client-locale.mjs --write` after editing a string.
     /* ---- generated dictionary ---- */
-    const DICT_JSON = '{"zh":{"page.title":"\u58f0\u97f3","page.subtitle":"\u5408\u6210\u3001\u6df7\u97f3\u3001\u97f3\u9891\u68c0\u67e5\u7684\u6280\u672f\u90e8\u5206\u4e0d\u9700\u8981\u5bc6\u94a5\uff1b\u8fd9\u91cc\u914d\u7f6e\u65c1\u767d\uff08TTS\uff09\u548c\u8bed\u4e49\u68c0\u67e5\u6240\u7528\u7684\u670d\u52a1\u3002","field.provider":"\u4f9b\u5e94\u5546","field.baseUrl":"\u63a5\u53e3\u5730\u5740","field.model":"\u6a21\u578b","field.voice":"\u97f3\u8272","field.speed":"\u8bed\u901f","field.pitch":"\u97f3\u8c03","field.ffmpeg":"ffmpeg","field.apiKey":"API \u5bc6\u94a5","provider.minimax":"MiniMax","provider.edge":"Edge \u6717\u8bfb\uff08\u514d\u8d39\uff0c\u65e0\u9700\u5bc6\u94a5\uff09","provider.openai":"OpenAI \u517c\u5bb9","provider.custom":"\u81ea\u5b9a\u4e49\u7aef\u70b9\uff08OpenAI \u517c\u5bb9\uff09","provider.none":"\u5173\u95ed","tts.sectionTitle":"\u65c1\u767d \u00b7 TTS","tts.baseUrlPlaceholder":"https://api.minimax.chat","tts.modelDesc":"speech-2.8-hd \u81ea\u52a8\u60c5\u611f\uff1bspeech-2.6-hd \u652f\u6301\u624b\u52a8\u60c5\u611f","tts.modelPlaceholder":"speech-2.8-hd","tts.voiceDescLive":"\u5b9e\u65f6\u5217\u8868\uff1a{count} \u4e2a\u97f3\u8272\uff0c\u6765\u81ea\u5f53\u524d\u8d26\u53f7","tts.voiceDescStatic":"\u9759\u6001\u540d\u5355\uff0c\u672a\u8054\u7f51\u6821\u9a8c\uff1b\u914d\u7f6e\u5bc6\u94a5\u540e\u81ea\u52a8\u6362\u6210\u8d26\u53f7\u7684\u5b9e\u65f6\u5217\u8868","tts.voicePlaceholder":"\u4e5f\u53ef\u4ee5\u76f4\u63a5\u586b\u97f3\u8272 id","tts.voiceNone":"\uff08\u65e0\u53ef\u7528\u97f3\u8272\uff09","tts.speedDesc":"0.5 \u2013 2.0","tts.pitchDesc":"\u534a\u97f3\uff0c\u221212 \u2013 12","tts.ffmpegDesc":"\u4ec5 Edge \u9700\u8981\uff1a\u5b83\u53ea\u63d0\u4f9b\u538b\u7f29\u97f3\u9891\uff0c\u7528\u672c\u673a ffmpeg \u89e3\u7801\u6210\u6ce2\u5f62\u3002\u7559\u7a7a\u81ea\u52a8\u63a2\u6d4b ~/.dsh/tools/ffmpeg","tts.ffmpegPlaceholder":"\u7559\u7a7a = \u81ea\u52a8\u63a2\u6d4b","tts.keyStored":"\u5df2\u4fdd\u5b58\u5bc6\u94a5\uff1b\u7559\u7a7a\u4fdd\u6301\u4e0d\u53d8","tts.keyEnvDetected":"\u7559\u7a7a\u5219\u8bfb\u73af\u5883\u53d8\u91cf {env}\uff08\u5df2\u68c0\u6d4b\u5230\uff09","tts.keyEnvMissing":"\u7559\u7a7a\u5219\u8bfb\u73af\u5883\u53d8\u91cf {env}\uff08\u672a\u68c0\u6d4b\u5230\uff09","tts.keyPlaceholder":"\u7559\u7a7a\u5219\u4e0d\u4fee\u6539","tts.testRow":"\u6d4b\u8bd5\u8fde\u63a5","tts.testDesc":"\u5408\u6210\u4e00\u53e5\u8bdd\u5e76\u8bd5\u542c\uff0c\u7528\u6765\u786e\u8ba4\u5bc6\u94a5\u3001\u6a21\u578b\u3001\u97f3\u8272\u90fd\u5bf9","tts.testAction":"\u5408\u6210\u5e76\u8bd5\u542c","tts.testOk":"\u6210\u529f\uff1a{seconds}s \u00b7 {model} \u00b7 {voice}","tts.testNoTimestamps":"\u65e0\u65f6\u95f4\u6233","tts.testTimestamps":"\u65f6\u95f4\u6233 {count} \u6761","check.sectionTitle":"\u97f3\u9891\u68c0\u67e5 \u00b7 \u8bed\u4e49\u5c42\uff08\u53ef\u9009\uff09","check.sectionDesc":"MiniMax \u6ca1\u6709\u97f3\u9891\u7406\u89e3\u63a5\u53e3\uff0c\u8fd9\u91cc\u4f7f\u7528 OpenAI \u517c\u5bb9\u7684 input_audio \u7aef\u70b9\uff08Qwen-Omni \u7b49\uff09\u3002\u4e0d\u586b\u5219\u53ea\u8dd1\u6280\u672f\u68c0\u67e5\u3002","check.testRow":"\u6d4b\u8bd5\u8bc6\u522b","check.testDesc":"\u9001\u4e00\u6bb5\u94c3\u58f0\u7ed9\u6a21\u578b\uff0c\u770b\u5b83\u80fd\u4e0d\u80fd\u63cf\u8ff0\u51fa\u6765","check.testAction":"\u8bd5\u542c\u5e76\u8bc6\u522b","check.testOk":"\u6210\u529f\uff1a{answer}","check.selfCheckRow":"\u6a21\u578b\u81ea\u68c0\uff08\u5b9e\u9a8c\u6027\uff09","check.selfCheckDesc":"\u9ed8\u8ba4\u5173\u95ed\u3002\u5f00\u542f\u540e\u6bcf\u6b21\u4fdd\u5b58\u90fd\u4f1a\u7528\u771f\u5b9e\u97f3\u9891\u95ee\u6a21\u578b\u4e00\u6b21\uff0c\u5e76\u663e\u793a\u7aef\u70b9\u72b6\u6001\u3001HTTP \u72b6\u6001\u4e0e\u8017\u65f6\uff1b\u4e5f\u53ef\u4ee5\u70b9\u53f3\u8fb9\u6309\u94ae\u7acb\u5373\u6821\u9a8c\u3002\u53ea\u6821\u9a8c\u5df2\u4fdd\u5b58\u7684\u914d\u7f6e\u3002","check.selfCheckOff":"\u5173\u95ed\uff08\u9ed8\u8ba4\uff09","check.selfCheckOn":"\u4fdd\u5b58\u540e\u81ea\u52a8\u6821\u9a8c","check.validateAction":"\u7acb\u5373\u6821\u9a8c","status.loading":"\u8bfb\u53d6\u4e2d\u2026","status.savedWaiting":"\u5df2\u4fdd\u5b58\uff0c\u7b49\u5f85\u63d2\u4ef6\u91cd\u542f\u2026","status.applied":"\u5df2\u751f\u6548","status.restartTimeout":"\u5df2\u4fdd\u5b58\uff0c\u4f46\u9875\u9762\u6ca1\u7b49\u5230\u63d2\u4ef6\u91cd\u542f\uff1b\u5237\u65b0\u4e00\u4e0b\u786e\u8ba4","status.endpointReachable":"\u7aef\u70b9\u53ef\u8fbe\uff08HTTP {status}\uff09","status.endpointUnreachable":"\u7aef\u70b9\u4e0d\u53ef\u8fbe\uff1a{error}","status.audioAccepted":"\u6a21\u578b\u63a5\u53d7\u97f3\u9891\u8f93\u5165\uff08{ms} ms\uff09","status.audioRejected":"\u6a21\u578b\u672a\u901a\u8fc7\uff1a{error}","status.answer":"\u56de\u7b54\uff1a{answer}","status.noModel":"\u672a\u586b\u6a21\u578b","error.loadFailed":"\u8bfb\u53d6\u5931\u8d25\uff1a{error}","error.httpNotReady":"\u63a5\u53e3\u8fd8\u6ca1\u5c31\u7eea\uff08HTTP {status}\uff09","error.httpNotJson":"\u63a5\u53e3\u8fd4\u56de\u7684\u4e0d\u662f JSON\uff08HTTP {status}\uff09","error.saveFailed":"\u4fdd\u5b58\u5931\u8d25","error.testFailed":"\u6d4b\u8bd5\u5931\u8d25","error.testFail":"\u5931\u8d25\uff1a{error}","error.unknownReason":"\u672a\u77e5\u539f\u56e0","error.validateFailed":"\u6821\u9a8c\u5931\u8d25\uff1a{error}","buttons.save":"\u4fdd\u5b58","buttons.saving":"\u4fdd\u5b58\u4e2d\u2026","buttons.reload":"\u91cd\u65b0\u8bfb\u53d6","buttons.retry":"\u91cd\u8bd5","buttons.testing":"\u6d4b\u8bd5\u4e2d\u2026","buttons.validating":"\u6821\u9a8c\u4e2d\u2026","note.select":"\u8bf7\u9009\u62e9"},"en":{"page.title":"Sound","page.subtitle":"The technical side \u2014 synthesis, mixing and audio checks \u2014 needs no key; configure the services used for narration (TTS) and semantic checks here.","field.provider":"Provider","field.baseUrl":"Endpoint","field.model":"Model","field.voice":"Voice","field.speed":"Speed","field.pitch":"Pitch","field.ffmpeg":"ffmpeg","field.apiKey":"API key","provider.minimax":"MiniMax","provider.edge":"Edge Speech (free, no key)","provider.openai":"OpenAI-compatible","provider.custom":"Custom endpoint (OpenAI-compatible)","provider.none":"Off","tts.sectionTitle":"Narration \u00b7 TTS","tts.baseUrlPlaceholder":"https://api.minimax.chat","tts.modelDesc":"speech-2.8-hd picks the emotion itself; speech-2.6-hd accepts a manual emotion","tts.modelPlaceholder":"speech-2.8-hd","tts.voiceDescLive":"Live list: {count} voices from this account","tts.voiceDescStatic":"Static list, not verified online; add a key to load the account voice list","tts.voicePlaceholder":"Or type a voice id","tts.voiceNone":"(no voices available)","tts.speedDesc":"0.5 \u2013 2.0","tts.pitchDesc":"Semitones, \u221212 \u2013 12","tts.ffmpegDesc":"Edge only: it returns compressed audio, decoded to a waveform by a local ffmpeg. Empty auto-detects ~/.dsh/tools/ffmpeg","tts.ffmpegPlaceholder":"Empty = auto-detect","tts.keyStored":"A key is stored; leave empty to keep it","tts.keyEnvDetected":"Leave empty to read the {env} environment variable (detected)","tts.keyEnvMissing":"Leave empty to read the {env} environment variable (not detected)","tts.keyPlaceholder":"Leave empty to keep the stored key","tts.testRow":"Test connection","tts.testDesc":"Synthesize one sentence and play it back to confirm the key, model and voice","tts.testAction":"Synthesize & listen","tts.testOk":"OK: {seconds}s \u00b7 {model} \u00b7 {voice}","tts.testNoTimestamps":"no timestamps","tts.testTimestamps":"{count} timestamps","check.sectionTitle":"Audio check \u00b7 semantic layer (optional)","check.sectionDesc":"MiniMax has no audio-understanding endpoint, so this uses an OpenAI-compatible input_audio endpoint (Qwen-Omni and similar). Leave empty to run technical checks only.","check.testRow":"Test recognition","check.testDesc":"Send a chime to the model and see whether it can describe it","check.testAction":"Listen & identify","check.testOk":"OK: {answer}","check.selfCheckRow":"Model self-check (experimental)","check.selfCheckDesc":"Off by default. When on, every save asks the model one real-audio question and reports endpoint status, HTTP status and latency; the button on the right validates immediately. Only the saved config is checked.","check.selfCheckOff":"Off (default)","check.selfCheckOn":"Validate on save","check.validateAction":"Validate now","status.loading":"Loading\u2026","status.savedWaiting":"Saved, waiting for the plugin to restart\u2026","status.applied":"Applied","status.restartTimeout":"Saved, but the page never saw the plugin restart; refresh to confirm","status.endpointReachable":"Endpoint reachable (HTTP {status})","status.endpointUnreachable":"Endpoint unreachable: {error}","status.audioAccepted":"Model accepted the audio input ({ms} ms)","status.audioRejected":"Model failed: {error}","status.answer":"Answer: {answer}","status.noModel":"no model set","error.loadFailed":"Failed to load: {error}","error.httpNotReady":"Endpoint not ready yet (HTTP {status})","error.httpNotJson":"The endpoint returned no JSON (HTTP {status})","error.saveFailed":"Save failed","error.testFailed":"Test failed","error.testFail":"Failed: {error}","error.unknownReason":"unknown reason","error.validateFailed":"Validation failed: {error}","buttons.save":"Save","buttons.saving":"Saving\u2026","buttons.reload":"Reload","buttons.retry":"Retry","buttons.testing":"Testing\u2026","buttons.validating":"Validating\u2026","note.select":"Select"}}'
+    const DICT_JSON = '{"zh":{"page.title":"\u58f0\u97f3","page.subtitle":"\u5408\u6210\u3001\u6df7\u97f3\u3001\u97f3\u9891\u68c0\u67e5\u7684\u6280\u672f\u90e8\u5206\u4e0d\u9700\u8981\u5bc6\u94a5\uff1b\u8fd9\u91cc\u914d\u7f6e\u65c1\u767d\uff08TTS\uff09\u548c\u8bed\u4e49\u68c0\u67e5\u6240\u7528\u7684\u670d\u52a1\u3002","field.provider":"\u4f9b\u5e94\u5546","field.baseUrl":"\u63a5\u53e3\u5730\u5740","field.model":"\u6a21\u578b","field.voice":"\u97f3\u8272","field.speed":"\u8bed\u901f","field.pitch":"\u97f3\u8c03","field.ffmpeg":"ffmpeg","field.apiKey":"API \u5bc6\u94a5","provider.minimax":"MiniMax","provider.edge":"Edge \u6717\u8bfb\uff08\u514d\u8d39\uff0c\u65e0\u9700\u5bc6\u94a5\uff09","provider.openai":"OpenAI \u517c\u5bb9","provider.custom":"\u81ea\u5b9a\u4e49\u7aef\u70b9\uff08OpenAI \u517c\u5bb9\uff09","provider.none":"\u5173\u95ed","tts.sectionTitle":"\u65c1\u767d \u00b7 TTS","tts.baseUrlPlaceholder":"https://api.minimax.chat","tts.modelDesc":"speech-2.8-hd \u81ea\u52a8\u60c5\u611f\uff1bspeech-2.6-hd \u652f\u6301\u624b\u52a8\u60c5\u611f","tts.modelPlaceholder":"speech-2.8-hd","tts.voiceDescLive":"\u5b9e\u65f6\u5217\u8868\uff1a{count} \u4e2a\u97f3\u8272\uff0c\u6765\u81ea\u5f53\u524d\u8d26\u53f7","tts.voiceDescStatic":"\u9759\u6001\u540d\u5355\uff0c\u672a\u8054\u7f51\u6821\u9a8c\uff1b\u914d\u7f6e\u5bc6\u94a5\u540e\u81ea\u52a8\u6362\u6210\u8d26\u53f7\u7684\u5b9e\u65f6\u5217\u8868","tts.voicePlaceholder":"\u4e5f\u53ef\u4ee5\u76f4\u63a5\u586b\u97f3\u8272 id","tts.voiceNone":"\uff08\u65e0\u53ef\u7528\u97f3\u8272\uff09","tts.speedDesc":"0.5 \u2013 2.0","tts.pitchDesc":"\u534a\u97f3\uff0c\u221212 \u2013 12","tts.ffmpegDesc":"\u4ec5 Edge \u9700\u8981\uff1a\u5b83\u53ea\u63d0\u4f9b\u538b\u7f29\u97f3\u9891\uff0c\u7528\u672c\u673a ffmpeg \u89e3\u7801\u6210\u6ce2\u5f62\u3002\u7559\u7a7a\u81ea\u52a8\u63a2\u6d4b ~/.dsh/tools/ffmpeg","tts.ffmpegPlaceholder":"\u7559\u7a7a = \u81ea\u52a8\u63a2\u6d4b","tts.keyStored":"\u5df2\u4fdd\u5b58\u5bc6\u94a5\uff1b\u7559\u7a7a\u4fdd\u6301\u4e0d\u53d8","tts.keyEnvDetected":"\u7559\u7a7a\u5219\u8bfb\u73af\u5883\u53d8\u91cf {env}\uff08\u5df2\u68c0\u6d4b\u5230\uff09","tts.keyEnvMissing":"\u7559\u7a7a\u5219\u8bfb\u73af\u5883\u53d8\u91cf {env}\uff08\u672a\u68c0\u6d4b\u5230\uff09","tts.keyPlaceholder":"\u7559\u7a7a\u5219\u4e0d\u4fee\u6539","tts.testRow":"\u6d4b\u8bd5\u8fde\u63a5","tts.testDesc":"\u5408\u6210\u4e00\u53e5\u8bdd\u5e76\u8bd5\u542c\uff0c\u7528\u6765\u786e\u8ba4\u5bc6\u94a5\u3001\u6a21\u578b\u3001\u97f3\u8272\u90fd\u5bf9","tts.testAction":"\u5408\u6210\u5e76\u8bd5\u542c","tts.testOk":"\u6210\u529f\uff1a{seconds}s \u00b7 {model} \u00b7 {voice}","tts.testNoTimestamps":"\u65e0\u65f6\u95f4\u6233","tts.testTimestamps":"\u65f6\u95f4\u6233 {count} \u6761","check.sectionTitle":"\u97f3\u9891\u68c0\u67e5 \u00b7 \u8bed\u4e49\u5c42\uff08\u53ef\u9009\uff09","check.sectionDesc":"MiniMax \u6ca1\u6709\u97f3\u9891\u7406\u89e3\u63a5\u53e3\uff0c\u8fd9\u91cc\u4f7f\u7528 OpenAI \u517c\u5bb9\u7684 input_audio \u7aef\u70b9\uff08Qwen-Omni \u7b49\uff09\u3002\u4e0d\u586b\u5219\u53ea\u8dd1\u6280\u672f\u68c0\u67e5\u3002","check.testRow":"\u6d4b\u8bd5\u8bc6\u522b","check.testDesc":"\u9001\u4e00\u6bb5\u94c3\u58f0\u7ed9\u6a21\u578b\uff0c\u770b\u5b83\u80fd\u4e0d\u80fd\u63cf\u8ff0\u51fa\u6765","check.testAction":"\u8bd5\u542c\u5e76\u8bc6\u522b","check.testOk":"\u6210\u529f\uff1a{answer}","check.selfCheckRow":"\u6a21\u578b\u81ea\u68c0\uff08\u5b9e\u9a8c\u6027\uff09","check.selfCheckDesc":"\u9ed8\u8ba4\u5173\u95ed\u3002\u5f00\u542f\u540e\u6bcf\u6b21\u4fdd\u5b58\u90fd\u4f1a\u7528\u771f\u5b9e\u97f3\u9891\u95ee\u6a21\u578b\u4e00\u6b21\uff0c\u5e76\u663e\u793a\u7aef\u70b9\u72b6\u6001\u3001HTTP \u72b6\u6001\u4e0e\u8017\u65f6\uff1b\u4e5f\u53ef\u4ee5\u70b9\u53f3\u8fb9\u6309\u94ae\u7acb\u5373\u6821\u9a8c\u3002\u53ea\u6821\u9a8c\u5df2\u4fdd\u5b58\u7684\u914d\u7f6e\u3002","check.selfCheckOff":"\u5173\u95ed\uff08\u9ed8\u8ba4\uff09","check.selfCheckOn":"\u4fdd\u5b58\u540e\u81ea\u52a8\u6821\u9a8c","check.validateAction":"\u7acb\u5373\u6821\u9a8c","status.loading":"\u8bfb\u53d6\u4e2d\u2026","status.savedWaiting":"\u5df2\u4fdd\u5b58\uff0c\u7b49\u5f85\u63d2\u4ef6\u91cd\u542f\u2026","status.applied":"\u5df2\u751f\u6548","status.restartTimeout":"\u5df2\u4fdd\u5b58\uff0c\u4f46\u9875\u9762\u6ca1\u7b49\u5230\u63d2\u4ef6\u91cd\u542f\uff1b\u5237\u65b0\u4e00\u4e0b\u786e\u8ba4","status.endpointReachable":"\u7aef\u70b9\u53ef\u8fbe\uff08HTTP {status}\uff09","status.endpointUnreachable":"\u7aef\u70b9\u4e0d\u53ef\u8fbe\uff1a{error}","status.endpointNotApplicable":"\u7aef\u70b9\u63a2\u6d4b\u4e0d\u9002\u7528\uff1a{reason}","status.audioAccepted":"\u6a21\u578b\u63a5\u53d7\u97f3\u9891\u8f93\u5165\uff08{ms} ms\uff09","status.audioRejected":"\u6a21\u578b\u672a\u901a\u8fc7\uff1a{error}","status.answer":"\u56de\u7b54\uff1a{answer}","status.noModel":"\u672a\u586b\u6a21\u578b","error.loadFailed":"\u8bfb\u53d6\u5931\u8d25\uff1a{error}","error.httpNotReady":"\u63a5\u53e3\u8fd8\u6ca1\u5c31\u7eea\uff08HTTP {status}\uff09","error.httpNotJson":"\u63a5\u53e3\u8fd4\u56de\u7684\u4e0d\u662f JSON\uff08HTTP {status}\uff09","error.saveFailed":"\u4fdd\u5b58\u5931\u8d25","error.testFailed":"\u6d4b\u8bd5\u5931\u8d25","error.testFail":"\u5931\u8d25\uff1a{error}","error.unknownReason":"\u672a\u77e5\u539f\u56e0","error.validateFailed":"\u6821\u9a8c\u5931\u8d25\uff1a{error}","reason.missing-key":"\u7f3a\u5c11 API \u5bc6\u94a5\uff08{env}\uff09","reason.endpoint-unreachable":"\u8fde\u63a5\u5931\u8d25","reason.http-4xx":"\u4f9b\u5e94\u5546\u62d2\u7edd\u4e86\u8bf7\u6c42\uff08HTTP {status}\uff09","reason.http-5xx":"\u4f9b\u5e94\u5546\u670d\u52a1\u51fa\u9519\uff08HTTP {status}\uff09","reason.not-audio":"\u4f9b\u5e94\u5546\u8fd4\u56de\u7684\u5185\u5bb9\u4e0d\u53ef\u7528","reason.no-base-url":"\u6ca1\u6709\u53ef\u7528\u7684\u63a5\u53e3\u5730\u5740","reason.provider-none":"\u65c1\u767d\u5df2\u5173\u95ed\uff08provider = none\uff09","reason.decoder-missing":"\u7f3a\u5c11\u89e3\u7801\u5668\uff08Edge \u9700\u8981 ffmpeg\uff09","reason.unsupported-target":"\u4e0d\u652f\u6301\u7684\u76ee\u6807\uff08{target}\uff09","buttons.save":"\u4fdd\u5b58","buttons.saving":"\u4fdd\u5b58\u4e2d\u2026","buttons.reload":"\u91cd\u65b0\u8bfb\u53d6","buttons.retry":"\u91cd\u8bd5","buttons.testing":"\u6d4b\u8bd5\u4e2d\u2026","buttons.validating":"\u6821\u9a8c\u4e2d\u2026","note.select":"\u8bf7\u9009\u62e9"},"en":{"page.title":"Sound","page.subtitle":"The technical side \u2014 synthesis, mixing and audio checks \u2014 needs no key; configure the services used for narration (TTS) and semantic checks here.","field.provider":"Provider","field.baseUrl":"Endpoint","field.model":"Model","field.voice":"Voice","field.speed":"Speed","field.pitch":"Pitch","field.ffmpeg":"ffmpeg","field.apiKey":"API key","provider.minimax":"MiniMax","provider.edge":"Edge Speech (free, no key)","provider.openai":"OpenAI-compatible","provider.custom":"Custom endpoint (OpenAI-compatible)","provider.none":"Off","tts.sectionTitle":"Narration \u00b7 TTS","tts.baseUrlPlaceholder":"https://api.minimax.chat","tts.modelDesc":"speech-2.8-hd picks the emotion itself; speech-2.6-hd accepts a manual emotion","tts.modelPlaceholder":"speech-2.8-hd","tts.voiceDescLive":"Live list: {count} voices from this account","tts.voiceDescStatic":"Static list, not verified online; add a key to load the account voice list","tts.voicePlaceholder":"Or type a voice id","tts.voiceNone":"(no voices available)","tts.speedDesc":"0.5 \u2013 2.0","tts.pitchDesc":"Semitones, \u221212 \u2013 12","tts.ffmpegDesc":"Edge only: it returns compressed audio, decoded to a waveform by a local ffmpeg. Empty auto-detects ~/.dsh/tools/ffmpeg","tts.ffmpegPlaceholder":"Empty = auto-detect","tts.keyStored":"A key is stored; leave empty to keep it","tts.keyEnvDetected":"Leave empty to read the {env} environment variable (detected)","tts.keyEnvMissing":"Leave empty to read the {env} environment variable (not detected)","tts.keyPlaceholder":"Leave empty to keep the stored key","tts.testRow":"Test connection","tts.testDesc":"Synthesize one sentence and play it back to confirm the key, model and voice","tts.testAction":"Synthesize & listen","tts.testOk":"OK: {seconds}s \u00b7 {model} \u00b7 {voice}","tts.testNoTimestamps":"no timestamps","tts.testTimestamps":"{count} timestamps","check.sectionTitle":"Audio check \u00b7 semantic layer (optional)","check.sectionDesc":"MiniMax has no audio-understanding endpoint, so this uses an OpenAI-compatible input_audio endpoint (Qwen-Omni and similar). Leave empty to run technical checks only.","check.testRow":"Test recognition","check.testDesc":"Send a chime to the model and see whether it can describe it","check.testAction":"Listen & identify","check.testOk":"OK: {answer}","check.selfCheckRow":"Model self-check (experimental)","check.selfCheckDesc":"Off by default. When on, every save asks the model one real-audio question and reports endpoint status, HTTP status and latency; the button on the right validates immediately. Only the saved config is checked.","check.selfCheckOff":"Off (default)","check.selfCheckOn":"Validate on save","check.validateAction":"Validate now","status.loading":"Loading\u2026","status.savedWaiting":"Saved, waiting for the plugin to restart\u2026","status.applied":"Applied","status.restartTimeout":"Saved, but the page never saw the plugin restart; refresh to confirm","status.endpointReachable":"Endpoint reachable (HTTP {status})","status.endpointUnreachable":"Endpoint unreachable: {error}","status.endpointNotApplicable":"Endpoint probe not applicable: {reason}","status.audioAccepted":"Model accepted the audio input ({ms} ms)","status.audioRejected":"Model failed: {error}","status.answer":"Answer: {answer}","status.noModel":"no model set","error.loadFailed":"Failed to load: {error}","error.httpNotReady":"Endpoint not ready yet (HTTP {status})","error.httpNotJson":"The endpoint returned no JSON (HTTP {status})","error.saveFailed":"Save failed","error.testFailed":"Test failed","error.testFail":"Failed: {error}","error.unknownReason":"unknown reason","error.validateFailed":"Validation failed: {error}","reason.missing-key":"missing API key ({env})","reason.endpoint-unreachable":"connection failed","reason.http-4xx":"provider rejected the request (HTTP {status})","reason.http-5xx":"provider service error (HTTP {status})","reason.not-audio":"provider returned no usable content","reason.no-base-url":"no usable endpoint URL","reason.provider-none":"narration is off (provider = none)","reason.decoder-missing":"decoder missing (Edge needs ffmpeg)","reason.unsupported-target":"unsupported target ({target})","buttons.save":"Save","buttons.saving":"Saving\u2026","buttons.reload":"Reload","buttons.retry":"Retry","buttons.testing":"Testing\u2026","buttons.validating":"Validating\u2026","note.select":"Select"}}'
     /* ---- end generated dictionary ---- */
     const DICT = JSON.parse(DICT_JSON)
 
@@ -150,6 +150,93 @@ window.__ModuleLoader__.load({
       const template = dictionaryFor(localeSnapshot())[key] ?? DICT.zh[key] ?? key
       if (vars === undefined) return template
       return template.replace(/\{(\w+)\}/g, (match, name) => (vars[name] === undefined ? match : String(vars[name])))
+    }
+
+    /* ---- server failure reasons ---- */
+
+    // The host routes (/dsh-audio/test, /dsh-audio/validate) report a failure as
+    // data: the untouched server text in `error`/`reason` + `detail`, plus a
+    // machine-readable `reasonCode`. The code picks one localized sentence, so
+    // an English page never shows a Chinese reason in the middle of an English
+    // line; the server text is data and only surfaces when it carries something
+    // the sentence cannot say (a provider body, a transport cause). Keys mirror
+    // `REASON_CODES` in lib/settings-route.js, and test/client-locale.mjs fails
+    // when the two lists drift.
+    const REASON_KEYS = {
+      'missing-key': 'reason.missing-key',
+      'endpoint-unreachable': 'reason.endpoint-unreachable',
+      'http-4xx': 'reason.http-4xx',
+      'http-5xx': 'reason.http-5xx',
+      'not-audio': 'reason.not-audio',
+      'no-base-url': 'reason.no-base-url',
+      'provider-none': 'reason.provider-none',
+      'decoder-missing': 'reason.decoder-missing',
+      'unsupported-target': 'reason.unsupported-target'
+    }
+
+    // Where a server detail hides provider data behind our own prose: the body
+    // of an HTTP error, the text after a full-width colon, and a transport cause
+    // inside full-width parentheses. Written as escapes so this file stays
+    // pure ASCII apart from the symbols the page already draws.
+    const DETAIL_PAYLOADS = [
+      /HTTP \d{3}:\s*([\s\S]+)$/,
+      /\uff1a([\s\S]+)$/,
+      /\uff08([^\uff08\uff09]*)\uff09\s*$/
+    ]
+    // Any CJK left in a server message means it is our own Chinese explanation,
+    // which must not be pasted into a non-Chinese page.
+    const SERVER_CJK = /[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]/
+
+    /**
+     * A server field as displayable text: strings and finite numbers only.
+     * An object, null, undefined or NaN becomes '', so a malformed response can
+     * never render as `[object Object]` or `undefined`.
+     */
+    function textOf (value) {
+      if (typeof value === 'string') return value.trim()
+      if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+      return ''
+    }
+
+    /**
+     * The part of a server detail worth showing next to a translated reason:
+     * provider payload or a transport cause, never our own Chinese sentence.
+     * Returns '' when the detail adds nothing the translation does not say.
+     */
+    function detailExtra (detail) {
+      const text = textOf(detail)
+      if (text === '') return ''
+      for (const pattern of DETAIL_PAYLOADS) {
+        const match = pattern.exec(text)
+        if (match === null) continue
+        const payload = match[1].trim()
+        if (payload !== '' && !SERVER_CJK.test(payload)) return payload
+      }
+      // Nothing separable: only a message that is already language-neutral is
+      // safe to show verbatim (a provider that answered in English, an OS error).
+      return SERVER_CJK.test(text) ? '' : text
+    }
+
+    /**
+     * The displayable reason for a failed step: a known `reasonCode` becomes the
+     * reader's language, and an unknown one falls back to the server detail as
+     * written, because an untranslatable code would hide the only explanation.
+     */
+    function reasonText (row, fallbackKey) {
+      const source = row ?? {}
+      const code = typeof source.reasonCode === 'string' ? source.reasonCode : ''
+      const detail = textOf(source.detail ?? source.error ?? source.reason)
+      const key = REASON_KEYS[code]
+      if (key === undefined) return detail !== '' ? detail : t(fallbackKey ?? 'error.unknownReason')
+      const sentence = t(key, {
+        // The route fills these in; '?' keeps a malformed response readable
+        // instead of printing a bare `{env}` placeholder.
+        env: textOf(source.envName) || '?',
+        status: textOf(source.status) || '?',
+        target: textOf(source.target) || '?'
+      })
+      const extra = detailExtra(detail)
+      return extra === '' ? sentence : `${sentence} · ${extra}`
     }
 
     /** Re-render `onChange` whenever the language moves; returns the unsubscribe. */
@@ -451,7 +538,13 @@ window.__ModuleLoader__.load({
         })
           .then((response) => response.json())
           .then(async (body) => {
-            if (body?.ok !== true) throw new Error(body?.error ?? t('error.testFailed'))
+            if (body?.ok !== true) {
+              // A refusal is data, not an exception: translate the reason code and
+              // fall back to the server text when this page has no string for it.
+              const failure = { ...(body ?? {}), target: body?.target ?? target }
+              setTestResult((current) => ({ ...current, [target]: t('error.testFail', { error: reasonText(failure, 'error.testFailed') }) }))
+              return
+            }
             if (body.wavBase64) {
               try { await playWav(body.wavBase64) } catch { /* playback is best-effort */ }
             }
@@ -468,7 +561,10 @@ window.__ModuleLoader__.load({
               setTestResult((current) => ({ ...current, check: t('check.testOk', { answer: body.answer }) }))
             }
           })
-          .catch((cause) => setTestResult((current) => ({ ...current, [target]: t('error.testFail', { error: cause.message }) })))
+          .catch((cause) => setTestResult((current) => ({
+            ...current,
+            [target]: t('error.testFail', { error: reasonText({ error: cause?.message }, 'error.testFailed') })
+          })))
           .finally(() => setTesting(null))
       }
 
@@ -476,6 +572,8 @@ window.__ModuleLoader__.load({
       // *saved* audio-understanding endpoint one real question with a real sound,
       // and reports what actually came back (reachability, HTTP status, latency)
       // instead of guessing. The page cannot aim it at another URL on purpose.
+      // Every failing part names its cause through `reasonCode`, so the report
+      // reads as one language even though the server writes Chinese.
       const runValidate = () => {
         setValidating(true)
         setValidateText(null)
@@ -488,21 +586,30 @@ window.__ModuleLoader__.load({
             const text = await response.text()
             let body
             try { body = JSON.parse(text) } catch { throw new Error(t('error.httpNotJson', { status: response.status })) }
-            if (response.ok !== true || body?.ok !== true) throw new Error(body?.error ?? `HTTP ${response.status}`)
+            if (response.ok !== true || body?.ok !== true) {
+              // Only a malformed self-check request lands here; it still carries a
+              // reason code (`unsupported-target`), so translate it the same way.
+              const failure = body ?? {}
+              setValidateText(t('error.validateFailed', { error: reasonText({ ...failure, target: failure.target ?? 'check' }) }))
+              return
+            }
             const endpoint = body.endpoint ?? {}
+            const endpointText = endpoint.reachable === true
+              ? t('status.endpointReachable', { status: textOf(endpoint.status) })
+              : endpoint.reachable === null
+                ? t('status.endpointNotApplicable', { reason: reasonText(endpoint) })
+                : t('status.endpointUnreachable', { error: reasonText(endpoint) })
             const parts = [
-              endpoint.reachable === true
-                ? t('status.endpointReachable', { status: endpoint.status })
-                : t('status.endpointUnreachable', { error: endpoint.error ?? t('error.unknownReason') }),
+              endpointText,
               body.audioAccepted === true
-                ? t('status.audioAccepted', { ms: body.latencyMs })
-                : t('status.audioRejected', { error: body.error ?? t('error.unknownReason') })
+                ? t('status.audioAccepted', { ms: textOf(body.latencyMs) })
+                : t('status.audioRejected', { error: reasonText({ ...body, target: body.target ?? 'check' }) })
             ]
-            if (body.answer) parts.push(t('status.answer', { answer: body.answer }))
-            parts.push(`${body.model || t('status.noModel')}`)
+            if (textOf(body.answer) !== '') parts.push(t('status.answer', { answer: textOf(body.answer) }))
+            parts.push(textOf(body.model) !== '' ? textOf(body.model) : t('status.noModel'))
             setValidateText(parts.join(' · '))
           })
-          .catch((cause) => setValidateText(t('error.validateFailed', { error: cause.message })))
+          .catch((cause) => setValidateText(t('error.validateFailed', { error: reasonText({ error: cause?.message }) })))
           .finally(() => setValidating(false))
       }
 

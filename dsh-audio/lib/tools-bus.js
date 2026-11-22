@@ -17,24 +17,26 @@
  * stereo file — the report says so rather than hiding it.
  */
 
-import { stat } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import { basename, extname, join, relative } from 'node:path'
 import {
   defaultOutputPath,
   finalize,
   hashSpec,
   measure,
-  readTrack,
   renderPreset,
   resolvePath,
   writeFileAtomic
 } from './audio.js'
 import { BUS_LIMITS, renderBus } from './bus.js'
+import { CHANNEL_COUNTS, encodeAnyWav, layoutFor } from './multichannel.js'
 import { STEM_BIT_DEPTHS, packageStems, renderStems } from './stems.js'
-import { encodeWavEx } from './wav-encode.js'
+import { decodeWav } from './wav.js'
 
 const TOOL = 'audio_bus'
 const DEFAULT_BIT_DEPTH = 16
+/** The extensible WAV writer behind multichannel output is integer PCM only. */
+const MULTICHANNEL_BIT_DEPTHS = [16, 24]
 /**
  * How many per-track summaries the one-line report names before it truncates.
  */
@@ -204,6 +206,29 @@ function readRenderRequest (raw, index) {
 }
 
 /**
+ * Read a wav file as its real channels.
+ *
+ * `audio.js`'s `readTrack` folds to mono, which would silently turn a 5.1 input
+ * into a mono layer. A multichannel bus needs the channels themselves, so the
+ * decode happens here with the same `decodeWav` the master tool uses.
+ */
+async function readChannelsFile (path) {
+  let bytes
+  try {
+    bytes = await readFile(path)
+  } catch (error) {
+    throw new Error(`cannot read ${path}: ${error.code ?? error.message}`)
+  }
+  let decoded
+  try {
+    decoded = decodeWav(bytes)
+  } catch (error) {
+    throw new Error(`cannot decode ${path}: ${error.message}`)
+  }
+  return { channels: decoded.channels, sampleRate: decoded.sampleRate }
+}
+
+/**
  * Load every source once. A path shared by two tracks (a bed that also drives a
  * duck, say) is read once; an inline render spec is rendered once. The cache key
  * is the request itself, so two identical renders never drift apart.
@@ -215,10 +240,10 @@ async function loadSources (cwd, specs) {
     const key = `path:${path}`
     if (!cache.has(key)) {
       try {
-        cache.set(key, await readTrack(path))
+        cache.set(key, await readChannelsFile(path))
       } catch (error) {
-        // `readTrack` already says "cannot read <path>: ENOENT"; prefixing the
-        // tool name is enough, repeating the sentence reads like a bug.
+        // `readChannelsFile` already says "cannot read <path>: ENOENT"; prefixing
+        // the tool name is enough, repeating the sentence reads like a bug.
         throw new Error(`${TOOL}: ${error.message}`)
       }
     }
@@ -239,7 +264,7 @@ async function loadSources (cwd, specs) {
       // Same finalise as `audio_synth`: a track rendered inline has to equal the
       // file that tool would have written, or the bus changes the sound.
       finalize(rendered.samples, rendered.sampleRate, -1, { loop: rendered.spec.loop === true })
-      cache.set(key, { samples: rendered.samples, sampleRate: rendered.sampleRate })
+      cache.set(key, { channels: [rendered.samples], sampleRate: rendered.sampleRate })
     }
     return cache.get(key)
   }
@@ -250,18 +275,18 @@ async function loadSources (cwd, specs) {
       const path = resolvePath(cwd, spec.path)
       if (path === undefined) throw new Error(`${TOOL}: tracks[${spec.index}] path is empty`)
       const track = await loadPath(path)
-      sources.push({ samples: track.samples, sampleRate: track.sampleRate, id: spec.name ?? basename(path, extname(path)) })
+      sources.push({ channels: track.channels, sampleRate: track.sampleRate, id: spec.name ?? basename(path, extname(path)) })
       continue
     }
     const request = spec.render
     const rendered = await loadRender(request)
-    sources.push({ samples: rendered.samples, sampleRate: rendered.sampleRate, id: spec.name ?? request.preset })
+    sources.push({ channels: rendered.channels, sampleRate: rendered.sampleRate, id: spec.name ?? request.preset })
   }
 
   return { sources, loadPath }
 }
 
-/** Resolve a track's `duckFrom` into samples renderBus can use. */
+/** Resolve a track's `duckFrom` into channels renderBus can use. */
 async function resolveSidechain (cwd, specs, sources, index, loadPath) {
   const reference = specs[index].duckFrom
   if (reference === undefined || reference === null) return undefined
@@ -270,14 +295,14 @@ async function resolveSidechain (cwd, specs, sources, index, loadPath) {
       throw new Error(`${TOOL}: tracks[${index}].duckFrom is a track index and must be a whole number between 0 and ${specs.length - 1}, got ${describeValue(reference)}`)
     }
     if (reference === index) throw new Error(`${TOOL}: tracks[${index}] cannot duck from itself`)
-    return { samples: sources[reference].samples, sampleRate: sources[reference].sampleRate, label: `track ${reference}` }
+    return { channels: sources[reference].channels, sampleRate: sources[reference].sampleRate, label: `track ${reference}` }
   }
   if (typeof reference === 'string') {
     if (reference.trim() === '') throw new Error(`${TOOL}: tracks[${index}].duckFrom path is empty`)
     const path = resolvePath(cwd, reference)
     if (path === undefined) throw new Error(`${TOOL}: tracks[${index}].duckFrom path is empty`)
     const track = await loadPath(path)
-    return { samples: track.samples, sampleRate: track.sampleRate, label: basename(path, extname(path)) }
+    return { channels: track.channels, sampleRate: track.sampleRate, label: basename(path, extname(path)) }
   }
   throw new Error(`${TOOL}: tracks[${index}].duckFrom must be a track index or a .wav path, got ${describeValue(reference)}`)
 }
@@ -300,14 +325,23 @@ function buildChain (spec, sidechain) {
   }
   if (spec.compressor !== undefined) chain.push({ type: 'compressor', ...spec.compressor })
   if (sidechain !== undefined) {
-    chain.push({ type: 'duck', sidechain: { samples: sidechain.samples, sampleRate: sidechain.sampleRate }, ...DEFAULT_DUCK, ...(spec.duck ?? {}) })
+    chain.push({ type: 'duck', sidechain: { channels: sidechain.channels, sampleRate: sidechain.sampleRate }, ...DEFAULT_DUCK, ...(spec.duck ?? {}) })
   }
   return chain
+}
+
+/** `mono`, `stereo`, or `6-ch 5.1` — the label a model needs to read a bus report. */
+function channelLabel (channels) {
+  if (channels === 1) return 'mono'
+  if (channels === 2) return 'stereo'
+  return `${channels}-ch ${layoutFor(channels).id}`
 }
 
 /** A short per-track fragment for the one-line report. */
 function trackBrief (statistics, sidechainLabel) {
   const parts = [statistics.id]
+  if (statistics.channels > 2) parts.push(`${statistics.channels}ch`)
+  if (statistics.fit !== undefined && statistics.fit.kind !== 'identity') parts.push(`mix ${statistics.fit.from}->${statistics.fit.to}`)
   if (statistics.chain.length > 0) parts.push(statistics.chain.join('+'))
   if (statistics.gainReductionDb > 0.05) parts.push(`GR ${fmt(statistics.gainReductionDb)} dB`)
   if (statistics.maxDuckDb > 0.05) parts.push(`duck ${fmt(statistics.maxDuckDb)} dB${sidechainLabel === undefined ? '' : ` from ${sidechainLabel}`}`)
@@ -321,7 +355,7 @@ function summaryLine (cwd, summary) {
   const more = summary.tracks.length > tracks.length ? ` (+${summary.tracks.length - tracks.length} more)` : ''
   const parts = [
     `Wrote bus ${displayPath(cwd, summary.path)}`,
-    `${summary.tracks.length} track(s), ${fmt(summary.durationSeconds, 3)}s, ${summary.sampleRate} Hz, ${summary.bitDepth}-bit ${summary.channels === 2 ? 'stereo' : 'mono'}`,
+    `${summary.tracks.length} track(s), ${fmt(summary.durationSeconds, 3)}s, ${summary.sampleRate} Hz, ${summary.bitDepth}-bit ${channelLabel(summary.channels)}`,
     sizeLabel(summary.bytes),
     `peak ${fmt(summary.metrics.peakDbfs)} dBFS`,
     `rms ${fmt(summary.metrics.rmsDbfs)} dBFS`,
@@ -330,6 +364,14 @@ function summaryLine (cwd, summary) {
     summary.meter.gainReductionDb > 0.05 ? `max track GR ${fmt(summary.meter.gainReductionDb)} dB` : null,
     `tracks ${tracks.join(', ')}${more}`
   ]
+  if (summary.channels > 2) {
+    // Per-channel peaks and the one master gain are the two numbers that say a
+    // surround file is balanced and unclipped without opening it.
+    const names = summary.channelNames.join('/')
+    parts.push(`channels ${names} peaks ${summary.metrics.channelPeaksDbfs.map((peak) => fmt(peak)).join('/')} dBFS`)
+    parts.push(`mix gain ${fmt(summary.meter.master.mixGainDb)} dB`)
+    if (summary.metrics.monoFoldPeakDbfs !== undefined) parts.push(`mono fold peak ${fmt(summary.metrics.monoFoldPeakDbfs)} dBFS`)
+  }
   if (summary.stems !== undefined && summary.stems !== null) {
     parts.push(`stems ${displayPath(cwd, summary.stems.outDir)}: ${summary.stems.files.length} mono layer(s) + ${summary.stems.manifestFile}, max sum error ${summary.stems.maxAbsError.toExponential(2)}${summary.channels === 2 ? ' (stems are pre-pan, so they sum to the un-panned mix)' : ''}`)
   }
@@ -341,7 +383,7 @@ function summaryLine (cwd, summary) {
 export function registerBusTools (ctx) {
   ctx.tools.register({
     name: 'audio_bus',
-    description: 'Assemble a cue through a processing bus: per-track high-pass, low-pass, bell, shelf, compressor, sidechain duck `duckFrom`, gain, offset, pan and width, then a master drive/limiter/peak stage. Use it instead of audio_mix when the layers have to be cleaned, tucked, glued or placed rather than merely summed; every processor reports its gain reduction so the result can be judged without listening. With stems:true the processed mono layers are also exported through lib/stems.js (one file per track, a master that equals their sum, and a stems.json manifest).',
+    description: 'Assemble a cue through a processing bus: per-track high-pass, low-pass, bell, shelf, compressor, sidechain duck `duckFrom`, gain, offset, pan and width, then a master drive/limiter/peak stage. Use it instead of audio_mix when the layers have to be cleaned, tucked, glued or placed rather than merely summed; every processor reports its gain reduction so the result can be judged without listening. Inputs may be mono, stereo or 4/6/8-channel files: the master follows the widest input (or `channels`), stereo processors link their detector across all channels, and a narrower input is upmixed / a wider one downmixed with LFE excluded from the fold. With stems:true the processed mono layers are also exported through lib/stems.js (one file per track, a master that equals their sum, and a stems.json manifest); stems are mono-only and refused when the bus or any layer is wider than mono.',
     parameters: {
       type: 'object',
       properties: {
@@ -359,8 +401,8 @@ export function registerBusTools (ctx) {
               },
               gainDb: { type: 'number', description: 'Track gain in dB, applied before the chain (finite, -120..24; default 0).' },
               offsetSeconds: { type: 'number', description: 'Where the layer starts on the timeline, in seconds (finite, 0..180; default 0).' },
-              pan: { type: 'number', description: 'Constant-power pan -1..1 (default 0). Centre is unity in both channels; hard pan is +3 dB in one and silence in the other.' },
-              width: { type: 'number', description: 'Mid/side width 0..2 (default 1). 0 folds the panned image to mono at the mid level, 2 doubles the side.' },
+              pan: { type: 'number', description: 'Constant-power pan -1..1 (default 0). Centre is unity in both channels; hard pan is +3 dB in one and silence in the other. Only applies to a mono source: a multichannel input already has a layout.' },
+              width: { type: 'number', description: 'Mid/side width 0..2 (default 1). 0 folds the panned image to mono at the mid level, 2 doubles the side. Only applies to a mono source.' },
               highpassHz: { type: 'number', description: 'Second-order high-pass corner in Hz (10..48000). Removes rumble and DC.' },
               lowpassHz: { type: 'number', description: 'Second-order low-pass corner in Hz. Tucks a bed under dialogue.' },
               peaking: {
@@ -421,7 +463,7 @@ export function registerBusTools (ctx) {
         limiter: { type: 'boolean', description: 'Soft-limit the master above the knee; defaults to true.' },
         sampleRate: { type: 'integer', description: 'Output rate in Hz (8000..96000); defaults to the highest input rate.' },
         bitDepth: { type: 'integer', enum: STEM_BIT_DEPTHS, description: '8=smallest (inline HTML), 16=CD (default), 24=video master, 32=IEEE float intermediate.' },
-        channels: { type: 'integer', enum: [1, 2], description: '1=mono, 2=stereo. Defaults to 2 when any track is panned, else 1.' },
+        channels: { type: 'integer', enum: [...CHANNEL_COUNTS], description: 'Output channel count: 1 mono, 2 stereo, 4 quad, 6 5.1 (FL FR FC LFE BL BR), 8 7.1 (FL FR FC LFE BL BR SL SR). Defaults to the widest input, else 2 when any track is panned, else 1. Every track is up/downmixed to it with LFE excluded from downmixes.' },
         stems: { type: 'boolean', description: 'Also export the processed mono layers through lib/stems.js: <layer>.wav per track, master.wav, and a stems.json manifest. Defaults to false.' },
         outDir: { type: 'string', description: 'Directory for the stem set, relative to the working directory. Only used with stems; defaults to assets/audio/bus-stems-<hash>.' },
         out: { type: 'string', description: 'Master output path, relative to the working directory. Defaults to assets/audio/bus-<hash>.wav.' }
@@ -453,8 +495,8 @@ export function registerBusTools (ctx) {
         throw new Error(`${TOOL}: bitDepth must be one of ${STEM_BIT_DEPTHS.join(', ')}, got ${describeValue(args.bitDepth)}`)
       }
       const channels = readNumber('channels', args.channels)
-      if (channels !== undefined && channels !== 1 && channels !== 2) {
-        throw new Error(`${TOOL}: channels must be 1 or 2, got ${describeValue(args.channels)}`)
+      if (channels !== undefined && !CHANNEL_COUNTS.includes(channels)) {
+        throw new Error(`${TOOL}: channels must be one of ${CHANNEL_COUNTS.join(', ')} (1 mono, 2 stereo, 4 quad, 6 5.1, 8 7.1), got ${describeValue(args.channels)}`)
       }
       const requestedRate = readRange('sampleRate', args.sampleRate, BUS_LIMITS.minSampleRate, BUS_LIMITS.maxSampleRate)
       const masterPeakDbfs = readRange('masterPeakDbfs', args.masterPeakDbfs, BUS_LIMITS.minMasterPeakDbfs, BUS_LIMITS.maxMasterPeakDbfs) ?? -1
@@ -475,7 +517,7 @@ export function registerBusTools (ctx) {
         sidechainLabels[index] = sidechain?.label
         busTracks.push({
           id: sources[index].id,
-          samples: sources[index].samples,
+          channels: sources[index].channels,
           sampleRate: sources[index].sampleRate,
           gainDb: spec.gainDb,
           offsetSeconds: spec.offsetSeconds,
@@ -491,12 +533,27 @@ export function registerBusTools (ctx) {
         master: { peakDbfs: masterPeakDbfs, limiter, drive: driveDb }
       })
 
+      // The extensible writer that carries a channel mask is integer PCM only;
+      // refusing an 8/32-bit surround file is honest, writing it under a header
+      // that lies about the format is not.
+      if (bus.channels > 2 && !MULTICHANNEL_BIT_DEPTHS.includes(bitDepth)) {
+        throw new Error(`${TOOL}: a ${bus.channels}-channel bus must be written at ${MULTICHANNEL_BIT_DEPTHS.join(' or ')} bits (the extensible WAV writer), got ${bitDepth}-bit`)
+      }
+      // A stem set is mono layers that sum to a mono master (`lib/stems.js`'s
+      // contract). A surround bus has no such set, so say so instead of writing
+      // stems that reconstruct something else.
+      if (includeStems && (bus.channels > 2 || bus.stems.some((stem) => stem.channelCount > 1))) {
+        throw new Error(`${TOOL}: stems are mono pre-pan layers that sum to the master (lib/stems.js); a bus with stereo or surround layers has no mono stem set that reconstructs it, so omit stems`)
+      }
+
       // The encoded file is exactly what renderBus produced: the bus's master
       // stage is the final stage, so no extra normalisation is applied here.
-      const channelBuffers = bus.channels === 2
-        ? [bus.master.channelSamples[0], bus.master.channelSamples[1]]
-        : [bus.master.samples]
-      const bytes = encodeWavEx(channelBuffers, bus.sampleRate, { bitDepth, channels: bus.channels })
+      let bytes
+      try {
+        bytes = encodeAnyWav(bus.master.channelSamples, bus.sampleRate, { bitDepth })
+      } catch (error) {
+        throw new Error(`${TOOL}: ${error.message}`)
+      }
 
       const hash = hashSpec({
         kind: 'bus',
@@ -535,6 +592,7 @@ export function registerBusTools (ctx) {
         crestDb: bus.master.crestDb,
         clipping: bus.master.clipping,
         channelPeaksDbfs: bus.master.channelPeaksDbfs,
+        channelLayout: bus.master.channelLayout,
         monoFoldPeakDbfs: bus.master.monoFoldPeakDbfs,
         centroidHz: monoMetrics.centroidHz,
         onsets: monoMetrics.onsets,
@@ -590,10 +648,13 @@ export function registerBusTools (ctx) {
         sampleRate: bus.sampleRate,
         bitDepth,
         channels: bus.channels,
+        channelNames: bus.channelNames,
         bytes: info.size ?? bytes.length,
         metrics,
         tracks: bus.meter.trackStats.map((statistics, index) => ({
           id: statistics.id,
+          channels: statistics.channels,
+          fit: statistics.fit,
           chain: statistics.chain,
           offsetSeconds: statistics.offsetSeconds,
           gainDb: statistics.gainDb,
@@ -622,11 +683,15 @@ export function registerBusTools (ctx) {
         sampleRate: summary.sampleRate,
         bitDepth: summary.bitDepth,
         channels: summary.channels,
+        channelLayout: bus.channelLayout,
+        channelNames: bus.channelNames,
+        channelPeaksDbfs: bus.master.channelPeaksDbfs,
         metrics,
         tracks: summary.tracks,
         gainReductionDb: summary.meter.gainReductionDb,
         master: {
           driveDb: bus.master.driveDb,
+          mixGainDb: bus.master.mixGainDb,
           gainDb: bus.master.gainDb,
           limiterEngaged: bus.master.limiterEngaged,
           limiterReductionDb: bus.master.limiterReductionDb

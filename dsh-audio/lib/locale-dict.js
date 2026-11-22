@@ -15,10 +15,14 @@
  * the copy inside `client.js`.
  *
  * Keys are grouped by surface (`page.*`, `field.*`, `provider.*`, `tts.*`,
- * `check.*`, `status.*`, `error.*`, `buttons.*`, `note.*`). The Chinese values
- * are the page's original wording, character for character. Placeholders use
- * the host's `{name}` form, so one template syntax serves both this helper and
- * the Client locale service.
+ * `check.*`, `status.*`, `error.*`, `reason.*`, `buttons.*`, `note.*`). The
+ * Chinese values are the page's original wording, character for character.
+ * `reason.*` is special: one key per value of `REASON_CODES` in
+ * `lib/settings-route.js`, the machine-readable failure code the host route
+ * sends, so the page can show a provider/environment failure in the reader's
+ * language instead of pasting the server's Chinese sentence into it.
+ * Placeholders use the host's `{name}` form, so one template syntax serves both
+ * this helper and the Client locale service.
  *
  * Values must stay free of apostrophes, backslashes and newlines: the copy
  * embedded in `client.js` is a single-quoted JavaScript literal, and the test
@@ -95,6 +99,7 @@ export const zh = {
   'status.restartTimeout': '已保存，但页面没等到插件重启；刷新一下确认',
   'status.endpointReachable': '端点可达（HTTP {status}）',
   'status.endpointUnreachable': '端点不可达：{error}',
+  'status.endpointNotApplicable': '端点探测不适用：{reason}',
   'status.audioAccepted': '模型接受音频输入（{ms} ms）',
   'status.audioRejected': '模型未通过：{error}',
   'status.answer': '回答：{answer}',
@@ -109,6 +114,17 @@ export const zh = {
   'error.testFail': '失败：{error}',
   'error.unknownReason': '未知原因',
   'error.validateFailed': '校验失败：{error}',
+
+  /* ---- server failure reasons, one per REASON_CODES entry ---- */
+  'reason.missing-key': '缺少 API 密钥（{env}）',
+  'reason.endpoint-unreachable': '连接失败',
+  'reason.http-4xx': '供应商拒绝了请求（HTTP {status}）',
+  'reason.http-5xx': '供应商服务出错（HTTP {status}）',
+  'reason.not-audio': '供应商返回的内容不可用',
+  'reason.no-base-url': '没有可用的接口地址',
+  'reason.provider-none': '旁白已关闭（provider = none）',
+  'reason.decoder-missing': '缺少解码器（Edge 需要 ffmpeg）',
+  'reason.unsupported-target': '不支持的目标（{target}）',
 
 
   /* ---- buttons ---- */
@@ -190,6 +206,7 @@ export const en = {
   'status.restartTimeout': 'Saved, but the page never saw the plugin restart; refresh to confirm',
   'status.endpointReachable': 'Endpoint reachable (HTTP {status})',
   'status.endpointUnreachable': 'Endpoint unreachable: {error}',
+  'status.endpointNotApplicable': 'Endpoint probe not applicable: {reason}',
   'status.audioAccepted': 'Model accepted the audio input ({ms} ms)',
   'status.audioRejected': 'Model failed: {error}',
   'status.answer': 'Answer: {answer}',
@@ -204,6 +221,17 @@ export const en = {
   'error.testFail': 'Failed: {error}',
   'error.unknownReason': 'unknown reason',
   'error.validateFailed': 'Validation failed: {error}',
+
+  /* ---- server failure reasons, one per REASON_CODES entry ---- */
+  'reason.missing-key': 'missing API key ({env})',
+  'reason.endpoint-unreachable': 'connection failed',
+  'reason.http-4xx': 'provider rejected the request (HTTP {status})',
+  'reason.http-5xx': 'provider service error (HTTP {status})',
+  'reason.not-audio': 'provider returned no usable content',
+  'reason.no-base-url': 'no usable endpoint URL',
+  'reason.provider-none': 'narration is off (provider = none)',
+  'reason.decoder-missing': 'decoder missing (Edge needs ffmpeg)',
+  'reason.unsupported-target': 'unsupported target ({target})',
 
   /* ---- buttons ---- */
   'buttons.save': 'Save',

@@ -35,6 +35,17 @@
  *     it rather than inventing a meaning the wav does not have), and
  *     `whoosh.speed`, which live does use (it sharpens the band-pass sweep).
  *
+ * The fixed graph is only half of an interactive sound: a page also wants a
+ * voice to *move* -- a swing whose filter opens, a riser whose pitch climbs, a
+ * UI blip that pans. `automation` closes that gap without a second module: a
+ * lane is declarative data (`{ target, from, to, duration, curve, start, lfo }`),
+ * the host validates and previews it (`validateAutomation`, `renderLiveSpec`),
+ * and the emitted script schedules it on the AudioContext clock
+ * (`setValueAtTime`/`linearRampToValueAtTime`/`exponentialRampToValueAtTime`
+ * plus an oscillator for an LFO). The automation runtime is spliced into the
+ * script only when a build asks for it, so a script built with no lanes stays
+ * byte-for-byte what it was before automation existed.
+ *
  * House rules for this file: the designers and the runtime below are emitted into
  * the page (squeezed by `squeezeSource`), so they must be self-contained -- no
  * closures over module state, no imports, only helpers passed in as `h` or
@@ -48,6 +59,94 @@ export const LIVE_FORMAT = 'dsh-live-graph'
 
 /** Script format version. Bumped only when the `window.dshLive` surface changes. */
 export const LIVE_VERSION = '1.0.0'
+
+/**
+ * Script version a build reports when it carries automation. A page can read
+ * `dshLive.version` and know whether `play(name, params, options)` accepts lanes;
+ * a script built with no lanes keeps reporting `LIVE_VERSION` so its bytes do
+ * not change when this feature is unused.
+ */
+export const LIVE_AUTOMATION_VERSION = '1.1.0'
+
+/* ------------------------------------------------- automation vocabulary -- */
+
+/** Hard ceiling on lanes per voice; keeps the emitted spec (and the graph) bounded. */
+export const MAX_AUTOMATION_LANES = 32
+
+/** Longest lane (and latest lane start) in seconds. */
+export const MAX_AUTOMATION_SECONDS = 60
+
+/**
+ * The five AudioParams an automation lane may drive, each with the unit its
+ * `from`/`to` values are expressed in and the range `validateAutomation`
+ * enforces. A lane cannot ask a WebAudio parameter for a value the API would
+ * clamp anyway: a model that types `pitch: 4000` gets a readable error instead
+ * of a silent clamp, because a silently clamped automation curve is a sound
+ * that does not do what the model believes it does.
+ *
+ * `lfoMax` bounds `lfo.depth` in the same unit. `pitch` lands on every
+ * oscillator's `detune` (and on a noise source's `playbackRate`, so a pitch lane
+ * moves a bed too); the other four each get one voice-wide node, created only
+ * when a lane (or an LFO) targets it. That is why adding automation to a play
+ * call can add nodes but a play with no lanes never does.
+ * @type {Record<string, {unit: string, min: number, max: number, lfoMax: number, param: string, description: string}>}
+ */
+export const AUTOMATION_TARGETS = Object.freeze({
+  pitch: Object.freeze({
+    unit: 'cents',
+    min: -2400,
+    max: 2400,
+    lfoMax: 2400,
+    param: 'detune',
+    description: 'Detune of every oscillator in the voice, and the playback rate of every noise source; 1200 cents is one octave.'
+  }),
+  filter: Object.freeze({
+    unit: 'Hz',
+    min: 20,
+    max: 20000,
+    lfoMax: 10000,
+    param: 'frequency',
+    description: 'Cutoff of a voice-wide low-pass biquad that exists only when a filter lane or filter LFO asks for it.'
+  }),
+  gain: Object.freeze({
+    unit: 'dB',
+    min: -60,
+    max: 12,
+    lfoMax: 24,
+    param: 'gain',
+    description: 'Trim of a voice-wide gain node, separate from the mix compensation, so a lane is a musical level ride.'
+  }),
+  pan: Object.freeze({
+    unit: 'pan',
+    min: -1,
+    max: 1,
+    lfoMax: 1,
+    param: 'pan',
+    description: 'Stereo position of a voice-wide StereoPannerNode; -1 hard left, +1 hard right.'
+  }),
+  send: Object.freeze({
+    unit: 'send',
+    min: 0,
+    max: 1,
+    lfoMax: 1,
+    param: 'gain',
+    description: 'Amount sent to the shared reverb network; 0 is dry. A preset with no space gets a small default room.'
+  })
+})
+
+/** The lane interpolation shapes, in the order every schema and message offers them. */
+export const AUTOMATION_CURVES = Object.freeze(['linear', 'exp', 'sine', 'step'])
+
+/** The lane targets in canonical order. */
+export const AUTOMATION_TARGET_NAMES = Object.freeze(Object.keys(AUTOMATION_TARGETS))
+
+/**
+ * `[min, max, lfoMax]` per target: the compact table the emitted script carries,
+ * because the shared lane helper is stringified into the page and cannot close
+ * over this module's objects.
+ */
+const AUTOMATION_LIMITS = {}
+for (const [name, def] of Object.entries(AUTOMATION_TARGETS)) AUTOMATION_LIMITS[name] = [def.min, def.max, def.lfoMax]
 
 /* --------------------------------------------------------------- helpers -- */
 /* These are emitted into the page script verbatim, so each one is
@@ -176,6 +275,287 @@ function liveResolve (name, over, defaults, ranges, kinds) {
     if (allowed && allowed.indexOf(over.kind) >= 0) out.kind = over.kind
   }
   return out
+}
+
+/* ---------------------------------------------------------- automation -- */
+/* A lane is data, never a callback: `{ target, from, to, duration, curve,
+ * start, lfo }`. The host validates and previews it; the page schedules it on
+ * the AudioContext clock. Both sides run the same pure functions below (they
+ * are emitted into the page verbatim), which is what makes `renderLiveSpec` an
+ * honest preview of the events the page will actually schedule. */
+
+/**
+ * Normalise one lane against the target's limits. Returns `null` when the lane
+ * cannot be scheduled at all, so the page never throws on model-authored data:
+ * the host reports the error, the page drops the lane.
+ *
+ * The `60`/`32` literals are `MAX_AUTOMATION_SECONDS`/`MAX_AUTOMATION_LANES`:
+ * a literal is required here because this function is stringified into the page
+ * and must not close over module constants.
+ * @param {object} lane - raw lane.
+ * @param {object} ranges - `[min, max, lfoMax]` per target.
+ * @returns {object|null} canonical lane.
+ */
+function liveAutoLane (lane, ranges) {
+  if (lane === null || typeof lane !== 'object') return null
+  const limit = ranges[lane.target]
+  // `Array.isArray` rather than a truthiness check: a lane whose target is
+  // `"constructor"` must not pick up `Object` off the prototype chain.
+  if (!Array.isArray(limit)) return null
+  if (!isFinite(lane.from) || !isFinite(lane.to) || !isFinite(lane.duration)) return null
+  const out = {
+    target: lane.target,
+    from: liveClamp(lane.from, limit[0], limit[1]),
+    to: liveClamp(lane.to, limit[0], limit[1]),
+    start: isFinite(lane.start) ? liveClamp(lane.start, 0, 60) : 0,
+    duration: liveClamp(lane.duration, 0.01, 60),
+    curve: lane.curve === 'exp' || lane.curve === 'sine' || lane.curve === 'step' ? lane.curve : 'linear',
+    lfo: null
+  }
+  if (lane.lfo !== null && typeof lane.lfo === 'object') {
+    const lfoTarget = lane.lfo.target === undefined ? lane.target : lane.lfo.target
+    const lfoLimit = ranges[lfoTarget]
+    if (lfoLimit !== undefined && isFinite(lane.lfo.hz) && isFinite(lane.lfo.depth)) {
+      out.lfo = {
+        hz: liveClamp(lane.lfo.hz, 0.01, 40),
+        depth: liveClamp(lane.lfo.depth, 0, lfoLimit[2]),
+        target: lfoTarget
+      }
+    }
+  }
+  return out
+}
+
+/**
+ * Normalise a lane list, dropping entries a page cannot schedule and capping the
+ * count. The fixed key order makes two spellings of the same lane produce the
+ * same emitted bytes.
+ * @param {Array<object>} lanes - raw lanes.
+ * @param {object} ranges - `[min, max, lfoMax]` per target.
+ * @returns {Array<object>} canonical lanes.
+ */
+function liveAutoNorm (lanes, ranges) {
+  if (!Array.isArray(lanes)) return []
+  const out = []
+  for (let i = 0; i < lanes.length && out.length < 32; i += 1) {
+    const lane = liveAutoLane(lanes[i], ranges)
+    if (lane !== null) out.push(lane)
+  }
+  return out
+}
+
+/**
+ * Break one canonical lane into AudioParam events, with times in seconds from
+ * `base`. `curve` is expressed as the events a page can schedule:
+ *
+ *   - `linear`: one `setValueAtTime` then one `linearRampToValueAtTime`;
+ *   - `exp`: the same, but the ramp is exponential when both endpoints are
+ *     positive -- WebAudio's exponential formula is a ratio, so a ramp that
+ *     touches or crosses zero falls back to linear rather than producing NaN;
+ *   - `sine`: an S-curve sampled at eight points (a half-cosine ease, which is
+ *     what a sine interpolation means for a single move);
+ *   - `step`: hold `from`, then jump to `to` at the end (two `setValueAtTime`s).
+ *
+ * Times are strictly increasing for a positive `duration`.
+ * @param {object} lane - canonical lane.
+ * @param {number} base - voice start time on the context clock.
+ * @returns {Array<{type: 'set'|'linear'|'exponential', value: number, time: number}>}
+ */
+function automationEvents (lane, base) {
+  const t0 = base + lane.start
+  const span = lane.duration
+  const events = []
+  if (lane.curve === 'step') {
+    events.push({ type: 'set', value: lane.from, time: t0 })
+    events.push({ type: 'set', value: lane.to, time: t0 + span })
+    return events
+  }
+  if (lane.curve === 'sine') {
+    const steps = 8
+    events.push({ type: 'set', value: lane.from, time: t0 })
+    for (let i = 1; i <= steps; i += 1) {
+      const p = i / steps
+      const ease = 0.5 - 0.5 * Math.cos(Math.PI * p)
+      events.push({ type: 'linear', value: lane.from + (lane.to - lane.from) * ease, time: t0 + span * p })
+    }
+    return events
+  }
+  events.push({ type: 'set', value: lane.from, time: t0 })
+  if (lane.curve === 'exp' && lane.from > 0 && lane.to > 0) events.push({ type: 'exponential', value: lane.to, time: t0 + span })
+  else events.push({ type: 'linear', value: lane.to, time: t0 + span })
+  return events
+}
+
+/**
+ * Canonicalise a lane list for the host. `validateAutomation` decides whether a
+ * lane set is legal; this function clamps and fills defaults so the caller can
+ * hash, emit and describe the same data.
+ * @param {Array<object>} [lanes] - lane specs.
+ * @returns {Array<object>} canonical lanes in the documented key order.
+ */
+export function normalizeAutomation (lanes) {
+  return liveAutoNorm(lanes, AUTOMATION_LIMITS)
+}
+
+/** Render a value for an error message; JSON for strings so `""` is visible. */
+function describeValue (value) {
+  if (value === undefined) return 'undefined'
+  if (typeof value === 'string') return JSON.stringify(value)
+  return String(value)
+}
+
+/** The fields a lane and an LFO may carry; anything else is a typo worth naming. */
+const LANE_FIELDS = ['target', 'from', 'to', 'duration', 'start', 'curve', 'lfo']
+const LFO_FIELDS = ['hz', 'depth', 'target']
+
+/** True when `value` is a usable number (not a numeric string, not NaN). */
+function isNumber (value) {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+/**
+ * Check a lane list against the documented vocabulary. This is the gate the
+ * tool and the builders run before anything is emitted: a lane typo must be a
+ * readable error with a path (`automation[1].target: unknown target ...`), not a
+ * script that silently does nothing. Endpoint order is free: `from > to` is a
+ * descending lane (a closing filter, a fade-out, a duck) and is valid.
+ * @param {Array<object>} [lanes] - lane specs.
+ * @returns {{ok: boolean, errors: Array<{path: string, message: string}>}}
+ */
+export function validateAutomation (lanes) {
+  const errors = []
+  const add = (path, message) => errors.push({ path, message })
+  if (lanes === undefined || lanes === null) return { ok: true, errors }
+  if (!Array.isArray(lanes)) {
+    add('automation', 'automation must be an array of lane objects')
+    return { ok: false, errors }
+  }
+  if (lanes.length > MAX_AUTOMATION_LANES) add('automation', `automation has ${lanes.length} lane(s); the maximum is ${MAX_AUTOMATION_LANES}`)
+  for (let index = 0; index < lanes.length; index += 1) {
+    const path = `automation[${index}]`
+    const lane = lanes[index]
+    if (lane === null || typeof lane !== 'object' || Array.isArray(lane)) {
+      add(path, 'lane must be an object')
+      continue
+    }
+    for (const key of Object.keys(lane)) {
+      if (!LANE_FIELDS.includes(key)) add(`${path}.${key}`, `unknown lane field; a lane accepts ${LANE_FIELDS.join(', ')}`)
+    }
+    const target = lane.target
+    // A name that reads back off the prototype chain is not a target.
+    const def = typeof target === 'string' && AUTOMATION_TARGET_NAMES.includes(target) ? AUTOMATION_TARGETS[target] : undefined
+    if (typeof target !== 'string') add(`${path}.target`, `missing target; use one of ${AUTOMATION_TARGET_NAMES.join(', ')}`)
+    else if (def === undefined) add(`${path}.target`, `unknown target ${describeValue(target)}; use one of ${AUTOMATION_TARGET_NAMES.join(', ')}`)
+    if (def === undefined) continue
+    const checkValue = (key) => {
+      const value = lane[key]
+      if (value === undefined) { add(`${path}.${key}`, 'missing; a lane needs a start and an end value'); return }
+      if (!isNumber(value)) { add(`${path}.${key}`, `must be a finite number (got ${describeValue(value)})`); return }
+      if (value < def.min || value > def.max) add(`${path}.${key}`, `${value} is outside ${target}'s ${def.min}..${def.max} ${def.unit}`)
+    }
+    checkValue('from')
+    checkValue('to')
+    const duration = lane.duration
+    if (duration === undefined) add(`${path}.duration`, 'missing; a lane needs a length in seconds')
+    else if (!isNumber(duration)) add(`${path}.duration`, `must be a finite number of seconds (got ${describeValue(duration)})`)
+    else if (duration <= 0) add(`${path}.duration`, `must be greater than 0 s (got ${duration})`)
+    else if (duration > MAX_AUTOMATION_SECONDS) add(`${path}.duration`, `${duration}s is longer than the ${MAX_AUTOMATION_SECONDS} s limit; trim the lane or split it`)
+    if (lane.start !== undefined) {
+      if (!isNumber(lane.start)) add(`${path}.start`, `must be a finite number of seconds (got ${describeValue(lane.start)})`)
+      else if (lane.start < 0 || lane.start > MAX_AUTOMATION_SECONDS) add(`${path}.start`, `${lane.start}s is outside 0..${MAX_AUTOMATION_SECONDS} s`)
+    }
+    // Direction is not validated: `from > to` is a legitimate descending move
+    // (a closing filter sweep, a fade-out, a duck), and the event planner and
+    // the page scheduler treat it exactly like an ascending one.
+    if (lane.curve !== undefined && !AUTOMATION_CURVES.includes(lane.curve)) {
+      add(`${path}.curve`, `must be one of ${AUTOMATION_CURVES.join(', ')} (got ${describeValue(lane.curve)})`)
+    }
+    if (lane.lfo !== undefined && lane.lfo !== null) {
+      const lfo = lane.lfo
+      const lfoPath = `${path}.lfo`
+      if (typeof lfo !== 'object' || Array.isArray(lfo)) {
+        add(lfoPath, 'must be an object { hz, depth, target }')
+      } else {
+        for (const key of Object.keys(lfo)) {
+          if (!LFO_FIELDS.includes(key)) add(`${lfoPath}.${key}`, `unknown lfo field; an lfo accepts ${LFO_FIELDS.join(', ')}`)
+        }
+        if (!isNumber(lfo.hz)) add(`${lfoPath}.hz`, `must be a finite frequency in Hz (got ${describeValue(lfo.hz)})`)
+        else if (lfo.hz < 0.01 || lfo.hz > 40) add(`${lfoPath}.hz`, `${lfo.hz} Hz is outside 0.01..40 Hz`)
+        if (!isNumber(lfo.depth)) add(`${lfoPath}.depth`, `must be a finite depth in ${def.unit} (got ${describeValue(lfo.depth)})`)
+        else if (lfo.depth < 0 || lfo.depth > def.lfoMax) add(`${lfoPath}.depth`, `${lfo.depth} is outside 0..${def.lfoMax} ${def.unit}`)
+        if (lfo.target !== undefined && (typeof lfo.target !== 'string' || !AUTOMATION_TARGET_NAMES.includes(lfo.target))) {
+          add(`${lfoPath}.target`, `unknown target ${describeValue(lfo.target)}; use one of ${AUTOMATION_TARGET_NAMES.join(', ')}`)
+        }
+      }
+    }
+  }
+  return { ok: errors.length === 0, errors }
+}
+
+/**
+ * One human line for a validation result: `automation[0].target: ...`.
+ * @param {Array<{path: string, message: string}>} errors - from validateAutomation.
+ * @returns {string}
+ */
+export function formatAutomationErrors (errors) {
+  return errors.map((error) => `${error.path}: ${error.message}`).join('; ')
+}
+
+/**
+ * Describe, without a browser, which AudioParams each lane touches, in what
+ * order and with which values. `renderLiveSpec` returns this, which is what lets
+ * a test assert the schedule the page will build without an AudioContext.
+ * @param {object} spec - graph description from the designers.
+ * @param {Array<object>} lanes - canonical lanes.
+ * @param {number} durationSeconds - effective voice length.
+ * @returns {object} plain-JSON automation description.
+ */
+function automationDescription (spec, lanes, durationSeconds) {
+  const oscillatorCount = spec.layers.filter((layer) => layer.source.type === 'osc').length
+  const noiseCount = spec.layers.length - oscillatorCount
+  const described = []
+  let eventCount = 0
+  let scheduledParamEvents = 0
+  let lfoCount = 0
+  let lfoConnections = 0
+  for (let index = 0; index < lanes.length; index += 1) {
+    const lane = lanes[index]
+    const events = automationEvents(lane, 0)
+    const params = []
+    if (lane.target === 'pitch') {
+      if (oscillatorCount > 0) params.push({ param: 'oscillator.detune', nodes: oscillatorCount, unit: 'cents', map: 'identity' })
+      if (noiseCount > 0) params.push({ param: 'bufferSource.playbackRate', nodes: noiseCount, unit: 'ratio', map: '2^(cents/1200)' })
+    } else if (lane.target === 'filter') params.push({ param: 'biquad.frequency', nodes: 1, unit: 'Hz', map: 'identity' })
+    else if (lane.target === 'gain') params.push({ param: 'gain.gain', nodes: 1, unit: 'linear amplitude', map: '10^(dB/20)' })
+    else if (lane.target === 'pan') params.push({ param: 'stereoPanner.pan', nodes: 1, unit: 'pan', map: 'identity' })
+    else if (lane.target === 'send') params.push({ param: 'send.gain', nodes: 1, unit: 'send', map: 'identity' })
+    let paramEvents = 0
+    for (const entry of params) paramEvents += entry.nodes * events.length
+    let lfo = null
+    if (lane.lfo !== null) {
+      const nodes = lane.lfo.target === 'pitch' ? oscillatorCount : 1
+      lfo = { target: lane.lfo.target, hz: lane.lfo.hz, depth: lane.lfo.depth, nodes: nodes, oscillator: 'sine' }
+      lfoCount += 1
+      lfoConnections += nodes
+    }
+    eventCount += events.length
+    scheduledParamEvents += paramEvents
+    described.push({
+      index,
+      target: lane.target,
+      unit: AUTOMATION_TARGETS[lane.target].unit,
+      from: lane.from,
+      to: lane.to,
+      start: lane.start,
+      duration: lane.duration,
+      curve: lane.curve,
+      events,
+      params,
+      scheduledParamEvents: paramEvents,
+      lfo
+    })
+  }
+  return { lanes: described, eventCount, scheduledParamEvents, lfoCount, lfoConnections, durationSeconds }
 }
 
 /* -------------------------------------------------------------- presets -- */
@@ -505,9 +885,12 @@ export const LIVE_PRESET_NAMES = CORE_NAMES.slice()
  * (`white|pink|brown|drops|pops`) and a buffer length.
  * @param {string} name - preset id, one of LIVE_PRESET_NAMES.
  * @param {object} [params] - perceptual knobs; unknown keys are ignored.
- * @param {{seed?: number, sampleRate?: number}} [options] - seed for the
- *   per-call random stream (ring gains, grain placement) and the sample rate.
- * @returns {object} plain-JSON graph description.
+ * @param {{seed?: number, sampleRate?: number, automation?: Array<object>, duration?: number}} [options]
+ *   seed for the per-call random stream (ring gains, grain placement), the
+ *   sample rate, a lane list to describe, and an optional voice duration in
+ *   seconds that the page would apply on top of the preset length.
+ * @returns {object} plain-JSON graph description; `automation` is `null` when no
+ *   lane list was passed, otherwise the scheduled events per param.
  */
 export function renderLiveSpec (name, params = {}, options = {}) {
   if (LIVE_PRESETS[name] === undefined) {
@@ -517,19 +900,30 @@ export function renderLiveSpec (name, params = {}, options = {}) {
   const sampleRate = Number.isFinite(options.sampleRate) ? options.sampleRate : 44100
   const resolved = liveResolve(name, params, LIVE_DEFAULTS, LIVE_RANGES, LIVE_KINDS)
   const body = LIVE_PRESETS[name].design(resolved, liveHelpers(liveRng(`spec:${name}:${seed}`)))
-  return {
+  const durationSeconds = body.duration ?? LIVE_DURATIONS[name]
+  const spec = {
     format: LIVE_FORMAT,
     version: LIVE_VERSION,
     name,
     loop: body.loop === true,
-    durationSeconds: body.duration ?? LIVE_DURATIONS[name],
+    durationSeconds,
     sampleRate,
     seed,
     params: resolved,
     layers: body.layers,
     space: body.space ?? null,
-    master: body.master
+    master: body.master,
+    automation: null
   }
+  if (options.automation !== undefined && options.automation !== null) {
+    const verdict = validateAutomation(options.automation)
+    if (!verdict.ok) throw new Error(`renderLiveSpec: invalid automation; ${formatAutomationErrors(verdict.errors)}`)
+    // A page applies `duration` to the voice, not to the preset, so the preview
+    // reports the length the lanes are actually scheduled against.
+    const voiceSeconds = Number.isFinite(options.duration) ? liveClamp(options.duration, 0.02, MAX_AUTOMATION_SECONDS) : durationSeconds
+    spec.automation = automationDescription(spec, normalizeAutomation(options.automation), voiceSeconds)
+  }
+  return spec
 }
 
 /* ------------------------------------------------------------- emitted JS -- */
@@ -828,6 +1222,272 @@ const RUNTIME = squeezeSource([
 ].join('\n'))
 
 
+/* --------------------------------------------------- automation runtime -- */
+/* Emitted into the page only when a build asks for automation. A script built
+ * with no lanes must stay byte-for-byte what it was, so `RUNTIME` above is left
+ * untouched and this block is spliced in front of its `var api` line by
+ * `automationRuntimeBlock`. `livePlayAuto` replaces `play`: the voice limit,
+ * limiter, mix compensation and every layer still come from the same functions,
+ * and the lanes are scheduled after the graph exists so a lane can address the
+ * oscillators belonging to *this* voice. */
+
+/** Cents to playback-rate ratio, for detuning a noise source. */
+function automationRate (cents) {
+  return Math.pow(2, cents / 1200)
+}
+
+/** dB to linear amplitude, for the voice gain node. */
+function automationGain (db) {
+  return Math.pow(10, db / 20)
+}
+
+/**
+ * Schedule one lane's events on one AudioParam. `map` converts the lane's native
+ * unit into the parameter's unit (null when they are the same); an exponential
+ * event that would land on a non-positive value degrades to a linear ramp, which
+ * is the difference between a quiet sound and a NaN.
+ */
+function automationParam (param, events, map) {
+  for (let i = 0; i < events.length; i += 1) {
+    const event = events[i]
+    const value = map === null ? event.value : map(event.value)
+    if (event.type === 'exponential' && value > 0) param.exponentialRampToValueAtTime(value, event.time)
+    else if (event.type === 'set') param.setValueAtTime(value, event.time)
+    else param.linearRampToValueAtTime(value, event.time)
+  }
+}
+
+/**
+ * Build the voice-wide nodes the lanes need and wire them bus -> ... -> limiter.
+ * Nothing is created when no lane needs it, which keeps a play with empty
+ * automation identical to a play on a build without automation at all.
+ */
+function automationBuild (bus, lanes, plan) {
+  if (lanes === null || lanes.length === 0) {
+    bus.connect(limiter)
+    return null
+  }
+  const need = { gain: false, filter: false, pan: false, send: false }
+  for (let i = 0; i < lanes.length; i += 1) {
+    const lane = lanes[i]
+    if (need[lane.target] !== undefined) need[lane.target] = true
+    if (lane.lfo !== null) {
+      // An LFO targeting a parameter still needs the node that carries it.
+      if (need[lane.lfo.target] !== undefined) need[lane.lfo.target] = true
+    }
+  }
+  const auto = { gain: null, filter: null, pan: null, send: null }
+  let node = bus
+  if (need.gain) {
+    auto.gain = ctx.createGain()
+    node.connect(auto.gain)
+    node = auto.gain
+  }
+  if (need.filter) {
+    auto.filter = ctx.createBiquadFilter()
+    auto.filter.type = 'lowpass'
+    auto.filter.frequency.value = 12000
+    auto.filter.Q.value = 0.7
+    node.connect(auto.filter)
+    node = auto.filter
+  }
+  if (need.pan && typeof ctx.createStereoPanner === 'function') {
+    auto.pan = ctx.createStereoPanner()
+    auto.pan.pan.value = 0
+    node.connect(auto.pan)
+    node = auto.pan
+  }
+  node.connect(limiter)
+  if (need.send && plan.space === null) {
+    // The preset has no space of its own, so a send lane needs a small room to
+    // send into. The shared `spaces` cache keeps it to one network per page.
+    auto.send = ctx.createGain()
+    auto.send.gain.value = 0
+    bus.connect(auto.send)
+    auto.send.connect(spaceIn({ amount: 0, feedback: 0.45, damping: 3400, spread: 0 }))
+  }
+  return auto
+}
+
+/**
+ * Start one LFO and connect it additively to every param its target names. The
+ * depth gain is what an AudioParam receives as an offset, so a pitch LFO moves
+ * each oscillator's detune in cents and a gain LFO is converted from dB to a
+ * linear offset around unity. Returns the depth node so the caller can
+ * disconnect it when the voice ends.
+ */
+function automationLfo (voice, auto, oscillators, lane, now, tail) {
+  const lfo = lane.lfo
+  const params = []
+  if (lfo.target === 'pitch') {
+    for (let i = 0; i < oscillators.length; i += 1) params.push(oscillators[i].detune)
+  } else if (lfo.target === 'filter' && auto.filter !== null) params.push(auto.filter.frequency)
+  else if (lfo.target === 'gain' && auto.gain !== null) params.push(auto.gain.gain)
+  else if (lfo.target === 'pan' && auto.pan !== null) params.push(auto.pan.pan)
+  else if (lfo.target === 'send') {
+    const send = voice.send ? voice.send : auto.send
+    if (send !== null && send !== undefined) params.push(send.gain)
+  }
+  if (params.length === 0) return null
+  const osc = ctx.createOscillator()
+  const depth = ctx.createGain()
+  osc.type = 'sine'
+  osc.frequency.value = lfo.hz
+  depth.gain.value = lfo.target === 'gain' ? Math.pow(10, lfo.depth / 20) - 1 : lfo.depth
+  osc.connect(depth)
+  for (let i = 0; i < params.length; i += 1) depth.connect(params[i])
+  osc.start(now)
+  if (tail !== null) osc.stop(tail)
+  // Pushing it into `sources` is what ties the LFO's lifetime to the voice:
+  // hardStop stops every source, and sweep drops the whole voice.
+  voice.sources.push(osc)
+  return depth
+}
+
+/** Disconnect every node the automation added to one voice. Idempotent. */
+function automationDetach (auto, depths) {
+  for (let i = 0; i < depths.length; i += 1) {
+    try { depths[i].disconnect() } catch (error) {}
+  }
+  if (auto === null) return
+  const nodes = [auto.gain, auto.filter, auto.pan, auto.send]
+  for (let i = 0; i < nodes.length; i += 1) {
+    if (nodes[i] !== null) {
+      try { nodes[i].disconnect() } catch (error) {}
+    }
+  }
+}
+
+/**
+ * Hook the voice's own sources so the automation graph disconnects when the
+ * voice ends. `retire`/`sweep` are shared with the no-automation runtime and are
+ * deliberately left untouched (their bytes are the byte-identity contract), so
+ * the cleanup rides on `onended` instead: it fires for every stopped source,
+ * whether the voice ended naturally or was stolen, and `disconnect()` is safe to
+ * call twice.
+ */
+function automationAttach (voice, auto, depths) {
+  const cleanup = function () {
+    automationDetach(auto, depths)
+  }
+  for (let i = 0; i < voice.sources.length; i += 1) {
+    const previous = voice.sources[i].onended
+    voice.sources[i].onended = function () {
+      cleanup()
+      if (typeof previous === 'function') previous()
+    }
+  }
+}
+
+/**
+ * Schedule every lane on an already-built voice and start its LFOs. Returns the
+ * number of param events scheduled, which the handle reports so a page can tell
+ * whether a lane found anything to move.
+ */
+function automationSchedule (voice, auto, lanes, now, loop) {
+  if (auto === null || lanes === null || lanes.length === 0) return 0
+  const oscillators = []
+  const noises = []
+  const depths = []
+  let i
+  // `voice.sources` was filled by buildLayer before this runs; the LFOs this
+  // function creates are pushed afterwards, so they cannot be mistaken for
+  // preset oscillators above. classify by the parameter that belongs to the
+  // node type (`frequency` vs `playbackRate`), never by `detune`: modern
+  // browsers give AudioBufferSourceNode a detune AudioParam too, so testing for
+  // detune would send every noise source down the oscillator branch.
+  for (i = 0; i < voice.sources.length; i += 1) {
+    if (voice.sources[i].frequency !== undefined) oscillators.push(voice.sources[i])
+    else if (voice.sources[i].playbackRate !== undefined) noises.push(voice.sources[i])
+  }
+  const tail = loop === true ? null : voice.stopAt
+  let count = 0
+  for (i = 0; i < lanes.length; i += 1) {
+    const lane = lanes[i]
+    const events = automationEvents(lane, now)
+    count += events.length
+    if (lane.target === 'pitch') {
+      for (let j = 0; j < oscillators.length; j += 1) automationParam(oscillators[j].detune, events, null)
+      for (let j = 0; j < noises.length; j += 1) automationParam(noises[j].playbackRate, events, automationRate)
+    } else if (lane.target === 'filter' && auto.filter !== null) {
+      automationParam(auto.filter.frequency, events, null)
+    } else if (lane.target === 'gain' && auto.gain !== null) {
+      automationParam(auto.gain.gain, events, automationGain)
+    } else if (lane.target === 'pan' && auto.pan !== null) {
+      automationParam(auto.pan.pan, events, null)
+    } else if (lane.target === 'send') {
+      const send = voice.send ? voice.send : auto.send
+      if (send !== null && send !== undefined) automationParam(send.gain, events, null)
+    }
+    if (lane.lfo !== null) {
+      const depth = automationLfo(voice, auto, oscillators, lane, now, tail)
+      if (depth !== null) depths.push(depth)
+    }
+  }
+  automationAttach(voice, auto, depths)
+  return count
+}
+
+/**
+ * `play(name, params, options)` with automation: the same contract as the
+ * no-automation runtime, plus `options.automation` to replace the lanes baked
+ * into the script and `options.duration` to lengthen or shorten the voice (and
+ * therefore the scheduled stop). Invalid lane data at this level is dropped
+ * rather than thrown: a page must keep sounding, and the host has already
+ * validated the baked lanes before emitting them.
+ */
+function livePlayAuto (name, over, opts) {
+  if (ctx === null || PLANS[name] === undefined) return null
+  if (ctx.state === 'suspended' && ctx.resume) {
+    try { ctx.resume() } catch (error) {}
+  }
+  const requested = opts !== undefined && opts !== null && opts.automation !== undefined ? opts.automation : AUTOLANES
+  let lanes = liveAutoNorm(requested, AUTORANGE)
+  if (lanes.length === 0) lanes = null
+  let duration = AUTODUR
+  if (opts !== undefined && opts !== null && typeof opts.duration === 'number' && isFinite(opts.duration)) duration = opts.duration
+  const resolved = liveResolve(name, over, DEF, RNG, KINDS)
+  const body = PLANS[name](resolved, liveHelpers(rand))
+  const plan = { loop: body.loop === true, duration: body.duration || DUR[name], layers: body.layers, space: body.space, master: body.master }
+  if (duration !== null && isFinite(duration) && duration > 0) plan.duration = liveClamp(duration, 0.02, 60)
+  const now = ctx.currentTime + 0.004
+  sweep(now)
+  let sounding = 0
+  for (let i = 0; i < voices.length; i += 1) if (voices[i].end > now) sounding += 1
+  while (voices.length >= MAXV) {
+    hardStop(voices[0], 0.012)
+    voices.shift()
+    sounding = Math.min(sounding, MAXV - 1)
+  }
+  const comp = 1 / Math.sqrt(1 + sounding)
+  const bus = ctx.createGain()
+  bus.gain.value = comp * plan.master.gain
+  const auto = automationBuild(bus, lanes, plan)
+  const tail = now + plan.duration + 0.15
+  const voice = { name: name, bus: bus, gain: bus.gain.value, stopAt: tail, sources: [], end: plan.loop ? Infinity : tail, auto: auto }
+  for (let i = 0; i < plan.layers.length; i += 1) buildLayer(voice, plan, plan.layers[i], now)
+  if (plan.space !== null) {
+    const send = ctx.createGain()
+    send.gain.value = plan.space.amount
+    bus.connect(send)
+    send.connect(spaceIn(plan.space))
+    voice.send = send
+  }
+  const events = automationSchedule(voice, auto, lanes, now, plan.loop)
+  voices.push(voice)
+  return {
+    name: name,
+    gain: voice.gain,
+    bed: plan.loop,
+    automation: lanes === null ? null : { lanes: lanes.length, events: events, duration: plan.duration },
+    stop: function () {
+      hardStop(voice, 0.03)
+      return true
+    }
+  }
+}
+
+
 /**
  * The emitted range table: only the exceptions to the `[0, 1]` convention, so a
  * script that uses nine presets does not pay for ~40 identical `[0, 1]` pairs.
@@ -901,6 +1561,59 @@ function normalizePresets (presets) {
 }
 
 /**
+ * Read the optional default voice duration a build bakes into the script. It
+ * rides with automation because that is the only build that emits the code to
+ * apply it; `play(name, params, { duration })` can still override it per call.
+ * @param {*} value - raw option.
+ * @returns {number|null} seconds, rounded to a millisecond so the emitted JSON
+ *   stays short and the same request always serialises to the same bytes.
+ */
+function automationDurationOption (value) {
+  if (value === undefined || value === null) return null
+  const number = Number(value)
+  if (!Number.isFinite(number)) throw new Error(`buildLiveScript: duration must be a finite number of seconds (got ${describeValue(value)})`)
+  if (number < 0.02 || number > MAX_AUTOMATION_SECONDS) {
+    throw new Error(`buildLiveScript: duration ${number}s is outside 0.02..${MAX_AUTOMATION_SECONDS} s`)
+  }
+  return Math.round(number * 1000) / 1000
+}
+
+/**
+ * Splice the automation runtime into the plain runtime, in front of its `var
+ * api` line. Keeping the plain runtime untouched is what makes the
+ * no-automation bytes identical: this block is the *only* difference between the
+ * two scripts.
+ * @param {Array<object>} lanes - canonical default lanes.
+ * @param {number|null} duration - baked default voice length.
+ * @returns {string} runtime source.
+ */
+function automationRuntimeBlock (lanes, duration) {
+  const lines = [
+    `var AUTOLANES=${json(lanes)}`,
+    `var AUTODUR=${duration === null ? 'null' : json(duration)}`,
+    `var AUTORANGE=${json(AUTOMATION_LIMITS)}`,
+    compactSource(liveAutoLane),
+    compactSource(liveAutoNorm),
+    compactSource(automationEvents),
+    compactSource(automationRate),
+    compactSource(automationGain),
+    compactSource(automationParam),
+    compactSource(automationBuild),
+    compactSource(automationLfo),
+    compactSource(automationDetach),
+    compactSource(automationAttach),
+    compactSource(automationSchedule),
+    compactSource(livePlayAuto),
+    'play=livePlayAuto'
+  ]
+  const marker = 'var api={play:play'
+  const index = RUNTIME.indexOf(marker)
+  if (index < 0) throw new Error('buildLiveScript: the runtime lost its api marker; automation cannot be emitted')
+  const block = squeezeSource(lines.join('\n'))
+  return `${RUNTIME.slice(0, index)}${block}\n${RUNTIME.slice(index)}`
+}
+
+/**
  * Emit the in-page synth.
  *
  * The script is a dependency-free IIFE that assigns `window.dshLive` and creates
@@ -908,11 +1621,20 @@ function normalizePresets (presets) {
  * preset designers, never a rendered sample: a page that loads it can play any
  * preset at any knobs, and re-randomise per interaction, for the size of the code
  * alone. The same options always produce the same bytes.
- * @param {{presets?: string[], seed?: number, sampleRate?: number, maxVoices?: number, volumeDb?: number}} [options]
+ *
+ * `automation` bakes default lanes into the script; `play(name, params, options)`
+ * then accepts `{ automation: lanes, duration }` to replace them per call. A
+ * build with neither `automation` nor `duration` emits exactly the script it
+ * emitted before automation existed (same bytes, same reported version); a build
+ * with lanes reports `LIVE_AUTOMATION_VERSION` so a page can feature-detect.
+ * @param {{presets?: string[], seed?: number, sampleRate?: number, maxVoices?: number, volumeDb?: number, automation?: Array<object>, duration?: number}} [options]
  *   `presets` defaults to all nine, `seed` to 1, `sampleRate` to 44100,
- *   `maxVoices` to 12 and `volumeDb` to 0.
- * @returns {{script: string, bytes: number, exports: string[]}} the script text,
- *   its UTF-8 size, and the preset ids it can play.
+ *   `maxVoices` to 12, `volumeDb` to 0, `automation` to no automation support and
+ *   `duration` to the preset length. Lane lists are validated: an invalid lane
+ *   throws before a script exists.
+ * @returns {{script: string, bytes: number, exports: string[], automation: object|null}}
+ *   the script text, its UTF-8 size, the preset ids it can play, and the lanes it
+ *   baked (`null` when the build carries no automation).
  */
 export function buildLiveScript (options = {}) {
   const names = normalizePresets(options.presets)
@@ -920,20 +1642,38 @@ export function buildLiveScript (options = {}) {
   const sampleRate = intOption(options.sampleRate, 44100, 8000, 96000)
   const maxVoices = intOption(options.maxVoices, 12, 1, 64)
   const volumeDb = liveClamp(Number.isFinite(options.volumeDb) ? options.volumeDb : 0, -60, 12)
-  const banner = `/* dsh-live ${LIVE_VERSION} - generated by dsh-audio lib/live.js; ` +
+  const requested = options.automation
+  const requestedDuration = options.duration === undefined || options.duration === null ? null : options.duration
+  const hasAutomation = (requested !== undefined && requested !== null) || requestedDuration !== null
+  let automation = null
+  if (hasAutomation) {
+    if (requested !== undefined && requested !== null) {
+      const verdict = validateAutomation(requested)
+      if (!verdict.ok) throw new Error(`buildLiveScript: invalid automation; ${formatAutomationErrors(verdict.errors)}`)
+    }
+    automation = { lanes: normalizeAutomation(requested), duration: automationDurationOption(requestedDuration) }
+  }
+  const version = automation === null ? LIVE_VERSION : LIVE_AUTOMATION_VERSION
+  const runtime = automation === null ? RUNTIME : automationRuntimeBlock(automation.lanes, automation.duration)
+  const banner = `/* dsh-live ${version} - generated by dsh-audio lib/live.js; ` +
     'no audio bytes, no network. API: play/stop/stopAll/setVolume/unlock/isUnlocked/activeVoices/version. */'
   const script = [
     banner,
     '(function (root) {',
     "'use strict'",
-    `var VERSION=${json(LIVE_VERSION)}`,
+    `var VERSION=${json(version)}`,
     `var SEED=${seed},SR=${sampleRate},MAXV=${maxVoices},VOL=${volumeDb}`,
     emitLibrary(names),
-    RUNTIME,
+    runtime,
     '})(typeof window === "undefined" ? globalThis : window)',
     ''
   ].join('\n')
-  return { script, bytes: utf8Bytes(script), exports: names.slice() }
+  return {
+    script,
+    bytes: utf8Bytes(script),
+    exports: names.slice(),
+    automation: automation === null ? null : { lanes: automation.lanes, duration: automation.duration }
+  }
 }
 
 /**

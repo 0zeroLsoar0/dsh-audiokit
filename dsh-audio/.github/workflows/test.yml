@@ -1,0 +1,50 @@
+# dsh-audio-plugin — test suite.
+#
+# The package has zero runtime and dev dependencies, so there is nothing to
+# cache and `npm install` is only a cheap package.json sanity check. All test
+# files go through tools/test-all.mjs, which runs one child process per file and
+# prints `ok`/`FAIL` plus the elapsed milliseconds.
+#
+# Environment notes:
+#   * Tests that cannot run here skip themselves (`SKIP:` + exit 0), never fail:
+#     test/video.mjs needs ffmpeg/ffprobe, which ubuntu-latest does not ship.
+#     The bundled Windows ffmpeg path (~/.dsh/tools/ffmpeg/bin) is therefore
+#     only covered by running the suite on Windows.
+#   * test/edge.mjs is the exception: it talks to the live Microsoft Edge
+#     read-aloud service. Hosted runners have network access, so it normally
+#     passes; if that service is unreachable the test fails loudly with a FAIL
+#     line instead of pretending to pass. Check the run log before assuming a
+#     code regression.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # No dependencies: this only proves the manifest is installable/parseable.
+      - name: Install (no dependencies)
+        run: npm install --no-audit --no-fund
+
+      - name: Tests
+        run: node tools/test-all.mjs

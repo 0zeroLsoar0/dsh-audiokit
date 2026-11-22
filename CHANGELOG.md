@@ -11,6 +11,36 @@
 - **U 盘上的版本目录只增不删。** 需要更新同一版本时覆盖同名文件，不要删目录。
 - 旧版本的唯一权威来源是 git tag；U 盘只是副本。
 
+## 0.5.10 — 2026-11-22
+
+工具 27 → **30**，并补上多声道、自动化与发布工程。
+
+### 新增工具
+
+- **`audio_synth_graph`**：运行时合成图。模型自己用 `osc / noise / filter / env / lfo / gain / drive / ring / pan / reverb / sum`
+  搭音色——真正意义的"AI 自己合成预设"。校验无分配（10 000 节点 0.034 ms），3 s/16 节点渲染 22.4 ms（134× 实时），
+  带 5 个示例图（metal-clang / glassy-pluck / hollow-wind / fm-bell / folded-drone）。
+- **`audio_sampler`**：采样器。指向用户自己的 wav，做键位与力度分区、变调（+12 半音实测 440.34 Hz）、
+  无咔哒循环（接缝台阶 0.00107 vs 内部 0.00787）、包络、轮换取样。**不内置任何素材**。
+- **`audio_daw`**：工程导出。CMX3600 EDL（24/25/30/29.97 逐帧量化 ≤ 半帧）、Reaper `.rpp`、CSV cue 表、
+  Audacity labels；写出的 EDL/RPP 会再解析回来核对（219 项断言）。
+
+### 增强
+
+- **多声道总线/母带**（`lib/multichannel.js`）：`audio_bus` / `audio_master` / `audio_convert` 支持 4/6/8 声道，
+  压缩器跨声道联动检测，真峰值上限在最响声道上验证；mono↔5.1 上/下混有明确增益约定。
+- **`audio_live` 自动化车道**：pitch/filter/gain/pan/send 的斜坡（linear/exp/sine/step）与 LFO，
+  可上行也可下行（关门扫频、duck 都能写）；不带动画时生成结果与 0.5.9 **逐字节相同**。
+- **设置页错误本地化**：`/validate` 与 `/test` 新增 `reasonCode`（9 种）+ `detail`，
+  中英界面都能显示母语原因（英文界面不再出现中文报错）。
+
+### 工程
+
+- `tools/test-all.mjs`：一条命令跑全部测试（40 个文件，串行，失败即非零；`--only` 过滤）。
+- `.github/workflows/test.yml`：GitHub Actions，node 20/22 矩阵。
+- `docs/RELEASE.md` + `dsh-audio-lab/tools/publish-pack.mjs`：打包/发布流程（在临时副本里改成公开包名
+  `dsh-audio-plugin` 再打包，仓库自身的 `@local/dsh-audio` 名字保持不变，避免破坏已安装的 profile）。
+
 ## 0.5.9 — 2026-11-22
 
 按用户要求分两步走：功能持续合并，版本号到这一步才从 0.5.6 升到 0.5.9（不直接跳 0.6.0）。

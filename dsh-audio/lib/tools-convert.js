@@ -16,14 +16,13 @@
  * caller will paste into a page.
  */
 
-import { stat } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import { basename, extname, join, relative } from 'node:path'
 import {
   defaultOutputPath,
   finalize,
   hashSpec,
   measure,
-  readTrack,
   renderPreset,
   resolvePath,
   writeFileAtomic
@@ -31,9 +30,11 @@ import {
 import { clamp } from './dsp.js'
 import { decodeWav } from './wav.js'
 import { applyGainDb, concat, fade, reverse, resampleHiFi, toStereo, trim, MAX_JOIN_SECONDS } from './convert.js'
-import { encodeWavEx } from './wav-encode.js'
+import { CHANNEL_COUNTS, encodeAnyWav, fitChannels, layoutFor } from './multichannel.js'
 
 const BIT_DEPTHS = [8, 16, 24, 32]
+/** The extensible WAV writer behind multichannel output is integer PCM only. */
+const MULTICHANNEL_BIT_DEPTHS = [16, 24]
 const OPS = ['trim', 'gain', 'fade', 'reverse', 'concat', 'gain-scan', 'convert']
 const SINGLE_INPUT_OPS = ['trim', 'gain', 'fade', 'reverse', 'convert']
 const CURVES = ['linear', 'equalPower']
@@ -114,30 +115,45 @@ function labelFromPath (path) {
   return basename(path, extname(path))
 }
 
-/** Fold a decoded channel list to mono, which is the shape `measure` wants. */
+/** Fold a decoded channel list to mono the way a downmix does, for `measure`. */
 function foldToMono (channels) {
   if (channels.length === 1) return channels[0]
-  const out = new Float32Array(channels[0].length)
-  for (const channel of channels) {
-    for (let index = 0; index < out.length; index += 1) out[index] += channel[index]
-  }
-  for (let index = 0; index < out.length; index += 1) out[index] /= channels.length
-  return out
+  return fitChannels(channels, 1)[0]
+}
+
+/** `mono`, `stereo`, or `6-ch 5.1`. */
+function channelLabel (channels) {
+  if (channels === 1) return 'mono'
+  if (channels === 2) return 'stereo'
+  return `${channels}-ch ${layoutFor(channels).id}`
 }
 
 /**
  * Read one input: a wav path, or a render spec that is synthesized first.
  *
- * Render specs are finalized the same way `audio_synth` finalizes them (DC
- * block, peak at -1 dBFS, soft limit), so `{ preset: 'impact' }` means the same
- * sound here as it does there.
+ * A file is read as its real channels, not folded: `convert` on a 5.1 file has
+ * to be able to write a 5.1 file. Render specs are mono (the synthesis kernel
+ * only makes one channel) and are finalised the same way `audio_synth`
+ * finalises them (DC block, peak at -1 dBFS, soft limit), so
+ * `{ preset: 'impact' }` means the same sound here as it does there.
  */
 async function readInput (cwd, entry) {
   if (typeof entry === 'string') {
     const path = resolvePath(cwd, entry)
     if (path === undefined) throw new Error('audio_convert: input path is empty')
-    const track = await readTrack(path)
-    return { samples: track.samples, sampleRate: track.sampleRate, label: labelFromPath(path), source: path }
+    let bytes
+    try {
+      bytes = await readFile(path)
+    } catch (error) {
+      throw new Error(`audio_convert: cannot read ${path}: ${error.code ?? error.message}`)
+    }
+    let decoded
+    try {
+      decoded = decodeWav(bytes)
+    } catch (error) {
+      throw new Error(`audio_convert: cannot decode ${path}: ${error.message}`)
+    }
+    return { channels: decoded.channels, sampleRate: decoded.sampleRate, label: labelFromPath(path), source: path }
   }
   if (entry !== null && typeof entry === 'object') {
     const preset = String(entry.preset ?? '')
@@ -152,7 +168,7 @@ async function readInput (cwd, entry) {
     const rendered = renderPreset(spec)
     finalize(rendered.samples, rendered.sampleRate, Number.isFinite(entry.peakDbfs) ? Number(entry.peakDbfs) : -1, { loop: rendered.spec.loop === true })
     return {
-      samples: rendered.samples,
+      channels: [rendered.samples],
       sampleRate: rendered.sampleRate,
       label: `${preset}-${spec.seed}`,
       spec: { ...spec, params: { ...spec.params } }
@@ -161,14 +177,25 @@ async function readInput (cwd, entry) {
   throw new Error('audio_convert: every input must be a .wav path or a render spec object')
 }
 
-/** Resolve the requested output format, with defaults that match the current tools. */
+/**
+ * Resolve the requested output format.
+ *
+ * `channels` defaults to the input's own channel count, so `op: 'convert'`
+ * re-encodes a 5.1 file as 5.1 instead of silently folding it to mono. An
+ * explicit 1/2/4/6/8 converts through `fitChannels` (LFE dropped by a downmix).
+ */
 function resolveFormat (args) {
   const bitDepth = args.bitDepth === undefined ? 16 : Number(args.bitDepth)
   if (!BIT_DEPTHS.includes(bitDepth)) {
     throw new Error(`audio_convert: bitDepth must be one of ${BIT_DEPTHS.join(', ')}`)
   }
-  const channels = args.channels === undefined ? 1 : Number(args.channels)
-  if (channels !== 1 && channels !== 2) throw new Error('audio_convert: channels must be 1 or 2')
+  let channels = null
+  if (args.channels !== undefined && args.channels !== null) {
+    channels = Number(args.channels)
+    if (!CHANNEL_COUNTS.includes(channels)) {
+      throw new Error(`audio_convert: channels must be one of ${CHANNEL_COUNTS.join(', ')} (1 mono, 2 stereo, 4 quad, 6 5.1, 8 7.1)`)
+    }
+  }
   let sampleRate = null
   if (args.sampleRate !== undefined && args.sampleRate !== null) {
     sampleRate = Math.round(Number(args.sampleRate))
@@ -181,20 +208,41 @@ function resolveFormat (args) {
   return { bitDepth, channels, sampleRate, pan, width }
 }
 
-/** Apply the requested rate/channel layout and encode the bytes. */
+/**
+ * Apply the requested rate/layout and encode the bytes.
+ *
+ * Mono -> stereo keeps the historical `toStereo` pan/width placement (the one
+ * the existing format matrix is defined by). Any other count change goes
+ * through `fitChannels`, so a 6-channel file survives `convert` untouched and a
+ * requested 5.1 output is a real upmix rather than six copies.
+ */
 function encodeTrack (track, format) {
-  let samples = track.samples
-  let sampleRate = track.sampleRate
+  const sourceRate = track.sampleRate
+  // The pure ops in lib/convert.js keep a mono track as `{ samples }` and a
+  // multichannel one as `{ channels }`; normalise both here.
+  let channels = Array.isArray(track.channels) ? track.channels : [track.samples]
+  if (!channels.every((channel) => ArrayBuffer.isView(channel))) {
+    throw new Error('audio_convert: internal track has no decodable samples')
+  }
+  let sampleRate = sourceRate
   const targetRate = format.sampleRate ?? sampleRate
   if (targetRate !== sampleRate) {
-    const resampled = resampleHiFi(samples, sampleRate, targetRate)
-    samples = resampled.samples
-    sampleRate = resampled.sampleRate
+    channels = channels.map((channel) => resampleHiFi(channel, sampleRate, targetRate).samples)
+    sampleRate = targetRate
   }
-  const channelBuffers = format.channels === 2
-    ? toStereo({ samples, sampleRate }, { pan: format.pan, width: format.width }).samples
-    : [samples]
-  return { bytes: encodeWavEx(channelBuffers, sampleRate, { bitDepth: format.bitDepth, channels: format.channels }), sampleRate }
+  const targetChannels = format.channels ?? channels.length
+  let output
+  if (targetChannels === 2 && channels.length === 1) {
+    output = toStereo({ samples: channels[0], sampleRate }, { pan: format.pan, width: format.width }).samples
+  } else if (targetChannels === channels.length) {
+    output = channels
+  } else {
+    output = fitChannels(channels, targetChannels)
+  }
+  if (output.length > 2 && !MULTICHANNEL_BIT_DEPTHS.includes(format.bitDepth)) {
+    throw new Error(`audio_convert: a ${output.length}-channel file supports ${MULTICHANNEL_BIT_DEPTHS.join(' or ')} bits (the extensible WAV writer), got ${format.bitDepth}-bit`)
+  }
+  return { bytes: encodeAnyWav(output, sampleRate, { bitDepth: format.bitDepth }), sampleRate, channels: output }
 }
 
 /**
@@ -207,6 +255,7 @@ async function writeTrack (cwd, track, format, target) {
   await writeFileAtomic(target, bytes)
   const info = await stat(target)
   const written = decodeWav(bytes)
+  const layout = layoutFor(written.channels.length)
   const metrics = { ...measure(foldToMono(written.channels), written.sampleRate), sampleRate: written.sampleRate }
   return {
     path: target,
@@ -214,6 +263,13 @@ async function writeTrack (cwd, track, format, target) {
     bytes: info.size ?? bytes.length,
     bitDepth: written.bitDepth,
     channels: written.channels.length,
+    channelLayout: layout.id,
+    channelNames: [...layout.names],
+    channelPeaksDbfs: written.channels.map((channel) => {
+      let peak = 0
+      for (let index = 0; index < channel.length; index += 1) peak = Math.max(peak, Math.abs(channel[index]))
+      return peak > 0 ? Math.round(20 * Math.log10(peak) * 100) / 100 : -120
+    }),
     sampleRate: written.sampleRate,
     durationSeconds: written.durationSeconds,
     metrics,
@@ -239,7 +295,7 @@ function buildInline (bytes, limit) {
 }
 
 function summaryLine (label, result, extra) {
-  const format = `${result.bitDepth}-bit ${result.channels === 2 ? 'stereo' : 'mono'} ${result.sampleRate} Hz`
+  const format = `${result.bitDepth}-bit ${channelLabel(result.channels)} ${result.sampleRate} Hz`
   const parts = [
     `${label} ${result.relativePath} (${fmt(result.durationSeconds, 2)}s, ${format}, ${sizeLabel(result.bytes)})`,
     `peak ${fmt(result.metrics.peakDbfs)} dBFS`,
@@ -247,6 +303,10 @@ function summaryLine (label, result, extra) {
     result.metrics.clipping > 0 ? `CLIPPING ${result.metrics.clipping} samples` : 'no clipping',
     ...extra
   ]
+  if (result.channels > 2) {
+    // The fold peak is not the file peak in a surround layout, so print both.
+    parts.push(`channel peaks ${result.channelPeaksDbfs.map((peak) => fmt(peak)).join('/')} dBFS`)
+  }
   return parts.join(' | ')
 }
 
@@ -273,7 +333,8 @@ function requestHash (op, tracks, args) {
     pan: args.pan,
     width: args.width,
     bitDepth: args.bitDepth ?? 16,
-    channels: args.channels ?? 1,
+    // `null` means "keep the input's channel count", so it is part of the hash.
+    channels: args.channels ?? null,
     sampleRate: args.sampleRate ?? null
   })
 }
@@ -319,6 +380,9 @@ async function runSingleOp (cwd, tracks, args, op, format, inlineLimit) {
       op,
       bitDepth: written.bitDepth,
       channels: written.channels,
+      channelLayout: written.channelLayout,
+      channelNames: written.channelNames,
+      channelPeaksDbfs: written.channelPeaksDbfs,
       sampleRate: written.sampleRate,
       durationSeconds: written.durationSeconds,
       metrics: written.metrics,
@@ -334,6 +398,9 @@ async function runSingleOp (cwd, tracks, args, op, format, inlineLimit) {
     op,
     bitDepth: written.bitDepth,
     channels: written.channels,
+    channelLayout: written.channelLayout,
+    channelNames: written.channelNames,
+    channelPeaksDbfs: written.channelPeaksDbfs,
     sampleRate: written.sampleRate,
     durationSeconds: written.durationSeconds,
     metrics: written.metrics,
@@ -366,9 +433,11 @@ async function runGainScan (cwd, tracks, args, format) {
   for (let index = 0; index < tracks.length; index += 1) {
     const track = tracks[index]
     let peak = 0
-    for (let frame = 0; frame < track.samples.length; frame += 1) {
-      const magnitude = Math.abs(track.samples[frame])
-      if (magnitude > peak) peak = magnitude
+    for (const channel of track.channels) {
+      for (let frame = 0; frame < channel.length; frame += 1) {
+        const magnitude = Math.abs(channel[frame])
+        if (magnitude > peak) peak = magnitude
+      }
     }
     const inputPeakDbfs = peak > 0 ? 20 * Math.log10(peak) : -120
     const gainDb = peak > 0 ? targetPeakDbfs - inputPeakDbfs : 0
@@ -389,12 +458,14 @@ async function runGainScan (cwd, tracks, args, format) {
       durationSeconds: written.durationSeconds,
       bitDepth: written.bitDepth,
       channels: written.channels,
+      channelLayout: written.channelLayout,
+      channelPeaksDbfs: written.channelPeaksDbfs,
       sampleRate: written.sampleRate
     })
   }
   const first = files[0]
   const destination = tracks.length === 1 ? first.relativePath : `${displayPath(cwd, directory)}/`
-  const formatText = `${first.bitDepth}-bit ${first.channels === 2 ? 'stereo' : 'mono'} ${first.sampleRate} Hz`
+  const formatText = `${first.bitDepth}-bit ${channelLabel(first.channels)} ${first.sampleRate} Hz`
   const gainText = files.map((file) => `${file.label} ${file.gainDb >= 0 ? '+' : ''}${file.gainDb.toFixed(1)} dB`).join(', ')
   const text = `Scanned ${files.length} file(s) to a common ${fmt(targetPeakDbfs)} dBFS peak -> ${destination} (${formatText}) | ${gainText}`
   return {
@@ -419,7 +490,7 @@ async function runGainScan (cwd, tracks, args, format) {
 export function registerConvertTools (ctx) {
   ctx.tools.register({
     name: 'audio_convert',
-    description: 'Edit and finish a rendered cue: trim a span, apply a gain, fade in/out, reverse, join takes with a gap or crossfade, level a whole cue set to one common peak (gain-scan), or just re-encode the format. Writes 8-bit (tiny, for a base64 data URI in one HTML file), 16-bit, 24-bit (video master) or 32-bit float, mono or stereo, at any sample rate with a windowed-sinc resampler. Use it after audio_synth/audio_pattern/audio_tts instead of re-rendering with different settings. Returns the path plus the format actually written; `inline: true` also returns the bytes as a base64 data URI.',
+    description: 'Edit and finish a rendered cue: trim a span, apply a gain, fade in/out, reverse, join takes with a gap or crossfade, level a whole cue set to one common peak (gain-scan), or just re-encode the format. Writes 8-bit (tiny, for a base64 data URI in one HTML file), 16-bit, 24-bit (video master) or 32-bit float at 1/2/4/6/8 channels and any sample rate with a windowed-sinc resampler. Trim/gain/fade/reverse/convert pass a multichannel file through channel for channel and default to keeping its layout (a 4/6/8-channel file gets the WAVE extensible header with its channel mask and supports 16/24-bit); pan/width place a mono input and are refused on a wider track. Use it after audio_synth/audio_pattern/audio_tts instead of re-rendering with different settings. Returns the path plus the format actually written; `inline: true` also returns the bytes as a base64 data URI.',
     parameters: {
       type: 'object',
       properties: {
@@ -449,10 +520,10 @@ export function registerConvertTools (ctx) {
         gapSeconds: { type: 'number', description: 'concat: silent gap between takes (finite, at most 60 s; negative clamps to 0); use this or crossfadeSeconds, not both.' },
         crossfadeSeconds: { type: 'number', description: 'concat: overlap between takes instead of a gap (finite, at most 60 s; negative clamps to 0).' },
         peakDbfs: { type: 'number', description: 'gain-scan: the common peak to hit in dBFS (default -1).' },
-        pan: { type: 'number', description: 'Stereo placement, -1 left .. 0 centre .. 1 right; only used when channels is 2.' },
-        width: { type: 'number', description: 'Stereo width 0..1: 0 folds both channels to mono, 1 keeps the pan image.' },
-        bitDepth: { type: 'integer', enum: BIT_DEPTHS, description: '8=smallest, good for an inline HTML data URI; 16=default; 24=video master; 32=32-bit IEEE float. Defaults to 16.' },
-        channels: { type: 'integer', enum: [1, 2], description: '1=mono (default), 2=stereo built from the mono track with pan/width.' },
+        pan: { type: 'number', description: 'Stereo placement, -1 left .. 0 centre .. 1 right; only used when channels is 2 and the input is mono. Refused on a multichannel input, which already has a layout.' },
+        width: { type: 'number', description: 'Stereo width 0..1: 0 folds both channels to mono, 1 keeps the pan image; only when placing a mono input in stereo. Refused on a multichannel input.' },
+        bitDepth: { type: 'integer', enum: BIT_DEPTHS, description: '8=smallest, good for an inline HTML data URI; 16=default; 24=video master; 32=32-bit IEEE float. A 4/6/8-channel file supports 16 or 24 bits (the extensible WAV writer); 8/32-bit is refused for surround. Defaults to 16.' },
+        channels: { type: 'integer', enum: [...CHANNEL_COUNTS], description: 'Output channel count: 1 mono, 2 stereo, 4 quad, 6 5.1, 8 7.1. Defaults to the input file\'s own channel count (so convert re-encodes a 5.1 file as 5.1); an explicit count converts through the layout matrix with LFE dropped by a downmix. A mono input with channels 2 is placed by pan/width.' },
         sampleRate: { type: 'integer', description: 'Output rate in Hz; defaults to the input rate. Uses a windowed-sinc resampler, safe as the final rate change.' },
         out: { type: 'string', description: 'Output path, relative to the working directory. Defaults to assets/audio/<op>-<label>-<hash>.wav. For gain-scan with several inputs this is a directory.' },
         inline: { type: 'boolean', description: 'Also return the written file as a base64 data URI (audio/wav) for single-file HTML. Skipped when the file exceeds maxInlineBytes.' },
@@ -487,6 +558,20 @@ export function registerConvertTools (ctx) {
       for (const entry of entries) tracks.push(await readInput(cwd, entry))
       if (SINGLE_INPUT_OPS.includes(op) && tracks.length !== 1) {
         throw new Error(`audio_convert: op "${op}" takes exactly one input; use concat to join takes`)
+      }
+      // Channel-shape guards, after the decode because only then is the input
+      // width known. These are operations with no meaning on a surround layer:
+      // pan/width place a mono point source on a stereo pair, and concat sums
+      // takes on one frame axis.
+      const widestInput = Math.max(...tracks.map((track) => track.channels.length))
+      if (widestInput > 1 && args.pan !== undefined && Number.isFinite(Number(args.pan)) && Number(args.pan) !== 0) {
+        throw new Error(`audio_convert: pan places a mono input on a stereo pair, and this input already has ${widestInput} channels; choose the layout with channels instead`)
+      }
+      if (widestInput > 1 && args.width !== undefined && Number.isFinite(Number(args.width)) && Number(args.width) !== 1) {
+        throw new Error(`audio_convert: width applies when a mono input is placed in stereo; this input has ${widestInput} channels, so convert its layout with channels instead`)
+      }
+      if (op === 'concat' && widestInput > 1) {
+        throw new Error('audio_convert: concat joins mono takes; downmix a multichannel input first (channels: 1)')
       }
 
       if (op === 'gain-scan') return runGainScan(cwd, tracks, args, format)

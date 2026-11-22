@@ -27,14 +27,16 @@ import {
   writeFileAtomic
 } from './audio.js'
 import { PRESETS } from './dsp.js'
-import { analyzeLoudness } from './lufs.js'
+import { analyzeLoudness, truePeak } from './lufs.js'
 import { masterChain, masterPresets } from './master.js'
+import { CHANNEL_COUNTS, encodeAnyWav, fitChannels, layoutFor } from './multichannel.js'
 import { decodeWav } from './wav.js'
-import { encodeWavEx } from './wav-encode.js'
 
 const PRESET_NAMES = Object.keys(PRESETS)
 const MASTER_PRESET_NAMES = Object.keys(masterPresets())
 const BIT_DEPTHS = [8, 16, 24, 32]
+/** The extensible WAV writer behind multichannel output is integer PCM only. */
+const MULTICHANNEL_BIT_DEPTHS = [16, 24]
 
 /**
  * Headroom left below the requested true-peak ceiling before encoding.
@@ -87,12 +89,35 @@ function sizeLabel (bytes) {
   return `${bytes} B`
 }
 
+/** Fold a channel list to mono for the legacy `measure` shaping metrics. */
 function foldToMono (channels) {
   if (channels.length === 1) return channels[0]
-  const frames = channels[0].length
-  const out = new Float32Array(frames)
-  for (let i = 0; i < frames; i += 1) out[i] = (channels[0][i] + channels[1][i]) * 0.5
-  return out
+  return fitChannels(channels, 1)[0]
+}
+
+/**
+ * Analyse a channel list the way the master chain does: LFE excluded from the
+ * loudness sum, the worst channel supplying the true peak (the meter already
+ * reports the maximum over the channels it is given).
+ */
+function analyseChannels (channels, sampleRate) {
+  const layout = layoutFor(channels.length)
+  const measured = layout.hasLfe ? channels.filter((_, index) => index !== layout.lfeIndex) : channels
+  return measured.length === 1
+    ? analyzeLoudness(measured[0], sampleRate)
+    : analyzeLoudness(measured[0], sampleRate, { channels: measured })
+}
+
+/** `mono`, `stereo`, or `6-ch 5.1`. */
+function channelLabel (channels) {
+  if (channels === 1) return 'mono'
+  if (channels === 2) return 'stereo'
+  return `${channels}-ch ${layoutFor(channels).id}`
+}
+
+/** One channel's 4x true peak in dBTP, floored so JSON never carries -Infinity. */
+function truePeakDbtpOf (samples, sampleRate) {
+  return finiteOr(truePeak(samples, sampleRate), PEAK_FLOOR_DB)
 }
 
 function finiteOr (value, fallback) {
@@ -202,7 +227,7 @@ function bandsText (bands) {
 
 /** One line the model reads instead of listening. */
 function summaryText ({ destination, info, before, after, report, presetName, bitDepth, channels, maxGainReductionDb, target }) {
-  const format = `${bitDepth}-bit ${channels === 2 ? 'stereo' : 'mono'} ${info.sampleRate} Hz`
+  const format = `${bitDepth}-bit ${channelLabel(channels)} ${info.sampleRate} Hz`
   const parts = [`Wrote ${destination} (${fmt(info.durationSeconds, 2)}s, ${format}, ${sizeLabel(info.bytes)})`]
   const chain = presetName === null ? 'custom chain' : `via ${presetName}`
   if (Number.isFinite(before.lufs) && Number.isFinite(after.lufs)) {
@@ -211,10 +236,25 @@ function summaryText ({ destination, info, before, after, report, presetName, bi
     parts.push(`${chain}: ${fmt(after.lufs, 1)} LUFS`)
   }
   parts.push(`true peak ${fmt(before.truePeak, 1)} -> ${fmt(after.truePeak, 1)} dBTP`)
+  if (channels > 2) {
+    // For a surround master the ceiling is a per-channel promise, so name the
+    // worst channel and the whole set instead of one folded number.
+    const names = layoutFor(channels).names
+    const byChannel = Array.isArray(after.truePeakByChannelDbtp) ? after.truePeakByChannelDbtp : []
+    const worst = Number.isInteger(after.truePeakChannel) ? names[after.truePeakChannel] : null
+    if (worst !== null && byChannel.length === names.length) {
+      parts.push(`true peak by channel ${names.map((name, index) => `${name} ${fmt(byChannel[index], 1)}`).join(' / ')} dBTP (worst ${worst})`)
+    }
+    parts.push(report.lfeExcluded === true
+      ? `loudness on ${report.loudnessChannels} channels (LFE excluded)`
+      : `loudness on ${report.loudnessChannels} channels`)
+  }
   parts.push(`limiter GR ${fmt(report.gainReductionDb, 1)} dB`)
   parts.push(`bands ${bandsText(report.bands)}`)
   if (report.widthApplied === true && (report.width !== 1 || report.bassMonoHz > 0)) {
     parts.push(`width ${fmt(report.width, 2)}, bass mono <= ${fmt(report.bassMonoHz, 0)} Hz`)
+  } else if (report.widthApplied === false && report.widthNote !== undefined && report.widthNote !== null && channels > 2) {
+    parts.push('width stage bypassed (surround input)')
   }
   parts.push(`${report.iterations} iteration(s)`)
   if (report.achievable) {
@@ -238,7 +278,7 @@ function summaryText ({ destination, info, before, after, report, presetName, bi
 export function registerMasterTools (ctx) {
   ctx.tools.register({
     name: 'audio_master',
-    description: 'Master a .wav file or an inline render to a delivery loudness target without clipping: 3-band Linkwitz-Riley compression, mid/side width with bass mono, and a lookahead true-peak limiter, with an outer search that lands on the target (-14 LUFS streaming, -16 podcast, -23 broadcast) at or below a dBTP ceiling. Writes 8/16/24-bit or 32-bit float, mono or stereo, and reports before/after LUFS and true peak, per-band gain reduction and the iteration count. Use it instead of audio_loudness when a single linear gain would clip or fall short. If the target cannot be reached inside the limiting budget it says so and reports the shortfall rather than clipping.',
+    description: 'Master a .wav file or an inline render to a delivery loudness target without clipping: 3-band Linkwitz-Riley compression, mid/side width with bass mono, and a lookahead true-peak limiter, with an outer search that lands on the target (-14 LUFS streaming, -16 podcast, -23 broadcast) at or below a dBTP ceiling. Writes 8/16/24-bit or 32-bit float at 1/2/4/6/8 channels, and reports before/after LUFS and true peak, per-band gain reduction and the iteration count. Multichannel input keeps its layout: the compressor detector and the limiter curve are linked across every channel, the ceiling is verified on the loudest channel with lib/lufs.js, loudness is measured on the non-LFE channels, and the stereo width stage is bypassed with a note. Use it instead of audio_loudness when a single linear gain would clip or fall short. If the target cannot be reached inside the limiting budget it says so and reports the shortfall rather than clipping.',
     parameters: {
       type: 'object',
       properties: {
@@ -276,11 +316,11 @@ export function registerMasterTools (ctx) {
             }
           }
         },
-        width: { type: 'number', description: 'Mid/side stereo width: 0 = mono, 1 = unchanged, 1.5 = wider (max 2). Mono input ignores it. Overrides the preset.' },
-        bassMonoHz: { type: 'number', description: 'Fold side content below this frequency to the centre (mono bass), 0 disables. Overrides the preset.' },
+        width: { type: 'number', description: 'Mid/side stereo width: 0 = mono, 1 = unchanged, 1.5 = wider (max 2). Mono input ignores it; a 4/6/8-channel input bypasses the stage and says so in the report (mid/side is defined on one stereo pair). Overrides the preset.' },
+        bassMonoHz: { type: 'number', description: 'Fold side content below this frequency to the centre (mono bass), 0 disables. A stereo control: ignored for mono, bypassed for a surround input. Overrides the preset.' },
         driveDb: { type: 'number', description: 'Gain into the multiband compressor in dB, -24..24; raise it to make the compressor work on quiet material. Overrides the preset.' },
         maxGainReductionDb: { type: 'number', description: 'Limiting budget in dB: if the target would need more reduction than this, the chain stops and reports the shortfall; defaults to the preset value (6..14).' },
-        bitDepth: { type: 'integer', enum: BIT_DEPTHS, description: '8=smallest (inline HTML), 16=default, 24=video master, 32=32-bit IEEE float. Defaults to 16.' },
+        bitDepth: { type: 'integer', enum: BIT_DEPTHS, description: '8=smallest (inline HTML), 16=default, 24=video master, 32=32-bit IEEE float. A 4/6/8-channel master supports 16 or 24 bits (the extensible WAV writer); 8/32-bit is refused for surround. Defaults to 16.' },
         out: { type: 'string', description: 'Output path, relative to the working directory or absolute. Defaults to assets/audio/master-<hash>.wav.' }
       },
       additionalProperties: false
@@ -304,7 +344,7 @@ export function registerMasterTools (ctx) {
       const { presetName, request } = resolveRequest('audio_master', args)
       const bitDepth = resolveBitDepth('audio_master', args.bitDepth)
 
-      // --- get the channels (mono or stereo only) ---------------------------
+      // --- get the channels (1/2/4/6/8; the layout is preserved) ------------
       let channels
       let sampleRate
       if (wantsRender) {
@@ -316,13 +356,23 @@ export function registerMasterTools (ctx) {
         channels = read.channels
         sampleRate = read.sampleRate
       }
-      if (channels.length > 2) {
-        throw new Error(`audio_master handles mono or stereo wav files (this one has ${channels.length} channels); fold it to stereo first`)
+      if (!CHANNEL_COUNTS.includes(channels.length)) {
+        throw new Error(`audio_master handles ${CHANNEL_COUNTS.join(', ')} channels (mono, stereo, quad, 5.1, 7.1); this file has ${channels.length}`)
+      }
+      if (channels.length > 2 && !MULTICHANNEL_BIT_DEPTHS.includes(bitDepth)) {
+        throw new Error(`audio_master: a ${channels.length}-channel master must be written at ${MULTICHANNEL_BIT_DEPTHS.join(' or ')} bits (the extensible WAV writer), got ${bitDepth}-bit`)
+      }
+      // Width and bass-mono are a mid/side matrix on one stereo pair; there is no
+      // defined "which pair" for a surround layout, so an explicit request is
+      // refused rather than silently ignored.
+      if (channels.length > 2 && args.width !== undefined && Number(args.width) !== 1) {
+        throw new Error(`audio_master: width is a stereo mid/side control and this input has ${channels.length} channels; master the stereo pair before a surround upmix, or drop width`)
+      }
+      if (channels.length > 2 && args.bassMonoHz !== undefined && Number(args.bassMonoHz) !== 0) {
+        throw new Error(`audio_master: bassMonoHz folds side content of a stereo pair and this input has ${channels.length} channels; drop bassMonoHz for a surround master`)
       }
 
-      const sourceAnalysis = channels.length === 1
-        ? analyzeLoudness(channels[0], sampleRate)
-        : analyzeLoudness(channels[0], sampleRate, { channels })
+      const sourceAnalysis = analyseChannels(channels, sampleRate)
       if (!Number.isFinite(sourceAnalysis.integratedLufs)) {
         throw new Error('audio_master cannot master a silent file: no 400 ms block clears the -70 LUFS gate')
       }
@@ -339,7 +389,12 @@ export function registerMasterTools (ctx) {
 
       // --- encode, write, and measure what actually landed on disk ----------
       const outputChannels = channels.length === 1 ? [chain.samples] : chain.samples
-      const bytes = encodeWavEx(outputChannels, sampleRate, { bitDepth, channels: outputChannels.length })
+      let bytes
+      try {
+        bytes = encodeAnyWav(outputChannels, sampleRate, { bitDepth })
+      } catch (error) {
+        throw new Error(`audio_master: ${error.message}`)
+      }
       const target = resolvePath(cwd, args.out) ?? defaultOutputPath(cwd, 'master', hashSpec({
         source: wantsRender ? { render: args.render } : requestedPath,
         preset: presetName,
@@ -351,18 +406,31 @@ export function registerMasterTools (ctx) {
       // Measure the decoded file: bit depth, dither and the ceiling promise are
       // all about the bytes on disk, not the in-memory master.
       const written = decodeWav(bytes)
-      const writtenAnalysis = written.channels.length === 1
-        ? analyzeLoudness(written.channels[0], written.sampleRate)
-        : analyzeLoudness(written.channels[0], written.sampleRate, { channels: written.channels })
+      const writtenAnalysis = analyseChannels(written.channels, written.sampleRate)
       const writtenMetrics = measure(foldToMono(written.channels), written.sampleRate)
+      // The true peak of the file is the worst channel, measured with the same
+      // meter the rest of the plugin reports; naming the channel is what makes a
+      // surround ceiling claim checkable.
+      const writtenTruePeakByChannel = written.channels.map((channel) => truePeakDbtpOf(channel, written.sampleRate))
+      let writtenTruePeakChannel = 0
+      let writtenTruePeak = Number.NEGATIVE_INFINITY
+      for (let index = 0; index < writtenTruePeakByChannel.length; index += 1) {
+        if (writtenTruePeakByChannel[index] > writtenTruePeak) {
+          writtenTruePeak = writtenTruePeakByChannel[index]
+          writtenTruePeakChannel = index
+        }
+      }
 
       const before = {
         lufs: finiteOr(sourceAnalysis.integratedLufs, GATE_FLOOR_LUFS),
-        truePeak: finiteOr(sourceAnalysis.truePeakDbtp, PEAK_FLOOR_DB)
+        truePeak: finiteOr(sourceAnalysis.truePeakDbtp, PEAK_FLOOR_DB),
+        truePeakChannel: report.truePeakChannelBefore ?? null
       }
       const after = {
         lufs: finiteOr(writtenAnalysis.integratedLufs, GATE_FLOOR_LUFS),
-        truePeak: finiteOr(writtenAnalysis.truePeakDbtp, PEAK_FLOOR_DB),
+        truePeak: finiteOr(writtenTruePeak, PEAK_FLOOR_DB),
+        truePeakChannel: written.channels.length > 1 ? writtenTruePeakChannel : 0,
+        truePeakByChannelDbtp: writtenTruePeakByChannel.map((value) => (Number.isFinite(value) ? Math.round(value * 1000) / 1000 : PEAK_FLOOR_DB)),
         samplePeakDbfs: writtenAnalysis.samplePeakDbfs
       }
       const requestCeiling = Number.isFinite(request.ceilingDbtp) ? request.ceilingDbtp : -1
@@ -386,6 +454,13 @@ export function registerMasterTools (ctx) {
         durationSeconds: writtenAnalysis.durationSeconds,
         sampleRate: written.sampleRate,
         channels: written.channels.length,
+        channelLayout: layoutFor(written.channels.length).id,
+        channelNames: [...layoutFor(written.channels.length).names],
+        channelPeaksDbfs: written.channels.map((channel) => {
+          let peak = 0
+          for (let index = 0; index < channel.length; index += 1) peak = Math.max(peak, Math.abs(channel[index]))
+          return peak > 0 ? Math.round(20 * Math.log10(peak) * 100) / 100 : PEAK_FLOOR_DB
+        }),
         bitDepth: written.bitDepth,
         metrics: {
           ...writtenMetrics,

@@ -17,12 +17,22 @@
  * the next tool will report. The only DSP this module owns is the crossover,
  * the compressor detector, the mid/side matrix and the limiter's gain curve.
  *
+ * Multichannel input (4/6/8 channels) is mastered without being folded: the
+ * multiband detector is linked across every channel, the limiter's gain curve is
+ * one curve for all channels, and the true-peak ceiling is verified on the
+ * loudest channel with `lib/lufs.js`'s meter (so the promise is about the file,
+ * not about a mono downmix). The stereo width stage is bypassed for a surround
+ * layout and says so, because a mid/side matrix is defined on one stereo pair.
+ * Loudness is measured on the non-LFE channels, which is what BS.1770 counts;
+ * the report states that and the count used.
+ *
  * Everything is pure and deterministic: the same samples, rate and options
  * produce identical output. No randomness, no state that survives a call.
  */
 
 import { clamp, dbToGain } from './dsp.js'
 import { analyzeLoudness, truePeak } from './lufs.js'
+import { CHANNEL_COUNTS, layoutFor, linkStemGain } from './multichannel.js'
 
 /* ---------------------------------------------------------------- constants -- */
 
@@ -70,8 +80,6 @@ const COMPRESSOR_CONTROL_SAMPLES = 8
 /** ln(10) / 20: converts a dB gain change to a natural-exponential factor. */
 const DB_TO_NEPER = Math.LN10 / 20
 
-const MAX_CHANNELS = 2
-
 /* ------------------------------------------------------------------ helpers -- */
 
 function round3 (value) {
@@ -109,12 +117,18 @@ function validateRate (sampleRate) {
  * no deliverable should ever contain one, so the stages that read the input
  * sanitise it (see `sanitiseChannels`); this function only rejects a shape that
  * cannot be processed at all.
+ *
+ * Channel counts are restricted to the layouts the plugin can mean: 1, 2, 4, 6
+ * or 8. A 3- or 5-channel array has no WAVE channel order, and mastering it
+ * would be guessing which channel is the centre.
  */
 function asChannelList (samples) {
   if (samples === null || samples === undefined) throw new Error('mastering needs sample data')
   const list = Array.isArray(samples) ? samples : [samples]
   if (list.length === 0) throw new Error('mastering needs at least one channel')
-  if (list.length > MAX_CHANNELS) throw new Error(`mastering handles mono or stereo only, got ${list.length} channels`)
+  if (!CHANNEL_COUNTS.includes(list.length)) {
+    throw new Error(`mastering handles ${CHANNEL_COUNTS.join(', ')} channels (mono, stereo, quad, 5.1, 7.1), got ${list.length}`)
+  }
   const frames = list[0] === null || list[0] === undefined ? 0 : list[0].length
   if (!Number.isInteger(frames) || frames <= 0) throw new Error('mastering needs non-empty sample arrays')
   for (const channel of list) {
@@ -162,21 +176,72 @@ function scaleChannels (channels, gain) {
   }
 }
 
-/** Analyze a channel list with the shared meter, stereo power summed. */
-function analyseChannels (channels, rate) {
-  return channels.length === 1
-    ? analyzeLoudness(channels[0], rate)
-    : analyzeLoudness(channels[0], rate, { channels })
+/**
+ * The channels a loudness measurement may use: LFE is excluded.
+ *
+ * ITU-R BS.1770 does not include an LFE channel in the loudness measure — it is
+ * an effects channel that plays up to 10 dB louder than its samples say — so
+ * counting it would let a handful of effects drag the integrated figure and make
+ * the master quieter than the requested target. (Surround channel *weighting* is
+ * also not applied: `lib/lufs.js` sums the measured channels at equal weight,
+ * which is the honest limitation of that meter and is stated in the report.)
+ *
+ * @param {Float32Array[]} channels - channel list in WAVE order.
+ * @returns {{ measured: Float32Array[], lfeExcluded: boolean }} the channels to meter.
+ */
+function loudnessChannels (channels) {
+  const layout = layoutFor(channels.length)
+  if (!layout.hasLfe) return { measured: channels, lfeExcluded: false }
+  return {
+    measured: channels.filter((_, index) => index !== layout.lfeIndex),
+    lfeExcluded: true
+  }
 }
 
-/** Channel-aware true peak: the worst channel wins, like the meter reports it. */
+/** Analyse a channel list with the shared meter, LFE excluded and power summed. */
+function analyseChannels (channels, rate) {
+  const { measured } = loudnessChannels(channels)
+  return measured.length === 1
+    ? analyzeLoudness(measured[0], rate)
+    : analyzeLoudness(measured[0], rate, { channels: measured })
+}
+
+/**
+ * Channel-aware true peak: the worst channel wins, like the meter reports it.
+ *
+ * A surround deliverable's ceiling is a property of the *file*, not of a fold:
+ * one hot surround channel is a clipped file even when the mono downmix looks
+ * fine. So every channel is measured with the same `lib/lufs.js` truePeak the
+ * reporting tools use, the maximum is the file's dBTP, and the index says which
+ * channel it was on so the report can name it.
+ *
+ * @param {Float32Array[]} channels - channel list.
+ * @param {number} rate - sample rate in Hz.
+ * @returns {{ dbtp: number, channel: number, byChannel: number[] }} worst peak and where.
+ */
 function measuredTruePeak (channels, rate) {
-  let peak = Number.NEGATIVE_INFINITY
-  for (const channel of channels) {
-    const value = truePeak(channel, rate)
-    if (value > peak) peak = value
+  const byChannel = channels.map((channel) => truePeak(channel, rate))
+  let dbtp = Number.NEGATIVE_INFINITY
+  let channel = 0
+  for (let index = 0; index < byChannel.length; index += 1) {
+    if (byChannel[index] > dbtp) {
+      dbtp = byChannel[index]
+      channel = index
+    }
   }
-  return peak
+  return { dbtp, channel, byChannel }
+}
+
+/** Per-channel sample peak in dBFS, floored at -120 like the meter does. */
+function samplePeaksDbfs (channels) {
+  return channels.map((channel) => {
+    let peak = 0
+    for (let index = 0; index < channel.length; index += 1) {
+      const magnitude = Math.abs(channel[index])
+      if (magnitude > peak) peak = magnitude
+    }
+    return round2(peak > 0 ? 20 * Math.log10(peak) : -120)
+  })
 }
 
 /* ------------------------------------------------------------------ biquads -- */
@@ -536,22 +601,21 @@ function limiterGainCurve (envelope, rate, options) {
 
 function applyGainCurve (channels, curve, inputGain = 1) {
   const frames = curve.length
-  if (channels.length > 1) {
-    const left = channels[0]
-    const right = channels[1]
-    const outLeft = new Float32Array(frames)
-    const outRight = new Float32Array(frames)
-    for (let i = 0; i < frames; i += 1) {
-      const gain = curve[i] * inputGain
-      outLeft[i] = left[i] * gain
-      outRight[i] = right[i] * gain
-    }
-    return [outLeft, outRight]
+  if (channels.length === 1) {
+    const source = channels[0]
+    const out = new Float32Array(frames)
+    for (let i = 0; i < frames; i += 1) out[i] = source[i] * curve[i] * inputGain
+    return [out]
   }
-  const source = channels[0]
-  const out = new Float32Array(frames)
-  for (let i = 0; i < frames; i += 1) out[i] = source[i] * curve[i] * inputGain
-  return [out]
+  // One gain curve for every channel: the limiter lowers a multichannel image
+  // without deforming it, because all channels are scaled by the same number at
+  // every instant.
+  const output = channels.map(() => new Float32Array(frames))
+  for (let i = 0; i < frames; i += 1) {
+    const gain = curve[i] * inputGain
+    for (let channel = 0; channel < channels.length; channel += 1) output[channel][i] = channels[channel][i] * gain
+  }
+  return output
 }
 
 function maxGainReductionDb (curve) {
@@ -604,8 +668,7 @@ function limitOnce (channels, rate, envelope, options, inputGainDb) {
  */
 function compressBand (channels, rate, spec, kneeDb) {
   const frames = channels[0].length
-  const first = channels[0]
-  const second = channels.length > 1 ? channels[1] : null
+  const channelCount = channels.length
   const slope = spec.ratio > 1 ? 1 - 1 / spec.ratio : 0
   const makeupGain = dbToGain(spec.makeupDb)
   const blockSeconds = COMPRESSOR_CONTROL_SAMPLES / rate
@@ -618,17 +681,17 @@ function compressBand (channels, rate, spec, kneeDb) {
   let previousGain = makeupGain
   for (let start = 0; start < frames; start += COMPRESSOR_CONTROL_SAMPLES) {
     const end = start + COMPRESSOR_CONTROL_SAMPLES < frames ? start + COMPRESSOR_CONTROL_SAMPLES : frames
-    // Block peak power (max across channels) drives the linked detector.
+    // Block peak power across *every* channel drives one linked detector, and
+    // the resulting gain is written to every channel. A per-channel detector
+    // would compress a hard-panned hit only where it lands and pump the surround
+    // image; one linked gain is what keeps the image still.
     let power = 0
     for (let i = start; i < end; i += 1) {
-      const left = first[i]
-      let square = left * left
-      if (second !== null) {
-        const right = second[i]
-        const rightSquare = right * right
-        if (rightSquare > square) square = rightSquare
+      for (let channel = 0; channel < channelCount; channel += 1) {
+        const value = channels[channel][i]
+        const square = value * value
+        if (square > power) power = square
       }
-      if (square > power) power = square
     }
     envelope = power > envelope
       ? envelope + (power - envelope) * attackCoefficient
@@ -645,8 +708,7 @@ function compressBand (channels, rate, spec, kneeDb) {
     const step = (target - previousGain) / (end - start)
     for (let i = start; i < end; i += 1) {
       previousGain += step
-      first[i] *= previousGain
-      if (second !== null) second[i] *= previousGain
+      for (let channel = 0; channel < channelCount; channel += 1) channels[channel][i] *= previousGain
     }
   }
   return maxGainReduction
@@ -736,6 +798,7 @@ export function multibandCompressor (samples, sampleRate, options = {}) {
       crossover: 'linkwitz-riley-4',
       kneeDb,
       bandCount: bands.length,
+      channelCount: list.length,
       bands: reports
     }
   }
@@ -825,7 +888,10 @@ export function transientShaper (samples, sampleRate, options = {}) {
  *
  * A mono input has no side signal to widen; it is returned unchanged with
  * `applied: false` (inventing a stereo image from a mono source is a creative
- * decision, not a mastering one).
+ * decision, not a mastering one). A 4/6/8-channel input is returned unchanged
+ * for the same reason in the other direction: mid/side is a matrix on one
+ * stereo pair, and which pair of a surround layout it should touch is not a
+ * decision a preset gets to make. The report says the stage was bypassed.
  *
  * @param {Float32Array|Float32Array[]} samples - mono buffer or one per channel.
  * @param {number} sampleRate - Hz.
@@ -844,6 +910,25 @@ export function stereoWidth (samples, sampleRate, options = {}) {
   const width = numberOr(options.width, 1, 'width', 0, 2)
   const bassMonoHz = numberOr(options.bassMonoHz, 120, 'bassMonoHz', 0, 800)
   const input = sanitiseChannels(list)
+
+  if (input.length > 2) {
+    return {
+      samples: restoreShape(input.map(copyChannel), mono),
+      report: {
+        width: 1,
+        bassMonoHz,
+        mode: 'multichannel',
+        applied: false,
+        channelCount: input.length,
+        sideEnergyBeforeDb: -120,
+        sideEnergyAfterDb: -120,
+        monoSumPreserved: true,
+        polarityPreserved: true,
+        monoSafe: true,
+        note: `width is a mid/side matrix on a stereo pair; a ${input.length}-channel input is passed through unchanged`
+      }
+    }
+  }
 
   if (input.length < 2) {
     return {
@@ -958,6 +1043,7 @@ export function stereoWidth (samples, sampleRate, options = {}) {
  *   lookaheadMs: number, releaseMs: number, oversample: number, detectionTaps: number,
  *   verifiedTaps: number, detectionGuardDb: number, maxGainReductionDb: number,
  *   trimDb: number, truePeakBeforeDbtp: number, truePeakAfterDbtp: number,
+ *   truePeakChannel: number, truePeakByChannelDbtp: number[], channelCount: number,
  *   overshootDb: number } }}
  */
 export function truePeakLimiter (samples, sampleRate, options = {}) {
@@ -974,8 +1060,12 @@ export function truePeakLimiter (samples, sampleRate, options = {}) {
   let trimDb = 0
   let truePeakAfter = measuredTruePeak(output, rate)
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    if (!Number.isFinite(truePeakAfter) || truePeakAfter <= settings.ceilingDbtp) break
-    const correction = settings.ceilingDbtp - TRIM_MARGIN_DB - truePeakAfter
+    // `measuredTruePeak` is the worst of every channel, so a hot surround is
+    // caught by the same trim as a hot front. A linear trim lowers the true peak
+    // by exactly its dB value on every channel, so one correction per attempt is
+    // enough and the reported number stays a real measurement.
+    if (!Number.isFinite(truePeakAfter.dbtp) || truePeakAfter.dbtp <= settings.ceilingDbtp) break
+    const correction = settings.ceilingDbtp - TRIM_MARGIN_DB - truePeakAfter.dbtp
     trimDb += correction
     scaleChannels(output, dbToGain(correction))
     truePeakAfter = measuredTruePeak(output, rate)
@@ -993,9 +1083,12 @@ export function truePeakLimiter (samples, sampleRate, options = {}) {
       detectionGuardDb: DETECTION_GUARD_DB,
       maxGainReductionDb: round2(pass.gainReductionDb),
       trimDb: round3(trimDb),
-      truePeakBeforeDbtp: round3(truePeakBefore),
-      truePeakAfterDbtp: round3(truePeakAfter),
-      overshootDb: round3(Math.max(0, truePeakAfter - settings.ceilingDbtp))
+      channelCount: output.length,
+      truePeakBeforeDbtp: round3(truePeakBefore.dbtp),
+      truePeakAfterDbtp: round3(truePeakAfter.dbtp),
+      truePeakChannel: truePeakAfter.channel,
+      truePeakByChannelDbtp: truePeakAfter.byChannel.map((value) => round3(value)),
+      overshootDb: round3(Math.max(0, truePeakAfter.dbtp - settings.ceilingDbtp))
     }
   }
 }
@@ -1141,9 +1234,10 @@ function predictGainForTarget (envelope, rate, settings, lufsBefore, residual) {
  *   `maxGainReductionDb` (default 12) and `maxIterations` (default 5).
  * @returns {{ samples: Float32Array|Float32Array[],
  *   report: { lufsBefore: number, lufsAfter: number, truePeakBefore: number,
- *   truePeakAfter: number, gainReductionDb: number, bands: object[],
- *   iterations: number, achievable: boolean, shortfallLu: number,
- *   limitedBy: string } }}
+ *   truePeakAfter: number, truePeakChannel: number, truePeakByChannelDbtp: number[],
+ *   channelCount: number, channelLayout: string, channelPeaksDbfs: number[],
+ *   gainReductionDb: number, bands: object[], iterations: number,
+ *   achievable: boolean, shortfallLu: number, limitedBy: string } }}
  */
 export function masterChain (samples, sampleRate, options = {}) {
   const rate = validateRate(sampleRate)
@@ -1153,10 +1247,24 @@ export function masterChain (samples, sampleRate, options = {}) {
   const source = list.map(copyChannel)
   const before = analyseChannels(source, rate)
   const lufsBefore = before.integratedLufs
-  const truePeakBefore = before.truePeakDbtp
+  const loudness = loudnessChannels(source)
+  const layout = layoutFor(source.length)
+  // The ceiling is a property of the whole file, LFE included: a hot LFE channel
+  // is a clipped file even though it is not part of the loudness measure. For
+  // mono/stereo, `analyzeLoudness` already measured the pair's worst channel, so
+  // no second pass is needed; a surround layout needs the all-channel scan
+  // because the loudness measurement legitimately skips LFE.
+  const surround = source.length > 2
+  const truePeakBefore = surround
+    ? measuredTruePeak(source, rate)
+    : {
+        dbtp: before.truePeakDbtp,
+        channel: source.length === 1 ? 0 : null,
+        byChannel: source.length === 1 ? [before.truePeakDbtp] : null
+      }
 
   // --- fixed front of the chain: drive, compression, width ------------------
-  if (settings.driveDb !== 0) scaleChannels(source, dbToGain(settings.driveDb))
+  linkStemGain(source, settings.driveDb)
   const compression = multibandCompressor(source, rate, { bands: settings.bands, kneeDb: settings.kneeDb })
   const width = stereoWidth(compression.samples, rate, { width: settings.width, bassMonoHz: settings.bassMonoHz })
   const preMastered = asChannelList(width.samples)
@@ -1167,7 +1275,8 @@ export function masterChain (samples, sampleRate, options = {}) {
     targetLufs: round2(settings.targetLufs),
     ceilingDbtp: round2(settings.ceilingDbtp),
     lufsBefore: round3(lufsBefore),
-    truePeakBefore: round3(truePeakBefore),
+    truePeakBefore: round3(truePeakBefore.dbtp),
+    truePeakChannelBefore: truePeakBefore.channel,
     gainReductionDb: 0,
     bands: compression.report.bands,
     iterations: 0,
@@ -1178,7 +1287,14 @@ export function masterChain (samples, sampleRate, options = {}) {
     driveDb: round2(settings.driveDb),
     width: width.report.width,
     widthApplied: width.report.applied,
+    widthNote: width.report.note ?? null,
     bassMonoHz: width.report.bassMonoHz,
+    channelCount: source.length,
+    channelLayout: layout.id,
+    channelNames: [...layout.names],
+    /** How many channels the loudness meter used: LFE is not one of them. */
+    loudnessChannels: loudness.measured.length,
+    lfeExcluded: loudness.lfeExcluded,
     maxGainReductionDb: round2(settings.maxGainReductionDb),
     detectionGuardDb: DETECTION_GUARD_DB,
     lufsTolerance: TARGET_TOLERANCE_LU
@@ -1193,6 +1309,9 @@ export function masterChain (samples, sampleRate, options = {}) {
         ...baseReport,
         lufsAfter: Number.NEGATIVE_INFINITY,
         truePeakAfter: Number.NEGATIVE_INFINITY,
+        truePeakChannel: -1,
+        truePeakByChannelDbtp: [],
+        channelPeaksDbfs: [],
         achievable: false,
         shortfallLu: Number.POSITIVE_INFINITY,
         limitedBy: 'silence'
@@ -1211,24 +1330,34 @@ export function masterChain (samples, sampleRate, options = {}) {
     gainDb = settled.gainDb
     const limited = applyGainCurve(preMastered, settled.curve, dbToGain(gainDb))
     const analysis = analyseChannels(limited, rate)
+    // `analyzeLoudness` already measured the true peak of every channel it used,
+    // and for mono/stereo that is every channel — measuring it a second time in
+    // the hot search loop would buy nothing and cost a true-peak pass per
+    // iteration. A surround master gets the explicit all-channel scan because
+    // the loudness meter skips LFE.
+    const peakMeasured = surround ? measuredTruePeak(limited, rate) : null
+    const peakDbtp = peakMeasured === null ? analysis.truePeakDbtp : peakMeasured.dbtp
 
     // The limiter promises the *sample* grid plus a detection guard; the meter
     // is the authority, and a linear trim is an exact correction.
     let trimDb = 0
-    if (Number.isFinite(analysis.truePeakDbtp) && analysis.truePeakDbtp > settings.ceilingDbtp) {
-      trimDb = settings.ceilingDbtp - TRIM_MARGIN_DB - analysis.truePeakDbtp
+    if (Number.isFinite(peakDbtp) && peakDbtp > settings.ceilingDbtp) {
+      trimDb = settings.ceilingDbtp - TRIM_MARGIN_DB - peakDbtp
       scaleChannels(limited, dbToGain(trimDb))
     }
     const lufsAfter = analysis.integratedLufs + trimDb
-    const truePeakAfter = Number.isFinite(analysis.truePeakDbtp)
-      ? analysis.truePeakDbtp + trimDb
-      : Number.NEGATIVE_INFINITY
+    const truePeakAfter = Number.isFinite(peakDbtp) ? peakDbtp + trimDb : Number.NEGATIVE_INFINITY
     const error = settings.targetLufs - lufsAfter
     const meanReductionDb = meanGainReductionDb(settled.curve)
     attempts.push({
       gainDb,
       lufs: lufsAfter,
       truePeak: truePeakAfter,
+      truePeakChannel: peakMeasured === null ? (source.length === 1 ? 0 : null) : peakMeasured.channel,
+      truePeakByChannel: peakMeasured === null
+        ? (source.length === 1 ? [truePeakAfter] : null)
+        : peakMeasured.byChannel.map((value) => value + trimDb),
+      channelPeaksDbfs: samplePeaksDbfs(limited),
       trimDb,
       gainReductionDb: settled.gainReductionDb,
       atCap: settled.atCap,
@@ -1281,6 +1410,14 @@ export function masterChain (samples, sampleRate, options = {}) {
       ...baseReport,
       lufsAfter: round3(chosen.lufs),
       truePeakAfter: round3(chosen.truePeak),
+      // The ceiling promise is about every channel: name the one that is closest
+      // to it and report all of them when they were measured separately, so a
+      // surround deliverable can be checked without decoding it again.
+      truePeakChannel: chosen.truePeakChannel,
+      truePeakByChannelDbtp: chosen.truePeakByChannel === null
+        ? null
+        : chosen.truePeakByChannel.map((value) => round3(value)),
+      channelPeaksDbfs: chosen.channelPeaksDbfs,
       gainReductionDb: round2(chosen.gainReductionDb),
       appliedGainDb: round2(chosen.gainDb),
       trimDb: round3(chosen.trimDb),

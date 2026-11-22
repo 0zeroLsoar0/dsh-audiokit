@@ -2,10 +2,15 @@
  * Pure track operations: everything an agent needs to finish a cue without
  * re-rendering it.
  *
- * A track is `{ samples, sampleRate }` where `samples` is a Float32Array; every
+ * A track is `{ samples, sampleRate }` where `samples` is a Float32Array; a
+ * multichannel track is `{ channels: Float32Array[], sampleRate }`. Every
  * function here takes tracks (or raw samples for the resampler) and returns a
  * new track, so operations compose: trim → fade → rate-change → stereo is one
- * expression, and nothing in between shares memory with the caller.
+ * expression, and nothing in between shares memory with the caller. Edits that
+ * act on frames (trim, gain, fade, reverse, padding) carry a multichannel track
+ * through channel for channel; operations that need a stereo image or a sum
+ * (toStereo, concat, mixdown) stay mono-only and refuse a wider track with a
+ * clear message instead of silently folding it.
  *
  * The one operation the existing engine cannot do acceptably is a rate change:
  * `audio.js` resamples with linear interpolation, which is fine for rate-matched
@@ -27,17 +32,50 @@ function numberOr (value, fallback) {
 }
 
 /**
- * Validate a track and return its parts.
- * @param {{ samples: Float32Array, sampleRate: number }} track
- * @returns {{ samples: Float32Array, sampleRate: number }}
+ * Validate a track and return its channels.
+ *
+ * A track is `{ samples, sampleRate }` for a mono buffer or
+ * `{ channels: [...], sampleRate }` for a multichannel one. The frame axis is
+ * shared by every channel, so an edit is channel-agnostic once the shape is
+ * known: trim, gain, fade, reverse and padding all act on frames.
+ *
+ * @param {{ samples: Float32Array, sampleRate: number }|{ channels: Float32Array[], sampleRate: number }} track
+ * @returns {{ channels: Float32Array[], sampleRate: number }}
  */
-function readTrack (track) {
-  if (track === null || typeof track !== 'object' || !ArrayBuffer.isView(track.samples)) {
-    throw new Error('expected a track shaped { samples, sampleRate }')
+function readTrackChannels (track) {
+  if (track === null || typeof track !== 'object') {
+    throw new Error('expected a track shaped { samples, sampleRate } or { channels, sampleRate }')
   }
   const sampleRate = Math.round(numberOr(track.sampleRate, 0))
   if (sampleRate <= 0) throw new Error(`track sampleRate must be a positive number, got ${track.sampleRate}`)
-  return { samples: track.samples, sampleRate }
+  const rawChannels = track.channels !== undefined
+    ? track.channels
+    : (ArrayBuffer.isView(track.samples) ? [track.samples] : null)
+  if (!Array.isArray(rawChannels) || rawChannels.length === 0 || rawChannels.some((channel) => !ArrayBuffer.isView(channel))) {
+    throw new Error('expected a track shaped { samples: Float32Array, sampleRate } or { channels: Float32Array[], sampleRate }')
+  }
+  const frames = rawChannels[0].length
+  if (rawChannels.some((channel) => channel.length !== frames)) throw new Error('every channel of a track must have the same length')
+  return { channels: rawChannels, sampleRate }
+}
+
+/**
+ * Validate a mono track. Operations with no multichannel meaning (concat,
+ * mixdown, stereo placement) use this and say so instead of silently folding.
+ * @param {{ samples: Float32Array, sampleRate: number }|{ channels: Float32Array[], sampleRate: number }} track
+ * @returns {{ samples: Float32Array, sampleRate: number }}
+ */
+function readTrack (track) {
+  const { channels, sampleRate } = readTrackChannels(track)
+  if (channels.length !== 1) {
+    throw new Error(`this operation works on mono tracks; this one has ${channels.length} channels (downmix it with fitChannels first)`)
+  }
+  return { samples: channels[0], sampleRate }
+}
+
+/** Build a result whose shape matches the input: mono stays `samples`, multichannel is `channels`. */
+function shapeResult (channels, sampleRate) {
+  return channels.length === 1 ? { samples: channels[0], sampleRate } : { channels, sampleRate }
 }
 
 function frame (seconds, sampleRate) {
@@ -252,40 +290,57 @@ function nearestZeroCrossing (samples, target, windowFrames) {
  * `trim({ start: 0.1, end: 0.2 })` at 44.1 kHz is exactly 4410 frames and starts
  * on the frame the caller asked for. Set `snapToZeroCrossing` to move the cut to
  * the nearest crossing (within `snapWindowSeconds`, default 5 ms) when a click
- * matters more than the exact index.
+ * matters more than the exact index. On a multichannel track the snap looks at
+ * the mono fold, so it is a best-effort click guard rather than a per-channel
+ * guarantee; the frames cut are identical for every channel.
  *
- * @param {{ samples: Float32Array, sampleRate: number }} track
+ * @param {{ samples: Float32Array, sampleRate: number }|{ channels: Float32Array[], sampleRate: number }} track
  * @param {{ start?: number, end?: number, snapToZeroCrossing?: boolean, snapWindowSeconds?: number }} [options]
- * @returns {{ samples: Float32Array, sampleRate: number }}
+ * @returns {{ samples?: Float32Array, channels?: Float32Array[], sampleRate: number }}
  */
 export function trim (track, options = {}) {
-  const { samples, sampleRate } = readTrack(track)
-  const duration = seconds(samples.length, sampleRate)
-  let startFrame = clamp(frame(numberOr(options.start, 0), sampleRate), 0, samples.length)
-  let endFrame = clamp(frame(numberOr(options.end, duration), sampleRate), 0, samples.length)
+  const { channels, sampleRate } = readTrackChannels(track)
+  const frames = channels[0].length
+  const duration = seconds(frames, sampleRate)
+  let startFrame = clamp(frame(numberOr(options.start, 0), sampleRate), 0, frames)
+  let endFrame = clamp(frame(numberOr(options.end, duration), sampleRate), 0, frames)
   if (options.snapToZeroCrossing === true) {
     const windowFrames = Math.max(1, frame(numberOr(options.snapWindowSeconds, 0.005), sampleRate))
-    startFrame = nearestZeroCrossing(samples, startFrame, windowFrames)
-    endFrame = nearestZeroCrossing(samples, endFrame, windowFrames)
+    const reference = channels.length === 1 ? channels[0] : foldChannels(channels)
+    startFrame = nearestZeroCrossing(reference, startFrame, windowFrames)
+    endFrame = nearestZeroCrossing(reference, endFrame, windowFrames)
   }
   if (endFrame <= startFrame) {
     throw new Error(`trim: end must be after start (frames ${startFrame}..${endFrame})`)
   }
-  return { samples: samples.slice(startFrame, endFrame), sampleRate }
+  return shapeResult(channels.map((channel) => channel.slice(startFrame, endFrame)), sampleRate)
+}
+
+/** Average every channel to one buffer: used only to find a cut point, never as audio. */
+function foldChannels (channels) {
+  const frames = channels[0].length
+  const out = new Float32Array(frames)
+  for (const channel of channels) {
+    for (let index = 0; index < frames; index += 1) out[index] += channel[index]
+  }
+  for (let index = 0; index < frames; index += 1) out[index] /= channels.length
+  return out
 }
 
 /**
- * Apply a gain in decibels.
- * @param {{ samples: Float32Array, sampleRate: number }} track
+ * Apply a gain in decibels to every channel.
+ * @param {{ samples: Float32Array, sampleRate: number }|{ channels: Float32Array[], sampleRate: number }} track
  * @param {number} gainDb - level change; negative attenuates.
- * @returns {{ samples: Float32Array, sampleRate: number }}
+ * @returns {{ samples?: Float32Array, channels?: Float32Array[], sampleRate: number }}
  */
 export function applyGainDb (track, gainDb) {
-  const { samples, sampleRate } = readTrack(track)
+  const { channels, sampleRate } = readTrackChannels(track)
   const gain = dbToGain(numberOr(gainDb, 0))
-  const out = new Float32Array(samples.length)
-  for (let index = 0; index < samples.length; index += 1) out[index] = samples[index] * gain
-  return { samples: out, sampleRate }
+  return shapeResult(channels.map((samples) => {
+    const out = new Float32Array(samples.length)
+    for (let index = 0; index < samples.length; index += 1) out[index] = samples[index] * gain
+    return out
+  }), sampleRate)
 }
 
 /** Fade curve: 0 at silence → 1 at full level. */
@@ -296,55 +351,62 @@ function curveGain (curve, progress) {
 }
 
 /**
- * Fade a track in and/or out.
+ * Fade a track in and/or out, identically on every channel.
  *
  * Gains are exact at the endpoints: the first sample of a fade-in is
  * multiplied by 0 and the sample a fade length past it is untouched (1), and a
  * fade-out's last sample is exactly 0. `curve: 'equalPower'` (sin shape) keeps
  * perceived loudness steadier than the default linear ramp.
  *
- * @param {{ samples: Float32Array, sampleRate: number }} track
+ * @param {{ samples: Float32Array, sampleRate: number }|{ channels: Float32Array[], sampleRate: number }} track
  * @param {{ in?: number, out?: number, curve?: 'linear'|'equalPower' }} [options] - fade lengths in seconds.
- * @returns {{ samples: Float32Array, sampleRate: number }}
+ * @returns {{ samples?: Float32Array, channels?: Float32Array[], sampleRate: number }}
  */
 export function fade (track, options = {}) {
-  const { samples, sampleRate } = readTrack(track)
-  const out = Float32Array.from(samples)
+  const { channels, sampleRate } = readTrackChannels(track)
+  const frames = channels[0].length
   const curve = options.curve === 'equalPower' ? 'equalPower' : 'linear'
-  const inFrames = clamp(frame(numberOr(options.in, 0), sampleRate), 0, out.length)
-  const outFrames = clamp(frame(numberOr(options.out, 0), sampleRate), 0, out.length)
-  for (let index = 0; index < inFrames; index += 1) out[index] *= curveGain(curve, index / inFrames)
-  for (let offset = 0; offset < outFrames; offset += 1) {
-    out[out.length - 1 - offset] *= curveGain(curve, offset / outFrames)
-  }
-  return { samples: out, sampleRate }
+  const inFrames = clamp(frame(numberOr(options.in, 0), sampleRate), 0, frames)
+  const outFrames = clamp(frame(numberOr(options.out, 0), sampleRate), 0, frames)
+  return shapeResult(channels.map((samples) => {
+    const out = Float32Array.from(samples)
+    for (let index = 0; index < inFrames; index += 1) out[index] *= curveGain(curve, index / inFrames)
+    for (let offset = 0; offset < outFrames; offset += 1) {
+      out[out.length - 1 - offset] *= curveGain(curve, offset / outFrames)
+    }
+    return out
+  }), sampleRate)
 }
 
 /**
- * Play a track backwards.
- * @param {{ samples: Float32Array, sampleRate: number }} track
- * @returns {{ samples: Float32Array, sampleRate: number }}
+ * Play a track backwards, every channel aligned.
+ * @param {{ samples: Float32Array, sampleRate: number }|{ channels: Float32Array[], sampleRate: number }} track
+ * @returns {{ samples?: Float32Array, channels?: Float32Array[], sampleRate: number }}
  */
 export function reverse (track) {
-  const { samples, sampleRate } = readTrack(track)
-  const out = Float32Array.from(samples)
-  out.reverse()
-  return { samples: out, sampleRate }
+  const { channels, sampleRate } = readTrackChannels(track)
+  return shapeResult(channels.map((samples) => {
+    const out = Float32Array.from(samples)
+    out.reverse()
+    return out
+  }), sampleRate)
 }
 
 /**
  * Add silence before and/or after a track.
- * @param {{ samples: Float32Array, sampleRate: number }} track
+ * @param {{ samples: Float32Array, sampleRate: number }|{ channels: Float32Array[], sampleRate: number }} track
  * @param {{ lead?: number, tail?: number }} [options] - padding in seconds.
- * @returns {{ samples: Float32Array, sampleRate: number }}
+ * @returns {{ samples?: Float32Array, channels?: Float32Array[], sampleRate: number }}
  */
 export function padSilence (track, options = {}) {
-  const { samples, sampleRate } = readTrack(track)
+  const { channels, sampleRate } = readTrackChannels(track)
   const lead = Math.max(0, frame(numberOr(options.lead, 0), sampleRate))
   const tail = Math.max(0, frame(numberOr(options.tail, 0), sampleRate))
-  const out = new Float32Array(lead + samples.length + tail)
-  out.set(samples, lead)
-  return { samples: out, sampleRate }
+  return shapeResult(channels.map((samples) => {
+    const out = new Float32Array(lead + samples.length + tail)
+    out.set(samples, lead)
+    return out
+  }), sampleRate)
 }
 
 /** A join gap/crossfade is an edit between takes; longer than this is a timeline move. */

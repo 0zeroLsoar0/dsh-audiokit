@@ -25,6 +25,8 @@ import { registerBusTools } from './lib/tools-bus.js'
 import { registerComposeTools } from './lib/tools-compose.js'
 import { registerConvertTools } from './lib/tools-convert.js'
 import { registerDesignTools } from './lib/tools-design.js'
+import { registerGraphTools } from './lib/tools-graph.js'
+import { registerDawTools } from './lib/tools-daw.js'
 import { registerLoudnessTools } from './lib/tools-loudness.js'
 import { registerMouthTools } from './lib/tools-mouth.js'
 import { registerMidiTools } from './lib/tools-midi.js'
@@ -33,6 +35,7 @@ import { registerLiveTools } from './lib/tools-live.js'
 import { registerReactTools } from './lib/tools-react.js'
 import { registerSettingsRoute } from './lib/settings-route.js'
 import { registerSingTools } from './lib/tools-sing.js'
+import { registerSamplerTools } from './lib/tools-sampler.js'
 import { registerSkill } from './lib/skill.js'
 import { registerSpatialTools } from './lib/tools-spatial.js'
 import { registerStemsTools } from './lib/tools-stems.js'
@@ -46,7 +49,7 @@ import { registerVideoTools } from './lib/tools-video.js'
 export const name = 'dsh-audio'
 
 /** Shown by the settings page; keep in sync with package.json. */
-const VERSION = '0.5.9'
+const VERSION = '0.5.10'
 
 /** The tool registry is required; the other seams are used when present. */
 export const inject = ['tools']
@@ -59,8 +62,10 @@ const PROMPT_SECTION = [
   'sound *is*, not by what it is made of:',
   '',
   '- one hit, texture or foley sound → `audio_synth` (38 presets; deterministic, same seed = same bytes)',
+  '- a sound no preset covers → `audio_synth_graph` (write the synthesis graph yourself: osc/noise/filter/env/LFO/FM/drive/reverb)',
   '- many events from one rule (typing, rain, accelerating ticks) → `audio_pattern`',
   '- a designed object ("metal door slam", "magic sparkle") → `audio_design` (26 layered recipes)',
+  '- your own recorded wav, pitched and mapped across a keyboard → `audio_sampler` (no bundled assets)',
   '- combining rendered files into one cue → `audio_mix` (per-track gain and time offsets)',
   '- music: a cue with harmony and a groove → `audio_compose` (8 genres, returns beat times for sync)',
   '- narration or dialogue → `audio_tts`; singing → `audio_sing` (zero assets); `audio_voices` lists voice ids',
@@ -73,6 +78,7 @@ const PROMPT_SECTION = [
   '- EQ / compression / ducking on a cue set → `audio_bus`; exchange scores with a DAW → `audio_midi`',
   '- a sound that must come from a direction, or a file wider than stereo → `audio_spatial`',
   '- the final deliverable is a video → `audio_mux` (probe, mux, shot-cut times, extract)',
+  '- handing the work to a DAW or editor → `audio_daw` (EDL, Reaper project, CSV, labels)',
   '- a mouth track without any voice audio (captions, silent comics) → `audio_mouth`',
   '- what a sound is made of: f0, harmonics, formants, noise, decay → `audio_analyze`',
   '- fixing an existing file: trim/join/fade/re-encode → `audio_convert`; retime or transpose → `audio_stretch`',
@@ -92,6 +98,7 @@ const PROMPT_SECTION = [
 export function apply (ctx, config = {}) {
   registerExtraPresets()
   registerTools(ctx)
+  registerGraphTools(ctx)
   registerTtsTool(ctx, config)
   registerVoicesTool(ctx, config)
   registerCheckTool(ctx, config)
@@ -111,7 +118,9 @@ export function apply (ctx, config = {}) {
   registerComposeTools(ctx)
   registerMidiTools(ctx)
   registerSingTools(ctx, config)
+  registerSamplerTools(ctx)
   registerStemsTools(ctx)
+  registerDawTools(ctx)
   registerStretchTools(ctx)
   registerSettingsRoute(ctx, config, VERSION)
 

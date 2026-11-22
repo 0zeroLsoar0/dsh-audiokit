@@ -31,8 +31,10 @@ const CONTENT = `# 给 HTML 动画配音
 | 你要的是 | 用这个 | 为什么 |
 |---|---|---|
 | 一个音效、一层底噪 | \`audio_synth\` | 38 个预设，参数是 0..1 的感知量 |
+| 预设里没有的声音，要自己搭 | \`audio_synth_graph\` | 振荡器/噪声/滤波/包络/LFO/FM/折叠/混响的声明式图 |
 | 一条规则铺满一段时间 | \`audio_pattern\` | train/scatter/riser，一次调用几百个事件 |
 | 一个"东西"（门、玻璃、爆炸、魔法） | \`audio_design\` | 26 个配方，多层共享包络与混响 |
+| 手上有真实录音要用 | \`audio_sampler\` | 键位/力度分区、变调、循环、包络（插件不内置素材） |
 | 一段音乐 | \`audio_compose\` | 真和声 + 声部进行 + 鼓，返回节拍表 |
 | 旁白/台词 | \`audio_tts\` | MiniMax / OpenAI 兼容 / 免费 Edge |
 | 选音色 | \`audio_voices\` | 列出当前供应商可用的音色（不产出音频） |
@@ -42,9 +44,10 @@ const CONTENT = `# 给 HTML 动画配音
 | 把声音接到事件上 | \`audio_bind\` | 生成 cue 表 + 播放器代码 |
 | 成片是视频，要把声音合进去 | \`audio_mux\` | probe/mux/cuts/extract，走本机 ffmpeg（不做分镜分析） |
 | 界面自己的声音（hover/click/成功/失败） | \`audio_react\` | 16 种交互 + 5 个音色家族，一次生成绑定脚本 |
-| 页面要实时反应、而且不想传音频 | \`audio_live\` | 生成 WebAudio 模块，参数连续可变、零音频字节 |
+| 页面要实时反应、而且不想传音频 | \`audio_live\` | 生成 WebAudio 模块，参数连续可变、可带自动化车道，零音频字节 |
 | 想知道一个声音"里面是什么" | \`audio_analyze\` | 基频、谐波、共振峰、噪声度、衰减时间 |
 | 给视频/游戏交分轨 | \`audio_stems\` | 每层一个 wav + master，且能重建 |
+| 要把工程交给 DAW/剪辑软件 | \`audio_daw\` | CMX3600 EDL / Reaper .rpp / CSV / Audacity labels |
 | 要 EQ / 压缩 / 侧链闪避 | \`audio_bus\` | 每轨处理器链 + 总线限幅 |
 | 声音要有方向、要出 5.1/双耳 | \`audio_spatial\` | 立体声/双耳/quad/5.1/7.1/一阶 Ambisonics |
 | 和 DAW 交换乐谱 | \`audio_midi\` | 导出 .mid 给 DAW，导入外部旋律来唱/渲 |

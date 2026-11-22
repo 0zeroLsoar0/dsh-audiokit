@@ -9,6 +9,12 @@
  * tiny hook runtime — the assertions read real text out of the component tree
  * instead of trusting the dictionary alone.
  *
+ * The page also translates *server* failures: the host route sends a
+ * `reasonCode` (see `REASON_CODES` in `lib/settings-route.js`) next to the
+ * untouched `detail` text. This file checks that both languages exist for every
+ * code the route can emit, that `client.js` maps exactly those codes, and that
+ * a rendered failure in English contains no Chinese copy.
+ *
  * What this does NOT prove: that the real browser React, the real slot
  * renderer, or the live Client locale service produce exactly this tree. See
  * the `--write` note below and the header of `lib/locale-dict.js` for why the
@@ -24,6 +30,7 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { DICT, NS, en, t, zh } from '../lib/locale-dict.js'
+import { REASON_CODES } from '../lib/settings-route.js'
 
 const pluginDir = dirname(dirname(fileURLToPath(import.meta.url)))
 const clientPath = join(pluginDir, 'client.js')
@@ -66,7 +73,9 @@ check('zh and en expose the same key set', JSON.stringify(keys) === JSON.stringi
   `${keys.filter((key) => !(key in en)).join(',')} missing in en; ${Object.keys(en).filter((key) => !(key in zh)).join(',')} extra in en`)
 check('DICT points at the two maps and nothing else', JSON.stringify(Object.keys(DICT)) === '["zh","en"]' && DICT.zh === zh && DICT.en === en)
 check('namespace is stable', NS === 'dsh.audio', NS)
-const grouping = /^(page|field|provider|tts|check|status|error|buttons|note)\.[a-z][A-Za-z0-9]*$/
+// Reason keys are kebab-case codes (`reason.http-4xx`), every other group is
+// camelCase after the dot.
+const grouping = /^(page|field|provider|tts|check|status|error|buttons|note|reason)\.[a-z][A-Za-z0-9-]*$/
 check('keys are grouped and flat', keys.every((key) => grouping.test(key)), keys.filter((key) => !grouping.test(key)).join(','))
 
 for (const locale of ['zh', 'en']) {
@@ -111,6 +120,55 @@ check('en labels/buttons stay short', tooLong.length === 0, tooLong.map((key) =>
 
 check('en template reads as English', !CJK.test(en['tts.testOk'].replace(PLACEHOLDER, '')), en['tts.testOk'])
 
+/* ------------------------------------------------ server reason codes -- */
+
+console.log('-- server reason codes --')
+
+// The set the host route can emit. `client.js` may only translate these, and
+// every one of them must read in both languages, or a failure would fall back
+// to the server's Chinese sentence in the English UI (the acceptance bug).
+const reasonCodes = [...REASON_CODES]
+const reasonKeys = reasonCodes.map((code) => `reason.${code}`)
+// Which placeholders each code's sentence needs, mirroring what the host route
+// sends: `missing-key` names the env var, the HTTP codes the status, and an
+// unsupported target the requested target name.
+const REASON_VARS = {
+  'missing-key': ['env'],
+  'endpoint-unreachable': [],
+  'http-4xx': ['status'],
+  'http-5xx': ['status'],
+  'not-audio': [],
+  'no-base-url': [],
+  'provider-none': [],
+  'decoder-missing': [],
+  'unsupported-target': ['target']
+}
+console.log(`  ${reasonCodes.length} codes: ${reasonCodes.join(', ')}`)
+
+check('the reason code list is unique', new Set(reasonCodes).size === reasonCodes.length, JSON.stringify(reasonCodes))
+check('every reason code has a zh string', reasonKeys.every((key) => typeof zh[key] === 'string' && zh[key].trim() !== ''),
+  reasonKeys.filter((key) => typeof zh[key] !== 'string' || zh[key].trim() === '').join(','))
+check('every reason code has an en string', reasonKeys.every((key) => typeof en[key] === 'string' && en[key].trim() !== ''),
+  reasonKeys.filter((key) => typeof en[key] !== 'string' || en[key].trim() === '').join(','))
+check('no reason string exists without a server code',
+  keys.filter((key) => key.startsWith('reason.')).every((key) => reasonCodes.includes(key.slice('reason.'.length))),
+  keys.filter((key) => key.startsWith('reason.') && !reasonCodes.includes(key.slice('reason.'.length))).join(','))
+check('reason keys are listed in the server code order', JSON.stringify(keys.filter((key) => key.startsWith('reason.'))) === JSON.stringify(reasonKeys),
+  JSON.stringify(keys.filter((key) => key.startsWith('reason.'))))
+
+for (const code of reasonCodes) {
+  const key = `reason.${code}`
+  for (const locale of ['zh', 'en']) {
+    const value = DICT[locale][key]
+    const vars = [...value.matchAll(PLACEHOLDER)].map((match) => match[1]).sort()
+    check(`${locale} "${key}" interpolates ${JSON.stringify(REASON_VARS[code])}`, JSON.stringify(vars) === JSON.stringify(REASON_VARS[code]),
+      JSON.stringify(vars))
+    // Short reasons sit inside a status line, so they must not drag punctuation
+    // of their own into it.
+    check(`${locale} "${key}" has no trailing punctuation`, !/[.。,，;；:：]$/.test(value), value)
+  }
+}
+
 /* --------------------------------------------------------- t() helper -- */
 
 console.log('-- t() helper --')
@@ -135,7 +193,11 @@ console.log('-- dictionary weight --')
 const dictSource = await readFile(dictPath, 'utf8')
 const sourceBytes = Buffer.byteLength(dictSource)
 console.log(`  serialized data ${serialized} B, source file ${sourceBytes} B, keys ${keys.length}`)
-check('dictionary data stays under 8 KiB', serialized <= 8192, `${serialized} B`)
+// The 9 reason strings for server failure codes are part of the page's
+// contract (a code without copy falls back to the server's Chinese sentence),
+// so the budget moved from 8 KiB to 10 KiB; it still guards against unbounded
+// copy growth in the literal client.js has to carry.
+check('dictionary data stays under 10 KiB', serialized <= 10240, `${serialized} B`)
 check('dictionary source stays under 16 KiB', sourceBytes <= 16384, `${sourceBytes} B`)
 
 /* ------------------------------------------------------ client.js copy -- */
@@ -248,9 +310,17 @@ const unreferenced = keys.filter((key) => !clientSource.includes(`'${key}'`))
 check('every dictionary key is referenced from client.js', unreferenced.length === 0, unreferenced.join(','))
 const asked = [...new Set([...stripComments(clientSource).matchAll(/\bt\('([^']+)'/g)].map((match) => match[1]))]
 const unknown = asked.filter((key) => !(key in DICT.zh))
-console.log(`  ${asked.length} distinct t() keys referenced, ${keys.length - unreferenced.length} dictionary keys used`)
+// The reason table is addressed through a computed key, so the literals in that
+// table are not `t('reason.*')` call sites; count them separately.
+const reasonLiterals = reasonKeys.filter((key) => clientSource.includes(`'${key}'`)).length
+console.log(`  ${asked.length} distinct t() keys referenced, ${reasonLiterals} reason keys mapped, ${keys.length} dictionary keys`)
 check('every t() key exists in the dictionary', unknown.length === 0, unknown.join(','))
-check('t() covers the dictionary', asked.length >= keys.length - 8, `${asked.length} call sites for ${keys.length} keys`)
+check('t() and the reason table cover the dictionary', asked.length + reasonLiterals >= keys.length - 8,
+  `${asked.length} call sites + ${reasonLiterals} reason keys for ${keys.length} keys`)
+// The page may only translate codes it has copy for: an unmapped code would
+// silently show the server's Chinese sentence instead.
+const unmapped = reasonCodes.filter((code) => !clientSource.includes(`'${code}':`))
+check('client.js maps every reason code to a dictionary key', unmapped.length === 0, unmapped.join(','))
 
 /* --------------------------------------------- fake browser and react -- */
 
@@ -582,7 +652,7 @@ function jsonResponse (body, { status = 200 } = {}) {
   }
 }
 
-/** One routed fake network; `route.config` decides the config endpoint. */
+/** One routed fake network; `route.*` decides what each endpoint answers. */
 function createFetch (route) {
   return async (url, options) => {
     const method = options?.method ?? 'GET'
@@ -590,6 +660,8 @@ function createFetch (route) {
     if (url === '/dsh-audio/config' && method === 'GET') return route.config()
     if (url === '/dsh-audio/config' && method === 'POST') return route.save()
     if (url === '/dsh-audio/voices') return route.voices()
+    if (url === '/dsh-audio/validate') return route.validate()
+    if (url === '/dsh-audio/test') return route.test()
     throw new Error(`unexpected fetch ${JSON.stringify(url)}`)
   }
 }
@@ -600,6 +672,24 @@ function createRoute (overrides = {}) {
     config: () => jsonResponse({ ok: true, config: CONFIG }),
     save: () => jsonResponse({ ok: true }),
     voices: () => jsonResponse(VOICES),
+    // Only used when a test clicks the self-check buttons; happy answers keep the
+    // harness reusable without each scenario having to spell them out.
+    validate: () => jsonResponse({
+      ok: true,
+      target: 'check',
+      model: 'qwen2.5-omni-7b',
+      endpoint: { reachable: true, status: 404, error: null },
+      audioAccepted: true,
+      answer: '像一声铃响',
+      latencyMs: 120
+    }),
+    test: () => jsonResponse({
+      ok: true,
+      target: 'tts',
+      durationSeconds: 1.2,
+      effective: { model: 'speech-2.8-hd', voice: 'female-shaonv' },
+      timestamps: 2
+    }),
     ...overrides
   }
 }
@@ -798,6 +888,175 @@ console.log('-- rendered page (zh) --')
   check('switching back restores the Chinese page exactly', JSON.stringify(page.texts()) === JSON.stringify(ZH_TEXTS))
 }
 
+console.log('-- server failure reasons in the rendered page --')
+{
+  // This is the acceptance bug, reproduced as a render assertion: the English
+  // page used to print the route's Chinese reason because the reason arrived as
+  // opaque text. The route now sends `reasonCode` + the untouched `detail`, and
+  // the page must show the English sentence while keeping any provider payload.
+  const shim = createReactShim()
+  const timers = createTimers()
+  const route = createRoute()
+  const locale = createLocaleService({ active: 'zh' })
+  const { plugin } = evaluateBundle({ React: shim.React, fetch: createFetch(route), setTimeout: timers.setTimeout })
+  const context = createClientContext({ locale })
+  plugin.apply(context)
+  const page = createPageHarness(context.registrations[0].component, shim)
+  await page.settle()
+
+  const MISSING_KEY = {
+    ok: true,
+    target: 'check',
+    model: 'qwen2.5-omni-7b',
+    endpoint: { reachable: true, status: 404, error: null },
+    audioAccepted: false,
+    error: '音频理解: 环境变量 DASHSCOPE_API_KEY 为空。在启动 DSH 的环境里设置它，或在插件 config 里写 apiKey。',
+    detail: '音频理解: 环境变量 DASHSCOPE_API_KEY 为空。在启动 DSH 的环境里设置它，或在插件 config 里写 apiKey。',
+    reasonCode: 'missing-key',
+    envName: 'DASHSCOPE_API_KEY',
+    latencyMs: 41
+  }
+
+  const click = async (label) => {
+    const button = findClickable(page.tree, label)
+    check(`the "${label}" button exists`, button !== null)
+    if (button === null) return
+    button.props.onClick()
+    await page.settle()
+  }
+  const lineContaining = (needle) => page.texts().find((text) => text.includes(needle))
+
+  route.validate = () => jsonResponse(MISSING_KEY)
+  await click('立即校验')
+  const zhLine = lineContaining('模型未通过')
+  console.log(`  zh validate: ${JSON.stringify(zhLine)}`)
+  check('zh failure uses the translated reason instead of pasting the server sentence',
+    zhLine === '端点可达（HTTP 404） · 模型未通过：缺少 API 密钥（DASHSCOPE_API_KEY） · qwen2.5-omni-7b', JSON.stringify(zhLine))
+  check('the Chinese fix instruction is not repeated in the reason line',
+    !(zhLine ?? '').includes('在启动 DSH 的环境里设置它'), JSON.stringify(zhLine))
+
+  locale.setLocale('en')
+  await page.settle()
+  route.validate = () => jsonResponse(MISSING_KEY)
+  await click('Validate now')
+  const enLine = lineContaining('Model failed')
+  console.log(`  en validate: ${JSON.stringify(enLine)}`)
+  check('en failure uses the translated reason', enLine === 'Endpoint reachable (HTTP 404) · Model failed: missing API key (DASHSCOPE_API_KEY) · qwen2.5-omni-7b',
+    JSON.stringify(enLine))
+  check('en failure carries no Chinese copy', enLine !== undefined && !CJK.test(enLine), JSON.stringify(enLine))
+
+  // A provider body is language-neutral data the page must keep: the translated
+  // sentence alone would hide "Incorrect API key provided".
+  route.validate = () => jsonResponse({
+    ok: true,
+    target: 'check',
+    model: 'qwen2.5-omni-7b',
+    endpoint: { reachable: true, status: 404, error: null },
+    audioAccepted: false,
+    error: 'api.minimax.chat HTTP 401: {"error":{"message":"Incorrect API key provided"}}',
+    detail: 'api.minimax.chat HTTP 401: {"error":{"message":"Incorrect API key provided"}}',
+    reasonCode: 'http-4xx',
+    status: 401,
+    latencyMs: 22
+  })
+  await click('Validate now')
+  const httpLine = lineContaining('Model failed')
+  console.log(`  en http-4xx: ${JSON.stringify(httpLine)}`)
+  check('en failure interpolates the provider status', (httpLine ?? '').includes('provider rejected the request (HTTP 401)'), JSON.stringify(httpLine))
+  check('the provider body is kept after the translation', (httpLine ?? '').includes('Incorrect API key provided'), JSON.stringify(httpLine))
+  check('a translated HTTP failure carries no Chinese copy', httpLine !== undefined && !CJK.test(httpLine), JSON.stringify(httpLine))
+
+  // A transport cause lives inside full-width parentheses; the page keeps that
+  // ASCII cause and drops the rest of the server sentence.
+  const transportLine = 'fetch failed（connect ECONNREFUSED 127.0.0.1:1）'
+  route.validate = () => jsonResponse({
+    ok: true,
+    target: 'check',
+    model: 'qwen2.5-omni-7b',
+    endpoint: { reachable: false, status: 0, error: transportLine, detail: transportLine, reasonCode: 'endpoint-unreachable' },
+    audioAccepted: false,
+    error: transportLine,
+    detail: transportLine,
+    reasonCode: 'endpoint-unreachable',
+    latencyMs: 3
+  })
+  await click('Validate now')
+  const unreachableLine = lineContaining('Endpoint unreachable')
+  console.log(`  en endpoint down: ${JSON.stringify(unreachableLine)}`)
+  check('en endpoint failure is translated', /Endpoint unreachable: connection failed/.test(unreachableLine ?? ''), JSON.stringify(unreachableLine))
+  check('the transport cause survives the translation', (unreachableLine ?? '').includes('connect ECONNREFUSED 127.0.0.1:1'), JSON.stringify(unreachableLine))
+  check('the transport line carries no Chinese copy', unreachableLine !== undefined && !CJK.test(unreachableLine), JSON.stringify(unreachableLine))
+
+  // A probe that does not apply (provider off / no URL) must not be called
+  // "unreachable": the row has its own line and a translated reason.
+  route.validate = () => jsonResponse({
+    ok: true,
+    target: 'tts',
+    model: 'speech-2.8-hd',
+    endpoint: {
+      reachable: null,
+      status: 0,
+      error: 'TTS 已关闭（provider = none），没有端点可探测',
+      detail: 'TTS 已关闭（provider = none），没有端点可探测',
+      reasonCode: 'provider-none'
+    },
+    audioAccepted: false,
+    error: '未知的 TTS provider "none"，支持 minimax / edge / openai / custom。',
+    detail: '未知的 TTS provider "none"，支持 minimax / edge / openai / custom。',
+    reasonCode: 'provider-none',
+    latencyMs: 0
+  })
+  await click('Validate now')
+  const notApplicableLine = lineContaining('Endpoint probe not applicable')
+  console.log(`  en endpoint n/a: ${JSON.stringify(notApplicableLine)}`)
+  check('an inapplicable probe says so in English', (notApplicableLine ?? '').includes('narration is off (provider = none)'), JSON.stringify(notApplicableLine))
+  check('the inapplicable line carries no Chinese copy', notApplicableLine !== undefined && !CJK.test(notApplicableLine), JSON.stringify(notApplicableLine))
+
+  // Malformed data must never reach the DOM as `[object Object]` / `undefined`:
+  // the route is supposed to send strings, but the page cannot trust that.
+  route.validate = () => jsonResponse({
+    ok: true,
+    target: 'check',
+    model: { name: 'weird' },
+    endpoint: { reachable: false },
+    audioAccepted: false,
+    error: { code: 42 },
+    reasonCode: 'no-such-code',
+    envName: { not: 'a string' }
+  })
+  await click('Validate now')
+  const brokenLine = lineContaining('Endpoint unreachable')
+  console.log(`  en malformed response: ${JSON.stringify(brokenLine)}`)
+  check('a malformed response never prints [object Object]', !/\[object Object\]/.test(brokenLine ?? ''), JSON.stringify(brokenLine))
+  check('a malformed response never prints undefined or NaN', !/undefined|NaN/.test(brokenLine ?? ''), JSON.stringify(brokenLine))
+  check('an unknown reason code falls back to the unknown-reason copy', (brokenLine ?? '').includes('unknown reason'), JSON.stringify(brokenLine))
+  check('a missing model falls back to the no-model copy', (brokenLine ?? '').includes('no model set'), JSON.stringify(brokenLine))
+
+  // The test-connection row takes the same path through `error.testFail`.
+  route.test = () => jsonResponse({
+    ok: false,
+    target: 'tts',
+    error: 'MiniMax TTS: 环境变量 MINIMAX_API_KEY 为空。在启动 DSH 的环境里设置它，或在插件 config 里写 apiKey。',
+    detail: 'MiniMax TTS: 环境变量 MINIMAX_API_KEY 为空。在启动 DSH 的环境里设置它，或在插件 config 里写 apiKey。',
+    reasonCode: 'missing-key',
+    envName: 'MINIMAX_API_KEY'
+  })
+  await click('Synthesize & listen')
+  const testFailLine = lineContaining('Failed:')
+  console.log(`  en test failure: ${JSON.stringify(testFailLine)}`)
+  check('a failed connection test uses the translated reason', testFailLine === 'Failed: missing API key (MINIMAX_API_KEY)', JSON.stringify(testFailLine))
+  check('a failed connection test carries no Chinese copy', testFailLine !== undefined && !CJK.test(testFailLine), JSON.stringify(testFailLine))
+
+  // Same server payload in Chinese: the copy is the Chinese sentence, so the
+  // page keeps the row in one language here too.
+  locale.setLocale('zh')
+  await page.settle()
+  await click('试听并识别')
+  const zhTestFailLine = lineContaining('测试失败') ?? lineContaining('失败：')
+  console.log(`  zh test failure: ${JSON.stringify(zhTestFailLine)}`)
+  check('a zh test failure reads the Chinese reason', zhTestFailLine === '失败：缺少 API 密钥（MINIMAX_API_KEY）', JSON.stringify(zhTestFailLine))
+}
+
 console.log('-- language without a dictionary follows the fallback chain --')
 {
   // The service ships eight locales; this plugin only translates two. A
@@ -866,6 +1125,6 @@ console.log('-- failure path --')
 /* ---------------------------------------------------------------- end -- */
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
-console.log(`dictionary: ${keys.length} keys, ${serialized} B serialized, ${leftovers.length} CJK leftover(s) in client.js`)
+console.log(`dictionary: ${keys.length} keys (${reasonCodes.length} server reason codes), ${serialized} B serialized, ${leftovers.length} CJK leftover(s) in client.js`)
 console.log(failures === 0 ? 'OK: locale dictionaries are complete, in sync, and render' : `FAILED: ${failures} check(s)`)
 process.exit(failures === 0 ? 0 : 1)
