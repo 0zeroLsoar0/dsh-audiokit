@@ -1,5 +1,4 @@
-# 只跟踪这个项目本身，工作区里其他目录（其他会话的产物）不进仓库。
-
+# 只跟踪这个项目本身：工作区里其他目录（其他会话的产物）不进仓库。
 /*
 !/.gitignore
 !/CHANGELOG.md
@@ -14,5 +13,17 @@ dsh-audio/test/out/
 *.log
 .DS_Store
 
-# 但 0.1.0 重建快照的 tgz 是这份留档的一部分
+# 动画成品与体积较大的媒体只在本地存在，不进仓库（需要时用生成脚本重跑）。
+# 保留的是源代码：build/render/spec/verify 脚本与说明。
+/demo/bounce.html
+/demo/scene.html
+/demo/showcase.html
+/demo/intro/index.html
+/demo/intro/frames/
+/demo/intro/*.png
+/demo/intro/audio/*.wav
+/demo/assets/audio/
+/demo/about.png
+
+# 但 0.1.0 重建快照的 tgz 是那次留档的一部分
 !versions/0.1.0-reconstructed/dist/*.tgz
