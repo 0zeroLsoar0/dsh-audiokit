@@ -1,0 +1,38 @@
+{
+  "source": "https://scp-wiki-cn.wikidot.com/scp-cn-1109 — sampled 2026-11-22 11:5x with headless Chrome (computed styles + screenshot). The page renders in the wiki's dark reader theme: near-black paper, light grey type, violet links, monospace metadata, hairline rules.",
+  "mood": "SCP 基金会档案 / 黑白为主 + 极少量蓝紫。没有任何橙色。像一份被归档的技术文档，而不是产品落地页。",
+  "tokens": {
+    "stage": "#121212",
+    "bg": "#171717",
+    "panel": "#1b1b1b",
+    "panelRaised": "#202020",
+    "paper": "#e9e9e6",
+    "paperInk": "#161616",
+    "ink": "#e6e6e6",
+    "inkDim": "#a8a8a8",
+    "inkFaint": "#6f6f6f",
+    "white": "#ffffff",
+    "black": "#000000",
+    "rule": "rgba(255,255,255,0.16)",
+    "ruleSoft": "rgba(255,255,255,0.08)",
+    "rulePaper": "rgba(0,0,0,0.18)",
+    "accent": "#c56bd6",
+    "accentDim": "#8e5f99",
+    "accentBlue": "#5b8dd6",
+    "redaction": "#0a0a0a"
+  },
+  "type": {
+    "sans": "\"PingFang SC\", \"Microsoft YaHei\", Verdana, Arial, system-ui, sans-serif",
+    "mono": "ui-monospace, \"SF Mono\", Menlo, Consolas, \"Courier New\", monospace",
+    "serif": "Georgia, \"Songti SC\", \"SimSun\", serif"
+  },
+  "rules": [
+    "Base is black and white: #121212 stage, #171717 panels, #e6e6e6 type, hairlines at 8–16% white. Nothing is coloured unless it is the one active thing.",
+    "Accent is violet #c56bd6, used for the current scene's marker, the active tool name, and link-like metadata only — under ~5% of the frame. Blue #5b8dd6 is a secondary marker only when two states must be told apart.",
+    "No orange, no amber, no warm hue anywhere. If something needs emphasis, use white, a hairline, or a redaction bar (#0a0a0a) — not colour.",
+    "Archive grammar: mono uppercase metadata with file numbers (FILE 03 / 08), thin rules, small-caps or letter-spaced labels, black redaction bars over text, a stamp-like box for the end card. No rounded cards above 4px, no shadows, no glass.",
+    "Numbers are the ornament: let counts, dB, Hz and timings sit in mono, aligned in columns.",
+    "Motion: type-on, line-draw, counter ticks, a caret. No bounces, no glowing gradients, no particles.",
+    "One paper-coloured section (#e9e9e6 with ink #161616 and rules rgba(0,0,0,0.18)) is allowed once, like a printed document page inside the archive."
+  ]
+}
