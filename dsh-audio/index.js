@@ -33,6 +33,7 @@ import { registerReactTools } from './lib/tools-react.js'
 import { registerSettingsRoute } from './lib/settings-route.js'
 import { registerSingTools } from './lib/tools-sing.js'
 import { registerSkill } from './lib/skill.js'
+import { registerSpatialTools } from './lib/tools-spatial.js'
 import { registerStemsTools } from './lib/tools-stems.js'
 import { registerStretchTools } from './lib/tools-stretch.js'
 import { registerTools } from './lib/tools.js'
@@ -97,6 +98,7 @@ export function apply (ctx, config = {}) {
   registerVisualTools(ctx)
   registerMouthTools(ctx)
   registerBusTools(ctx)
+  registerSpatialTools(ctx)
   registerBindTools(ctx)
   registerReactTools(ctx)
   registerLiveTools(ctx)
