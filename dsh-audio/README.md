@@ -2,6 +2,8 @@
 
 给 HTML 动画配音的 DSH 插件。让你的 agent 在做动画时，顺手把声音也做出来。
 
+npm 包名 `dsh-audiokit`，插件/设置页里仍叫「声音」。
+
 > 合成音效、分层设计、作曲、旁白与唱声、口型与节拍对齐、混音、响度、交付检查——一整套都在 agent 的工具箱里，且不依赖任何素材库。
 
 ## 为什么需要它
@@ -86,8 +88,10 @@ audio_check({ paths: ['assets/audio/slam.wav'], cues: [{ at: 0.82, src: 'assets/
 | 工具 | 作用 |
 |---|---|
 | `audio_synth` | 渲染单个音效（38 个预设，感知参数 0..1，可循环） |
+| `audio_synth_graph` | 运行时合成图：用振荡器/噪声/滤波/包络/LFO/FM/折叠/混响自己搭一个新音色 |
 | `audio_pattern` | 用一条规则填满一段时间（train / scatter / riser） |
 | `audio_design` | 分层设计引擎，26 个配方，或自定义层叠 |
+| `audio_sampler` | 采样器：用你自己的 wav 做键位/力度分区、变调、循环、包络（不内置素材） |
 | `audio_compose` | 作曲并渲染配乐，返回节拍表与和弦 |
 | `audio_midi` | 标准 MIDI 读写：作曲导出给 DAW，外部旋律导入后可唱/可渲 |
 | `audio_tts` | 文本转语音（MiniMax / OpenAI 兼容 / 免费 Edge），返回音频 + 时间戳 |
@@ -99,9 +103,10 @@ audio_check({ paths: ['assets/audio/slam.wav'], cues: [{ at: 0.82, src: 'assets/
 | `audio_bind` | 生成 cue 表与页面播放器（可内联成单文件） |
 | `audio_mux` | 视频联动：探测媒体、把音频混流进 mp4/mov/mkv/webm、检测镜头切点、抽出音轨 |
 | `audio_react` | 交互音效：16 种 UI 事件 + 5 个音色家族，产出零胶水绑定脚本 |
-| `audio_live` | 页面内实时合成：生成 15.8 KB 的 WebAudio 模块，一个音频字节都不用传 |
+| `audio_live` | 页面内实时合成：生成 ~16 KB 的 WebAudio 模块，一个音频字节都不用传；可带 automation 车道（pitch/filter/gain/pan/send 的斜坡与 LFO） |
 | `audio_analyze` | 频谱分析：基频、谐波、共振峰、噪声度、衰减时间、频段平衡，可做容差比对 |
 | `audio_stems` | 分轨导出：每层一个 wav + master，`sum(stems) == master` |
+| `audio_daw` | 工程导出：CMX3600 EDL / Reaper .rpp / CSV cue 表 / Audacity labels |
 | `audio_mix` | 多轨合一，逐条增益与时间偏移 |
 | `audio_bus` | 混音总线：高通/低通/搁架/钟形、压缩、侧链闪避、声像与宽度 |
 | `audio_spatial` | 空间音频：立体声/双耳/quad/5.1/7.1/一阶 Ambisonics，自带多声道 WAV |

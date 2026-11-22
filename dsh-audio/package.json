@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-audio",
-  "version": "0.5.9",
+  "version": "0.5.10",
   "description": "Sound effects for HTML animation: a deterministic synthesizer exposed as DSH tools, plus the workflow skill that makes an agent actually use it.",
   "license": "MIT",
   "author": "Soar_L",
@@ -28,7 +28,9 @@
     "tools/*.mjs"
   ],
   "scripts": {
-    "test": "node test/smoke.mjs"
+    "test": "node tools/test-all.mjs",
+    "test:smoke": "node test/smoke.mjs",
+    "pack:check": "node tools/test-all.mjs --only smoke && npm pack --dry-run"
   },
   "keywords": [
     "dsh",
@@ -45,6 +47,14 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/0zeroLsoar0/dsh-audiokit.git"
+  },
+  "homepage": "https://github.com/0zeroLsoar0/dsh-audiokit#readme",
+  "bugs": {
+    "url": "https://github.com/0zeroLsoar0/dsh-audiokit/issues"
   },
   "dsh": {
     "bundle": {
