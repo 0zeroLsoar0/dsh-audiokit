@@ -740,7 +740,7 @@ export function planMux (request = {}) {
   const codecArgs = ['-c:v', 'copy']
   if (mode === 'attach') {
     codecArgs.push('-c:a:0', 'copy', '-c:a:1', container.audioCodec, '-b:a:1', container.audioBitrate)
-    codecArgs.push('-metadata:s:a:1', 'title=dsh-audio')
+    codecArgs.push('-metadata:s:a:1', 'title=dsh-audiokit')
   } else {
     codecArgs.push('-c:a', container.audioCodec, '-b:a', container.audioBitrate)
   }

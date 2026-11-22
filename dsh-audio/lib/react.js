@@ -573,7 +573,7 @@ function renderCue (cue, sampleRate, room) {
  *     be louder than a single press, and a press younger than STEAL_SECONDS is
  *     replaced instead of layered.
  */
-const BINDING_SOURCE = `/* dsh-audio interaction sounds: paste once; the first gesture unlocks audio. */
+const BINDING_SOURCE = `/* dsh-audiokit interaction sounds: paste once; the first gesture unlocks audio. */
 (() => {
   'use strict'
   const D = __DATA__

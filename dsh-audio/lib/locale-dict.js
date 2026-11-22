@@ -1,5 +1,5 @@
 /**
- * User-visible copy of the dsh-audio settings page, in Chinese and English.
+ * User-visible copy of the dsh-audiokit settings page, in Chinese and English.
  *
  * This file is the editable source of truth. It cannot be imported by the page
  * at runtime: DSH serves a hand-written client bundle as one classic browser

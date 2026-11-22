@@ -587,7 +587,7 @@ function buildCssTrack (frames, meta) {
   const runs = visemeRuns(frames, meta.fps)
   const duration = meta.duration > 0 ? meta.duration : 1 / meta.fps
   const lines = []
-  lines.push('/* dsh-audio lipsync track')
+  lines.push('/* dsh-audiokit lipsync track')
   lines.push(`   ${meta.fps} fps · ${duration.toFixed(3)} s · ${frames.length} frames · lead ${meta.leadMs} ms`)
   lines.push('   markup: <div class="dsh-mouth"><i class="v-AA"></i>…<i class="dsh-jaw"></i></div>')
   lines.push('   .v-* layers switch with steps(1,end); .dsh-jaw scales continuously on Y. */')

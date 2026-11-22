@@ -1,5 +1,5 @@
 /**
- * Settings page for dsh-audio.
+ * Settings page for dsh-audiokit.
  *
  * Styled with the host theme tokens (`--dsw-alias-*`) so it reads as part of
  * DSH's own settings rather than a foreign panel: plain rows separated by
@@ -17,7 +17,7 @@
  *     configured, and falls back to a shortlist explicitly marked as unverified.
  */
 window.__ModuleLoader__.load({
-  id: '@local/dsh-audio',
+  id: 'dsh-audiokit',
   factory (require) {
     const React = require('react')
     const h = React.createElement
@@ -756,20 +756,20 @@ window.__ModuleLoader__.load({
               try {
                 return locale.register(NS, { zh: DICT.zh, en: DICT.en })
               } catch (cause) {
-                console.warn('dsh-audio: locale dictionary registration failed; keeping the Chinese copy', cause)
+                console.warn('dsh-audiokit: locale dictionary registration failed; keeping the Chinese copy', cause)
                 return () => {}
               }
-            }, 'dsh-audio: locale dictionaries')
-            scope.effect(() => () => { detachLocale() }, 'dsh-audio: locale subscription')
+            }, 'dsh-audiokit: locale dictionaries')
+            scope.effect(() => () => { detachLocale() }, 'dsh-audiokit: locale subscription')
           })
         } catch (cause) {
           // A composition that cannot start nested plugins still gets the page,
           // in Chinese, rather than no settings section at all.
-          console.warn('dsh-audio: locale injection unavailable; keeping the Chinese copy', cause)
+          console.warn('dsh-audiokit: locale injection unavailable; keeping the Chinese copy', cause)
         }
         ctx.slots.inject('settings.section', () => ctx.slots.register({
           name: 'settings.section',
-          id: 'dsh-audio',
+          id: 'dsh-audiokit',
           order: 50,
           // A thunk, not a string: the settings shell resolves it per render and
           // re-resolves it when the locale revision moves, so the navigation

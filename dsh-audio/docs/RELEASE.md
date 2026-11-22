@@ -15,32 +15,36 @@ its full path, e.g.
 
 ## 0. What the rename does and does not change
 
-- The **public npm package name** is `dsh-audiokit`. The repo's own
-  `package.json` keeps `"name": "@local/dsh-audio"` **on purpose**: the live DSH
-  profile links to that specifier, so renaming it in the repo would break an
-  already-installed profile. `tools/publish-pack.mjs` copies the tree and
-  rewrites only the staged manifest's name before packing; that staged copy is
-  what gets published under `dsh-audiokit`.
-- The bare `dsh-audio` is already taken on npm (it resolves to someone else's
-  `0.0.1`), which is why the public name needed the `-kit` suffix.
-- The **Cordis bundle entry id stays `dsh-audio`**. These references are
-  intentionally unchanged and must keep matching existing profiles/links:
-  - `cordis.patch.yml` → `insert[0].id: dsh-audio`
-  - `index.js` → `export const name = 'dsh-audio'` and the skill locator
-  - HTTP routes `/dsh-audio/config`, `/dsh-audio/test`, `/dsh-audio/voices`,
-    `/dsh-audio/validate`
-  - the settings page id `dsh-audio` and its locale namespace
+- The **package name is `dsh-audiokit`** everywhere it is an identity: the manifest
+  (`package.json`), the client bundle id (`client.js` →
+  `window.__ModuleLoader__.load({ id: 'dsh-audiokit' })`), the settings-section id,
+  the Cordis patch entry *name*, the skill provider/locator, `tools/*` banners and
+  these docs. Nothing installable still says `@local/dsh-audio`.
+- The **Cordis bundle entry id stays `dsh-audio`** (`cordis.patch.yml` →
+  `insert[0].id: dsh-audio`). That id is the key a profile stores the entry — and
+  the saved MiniMax key — under; renaming it would orphan an existing config, so it
+  is frozen even though the plugin's name changed.
+- The **HTTP routes stay** `/dsh-audio/config`, `/dsh-audio/test`,
+  `/dsh-audio/voices`, `/dsh-audio/validate`, and the **tool names stay `audio_*`**.
+  Both halves of the running app already agree on them; changing either would force
+  a matching change in the live page and in every recorded tool call, for no gain.
+- Also unchanged on purpose: the settings label 声音/Sound, the skill name
+  `animation-sound`, the voicebank data path `~/.dsh/dsh-audio/voicebank/` (moving
+  it would hide a voicebank the user already downloaded), and the JSON format tags
+  `dsh-audio-lipsync` / `dsh-audio-beats` / `dsh-audio-stems` / `dsh-audio-analyze`
+  (on-disk data contracts, read back by the tests).
 - The package version stays **0.5.10**.
-- Only the npm identity changes. Installing/updating the plugin changes the
-  package specifier (for example `dsh-audiokit@0.5.10`); anything that
-  addresses the plugin by its entry id (`dsh-audio`) does not change.
+- A profile installed under the old `@local/dsh-audio` specifier must be
+  **reinstalled under the new name** (`plugin_manager action: install_bundle
+  target: <path>`, or `dsh plugin --profile <profile> add "file:<path>"` plus
+  `dsh-audiokit` in `dsh.profile.bundles`). The saved entry config — including the
+  MiniMax key — survives, because the entry id did not change.
 
-`cordis.patch.yml` declares `name: '@local/dsh-audio'` and `client.js` registers
-the settings page as `id: '@local/dsh-audio'`. Both literals are **intentional
-and must not be renamed**: they are the names the live profile already links to.
-Only the manifest inside the publish staging copy changes its name, so a
-repo-installed profile keeps working while npm-installed bundles carry the
-public name. Verify with a tarball install (step 8) before announcing.
+`cordis.patch.yml` now declares `name: dsh-audiokit` and `client.js` registers the
+bundle as `id: 'dsh-audiokit'`; the repo manifest carries the same name, so no
+staging rewrite is needed any more (`tools/publish-pack.mjs` only changes the name
+when `--name` really differs from the manifest). Verify with a tarball install
+(step 8) before announcing.
 
 ## 1. Prerequisites
 
@@ -61,9 +65,9 @@ public name. Verify with a tarball install (step 8) before announcing.
 ```
 
 Re-check them **before** packing: the tarball embeds `package.json`, so a publish
-made with a wrong URL is permanent (the version cannot be reused). The public
-package name is applied by `tools/publish-pack.mjs` (step 6), not by this file —
-the repo manifest deliberately keeps `@local/dsh-audio` (see §0).
+made with a wrong URL is permanent (the version cannot be reused). The manifest
+already carries the public name `dsh-audiokit`; `tools/publish-pack.mjs` (step 6)
+only rewrites it when `--name` asks for a different one.
 
 ## 3. Confirm the name is still free
 
@@ -138,16 +142,18 @@ Must **not** appear: `node_modules/`, `test/out/`, `*.tgz`, `.git/`, `.github/`,
 ## 6. Publish to npm
 
 `npm login` first (human step, 2FA/OTP). Then publish through the packer, which
-stages a copy, renames the manifest to `dsh-audiokit` and publishes that tarball:
+stages a copy of the plugin, packs it and publishes that tarball (the staged
+manifest only gets renamed when `--name` differs from `dsh-audiokit`):
 
 ```powershell
 node dsh-audio-lab/tools/publish-pack.mjs --name dsh-audiokit --repo https://github.com/0zeroLsoar0/dsh-audiokit --publish
 ```
 
 Without `--publish` it only packs and reports the tarball name, file count and
-size — do that once first and compare with step 5. **Do not** run `npm publish`
-in the plugin root: that manifest still says `@local/dsh-audio` (§0) and is not
-the package people install.
+size — do that once first and compare with step 5. The plugin root has the same
+manifest name, but run the packer instead of `npm publish` in the root: the
+packer filters `test/out`, `*.tgz` and other residue out of the tarball and this
+step then inspects exactly what it produced.
 
 Expected: `dsh-audiokit-0.5.10.tgz`, then `+ dsh-audiokit@0.5.10` and a registry
 URL `https://www.npmjs.com/package/dsh-audiokit`.
@@ -195,8 +201,8 @@ a DSH plugin loaded by the host, not a command. Verify the real registry
 artifact by installing the tarball into a scratch profile:
 
 ```powershell
-mkdir "$env:TEMP\dsh-audio-verify"
-cd "$env:TEMP\dsh-audio-verify"
+mkdir "$env:TEMP\dsh-audiokit-verify"
+cd "$env:TEMP\dsh-audiokit-verify"
 npm pack dsh-audiokit@0.5.10
 tar -xzf dsh-audiokit-0.5.10.tgz
 dir package          # same file list as step 5
@@ -262,8 +268,8 @@ tarball.
 - [ ] Publish with `--publish` added to that command (human action, needs the npm
       OTP; never run by an agent). Do not `npm publish` the plugin root.
 - [ ] Create the GitHub repo, `git remote add origin`, `git push -u origin main --tags`.
-- [ ] Leave `cordis.patch.yml`'s `name: '@local/dsh-audio'` as-is — it is the
-      profile's link target, not the npm name (see §0).
+- [ ] Leave `cordis.patch.yml`'s `id: dsh-audio` and the `/dsh-audio/*` routes
+      as-is — they are the profile's link target, not the package name (see §0).
 - [ ] Verify by installing the packed tarball (`npm pack dsh-audiokit@0.5.10`)
       in a scratch profile — there is no `npx` CLI.
 - [ ] Note that `test/video.mjs` only exercises the bundled Windows ffmpeg locally;

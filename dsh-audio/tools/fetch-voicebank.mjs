@@ -194,7 +194,7 @@ async function fetchFile (path) {
   try {
     response = await fetch(url, {
       headers: {
-        'User-Agent': 'dsh-audio-fetch-voicebank',
+        'User-Agent': 'dsh-audiokit-fetch-voicebank',
         Accept: 'application/vnd.github+json'
       }
     })

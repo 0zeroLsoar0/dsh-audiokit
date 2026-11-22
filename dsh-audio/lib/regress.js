@@ -68,7 +68,7 @@ const round = (value, digits) => Number(Number(value).toFixed(digits))
  * would report on the delivered file. The wav bytes are encoded without
  * dither, because dither is random noise and would make the hash meaningless;
  * that also means a snapshot hash is comparable to another snapshot, not to
- * the bytes of a dsh-audio `.wav` file.
+ * the bytes of a dsh-audiokit `.wav` file.
  *
  * @param {object[]} specs - render specs, `name` must be unique.
  * @param {{ label?: string, sampleRate?: number }} [options]

@@ -183,13 +183,13 @@ export function registerSkill (skills) {
     name: SKILL_NAME,
     description: '给 HTML 动画配音：选型、拍点、音效/作曲/唱声、口型与节拍对齐、交付与验收。Whenever you build an HTML animation, motion graphic, or browser demo that should make sound, load this first.',
     invocation: { modelInvocable: true, userInvocable: true },
-    provider: 'dsh-audio',
+    provider: 'dsh-audiokit',
     source: 'bundled',
     rank: 600,
-    locator: 'dsh-audio/animation-sound'
+    locator: 'dsh-audiokit/animation-sound'
   }
   skills.registerProvider(() => ({
-    name: 'dsh-audio',
+    name: 'dsh-audiokit',
     list: async () => [summary],
     async get () {
       return { ...summary, content: CONTENT }

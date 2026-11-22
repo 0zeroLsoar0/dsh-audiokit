@@ -37,7 +37,7 @@ export const DEFAULT_MAX_INLINE_BYTES = 2 * 1024 * 1024
  * `buildCueSheet`; the result is a plain IIFE with no imports and no eval.
  * Kept short on purpose: this text is pasted into the deliverable.
  */
-const PLAYER_SOURCE = `/* dsh-audio cue player: paste in <script>; call dshAudio.resume() from a click. */
+const PLAYER_SOURCE = `/* dsh-audiokit cue player: paste in <script>; call dshAudio.resume() from a click. */
 (() => {
   const D = __DATA__, C = D.cues, END = D.duration
   const LEAD = __LEAD__, AHEAD = __AHEAD__, WAKE = __WAKE__, LATE = __LATE__

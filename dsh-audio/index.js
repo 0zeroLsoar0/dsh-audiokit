@@ -1,5 +1,5 @@
 /**
- * dsh-audio: sound for HTML animation.
+ * dsh-audiokit: sound for HTML animation.
  *
  * The plugin owns exactly one seam: audio in, audio out. It renders files and
  * reports measurements; how the page consumes them is the animation author's
@@ -46,7 +46,7 @@ import { registerVisualTools } from './lib/tools-visual.js'
 import { registerVideoTools } from './lib/tools-video.js'
 
 /** Cordis plugin name used by loader diagnostics. */
-export const name = 'dsh-audio'
+export const name = 'dsh-audiokit'
 
 /** Shown by the settings page; keep in sync with package.json. */
 const VERSION = '0.5.10'
@@ -133,7 +133,7 @@ export function apply (ctx, config = {}) {
   const systemPrompt = ctx.get('systemPrompt')
   if (systemPrompt !== undefined) {
     systemPrompt.section({
-      name: 'dsh-audio:animation-sound',
+      name: 'dsh-audiokit:animation-sound',
       order: 2950,
       text: PROMPT_SECTION
     })

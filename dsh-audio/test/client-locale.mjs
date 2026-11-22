@@ -762,7 +762,7 @@ console.log('-- plugin wiring --')
   const probe = createReactShim()
   const { registration, plugin } = evaluateBundle({ React: probe.React, fetch: createFetch(createRoute()), setTimeout: () => 0 })
 
-  check('bundle registers the package id', registration.id === '@local/dsh-audio', registration.id)
+  check('bundle registers the package id', registration.id === 'dsh-audiokit', registration.id)
   check('factory returns a plugin object', plugin !== null && typeof plugin === 'object')
   check('plugin requires slots only', JSON.stringify(plugin.inject) === '["slots"]', JSON.stringify(plugin.inject))
   check('plugin exposes apply', typeof plugin.apply === 'function')
@@ -771,7 +771,7 @@ console.log('-- plugin wiring --')
   plugin.apply(context)
   check('one settings.section registration', context.registrations.length === 1, String(context.registrations.length))
   const { options, component } = context.registrations[0]
-  check('registers into settings.section', options.name === 'settings.section' && options.id === 'dsh-audio', JSON.stringify({ name: options.name, id: options.id }))
+  check('registers into settings.section', options.name === 'settings.section' && options.id === 'dsh-audiokit', JSON.stringify({ name: options.name, id: options.id }))
   check('keeps its navigation order', options.order === 50, String(options.order))
   check('nav label is a thunk', typeof options.label === 'function')
   check('nav label reads zh at registration', options.label() === '声音', JSON.stringify(options.label()))
@@ -783,7 +783,7 @@ console.log('-- plugin wiring --')
   check('dictionary used the plugin namespace', registrationCall.namespace === NS, registrationCall?.namespace)
   check('zh dictionary registered verbatim', JSON.stringify(registrationCall.dicts.zh) === JSON.stringify(zh))
   check('en dictionary registered verbatim', JSON.stringify(registrationCall.dicts.en) === JSON.stringify(en))
-  check('every effect is labelled for diagnostics', context.effects.length > 0 && context.effects.every((effect) => typeof effect.label === 'string' && effect.label.startsWith('dsh-audio:')),
+  check('every effect is labelled for diagnostics', context.effects.length > 0 && context.effects.every((effect) => typeof effect.label === 'string' && effect.label.startsWith('dsh-audiokit:')),
     JSON.stringify(context.effects.map((effect) => effect.label)))
 
   locale.setLocale('en')
@@ -802,7 +802,7 @@ console.log('-- plugin wiring --')
   check('apply survives a composition without the locale service', threw === false)
   check('renders without a locale service', context.registrations.length === 1)
   check('nav label degrades to Chinese', context.registrations[0].options.label() === '声音')
-  check('no dictionary effect without the service', context.effects.every((effect) => effect.label !== 'dsh-audio: locale dictionaries'))
+  check('no dictionary effect without the service', context.effects.every((effect) => effect.label !== 'dsh-audiokit: locale dictionaries'))
 }
 
 {

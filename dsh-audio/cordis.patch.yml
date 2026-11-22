@@ -1,11 +1,11 @@
-# dsh-audio bundle: registers the sound-for-animation tools, skill and settings page.
+# dsh-audiokit bundle: registers the sound-for-animation tools, skill and settings page.
 #
 # Providers are optional: synthesis, mixing and the technical half of
 # audio_check work with no key at all. Fill these in to enable speech and the
 # semantic half of the check. The settings page edits the same values.
 - insert:
     - id: dsh-audio
-      name: '@local/dsh-audio'
+      name: dsh-audiokit
       config:
         tts:
           # minimax (default) | edge | openai | custom | none

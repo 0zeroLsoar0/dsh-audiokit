@@ -560,7 +560,7 @@ export function exportEdl (request = {}) {
     `TITLE:   ${title}`,
     `FCM: ${rate.fcm}`,
     '',
-    `* dsh-audio CMX3600 EDL | ${entries.length} event(s) | ${rate.label} | audio track ${trackType} | record start ${timecodeFromFrames(startFrame, rate)}`,
+    `* dsh-audiokit CMX3600 EDL | ${entries.length} event(s) | ${rate.label} | audio track ${trackType} | record start ${timecodeFromFrames(startFrame, rate)}`,
     '* NOTE: CMX3600 carries cut timing only: gain, fades and overlapping events cannot be expressed in this format. The csv and rpp exports keep levels.'
   ]
   const lines = header.slice()

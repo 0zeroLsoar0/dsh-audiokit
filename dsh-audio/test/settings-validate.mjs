@@ -177,7 +177,7 @@ const child = {
       }
     }
   },
-  fiber: { entry: { id: '@local/dsh-audio' } }
+  fiber: { entry: { id: 'dsh-audio', name: 'dsh-audiokit' } }
 }
 registerSettingsRoute({ inject: (_deps, callback) => callback(child) }, config, '0.0.0-test')
 

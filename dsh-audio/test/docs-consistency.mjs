@@ -226,8 +226,8 @@ const readmeRaw = await readText('README.md')
 const indexRaw = await readText('index.js')
 const skillRaw = await readText('lib/skill.js')
 
-const promptSection = state.sections.find((entry) => entry.name === 'dsh-audio:animation-sound')
-if (promptSection === undefined) fail('index.js', null, 'plugin registered no `dsh-audio:animation-sound` prompt section')
+const promptSection = state.sections.find((entry) => entry.name === 'dsh-audiokit:animation-sound')
+if (promptSection === undefined) fail('index.js', null, 'plugin registered no `dsh-audiokit:animation-sound` prompt section')
 const promptText = promptSection?.text ?? ''
 
 let skillContent = ''

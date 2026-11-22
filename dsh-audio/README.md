@@ -1,8 +1,8 @@
-# dsh-audio
+# dsh-audiokit
 
 给 HTML 动画配音的 DSH 插件。让你的 agent 在做动画时，顺手把声音也做出来。
 
-npm 包名 `dsh-audiokit`，插件/设置页里仍叫「声音」。
+项目/包统一叫 `dsh-audiokit`；设置页里仍叫「声音」，Cordis 入口 id 与 HTTP 路由仍是 `dsh-audio`（见下文安装说明）。
 
 > 合成音效、分层设计、作曲、旁白与唱声、口型与节拍对齐、混音、响度、交付检查——一整套都在 agent 的工具箱里，且不依赖任何素材库。
 
@@ -41,7 +41,7 @@ plugin_manager  action: install_bundle   target: <插件目录>/dsh-audio
 
 ```powershell
 dsh plugin --profile <profile> add "file:<插件目录>/dsh-audio"
-# 再把 "@local/dsh-audio" 加进 profile package.json 的 dsh.profile.bundles
+# 再把 "dsh-audiokit" 加进 profile package.json 的 dsh.profile.bundles
 ```
 
 安装后：**设置 → 声音**。所有工具会自动出现在 agent 的工具表里，做动画时会自己用。

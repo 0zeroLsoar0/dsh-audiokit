@@ -1,4 +1,4 @@
-# dsh-audio-plugin — test suite.
+# dsh-audiokit — test suite.
 #
 # The package has zero runtime and dev dependencies, so there is nothing to
 # cache and `npm install` is only a cheap package.json sanity check. All test

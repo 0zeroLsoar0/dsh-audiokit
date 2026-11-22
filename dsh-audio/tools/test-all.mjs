@@ -276,7 +276,7 @@ async function main () {
   let skipped = 0
   let failed = 0
 
-  console.log(`dsh-audio plugin tests · node ${process.version} · ${files.length} file(s) · jobs ${options.jobs}`)
+  console.log(`dsh-audiokit plugin tests · node ${process.version} · ${files.length} file(s) · jobs ${options.jobs}`)
   if (options.only.length > 0) console.log(`filter: ${options.only.join(', ')}`)
   console.log('')
 
