@@ -1,18 +1,21 @@
-﻿# 鍙窡韪繖涓」鐩湰韬細宸ヤ綔鍖洪噷鍏朵粬鐩綍锛堝叾浠栦細璇濈殑浜х墿锛変笉杩涗粨搴撱€?/*
+# 只跟踪这个项目本身：工作区里其他目录（其他会话的产物）不进仓库。
+/*
 !/.gitignore
 !/CHANGELOG.md
 !/dsh-audio/
 !/demo/
 !/versions/
 
-# 渚濊禆涓庣敓鎴愮墿
+# 依赖与生成物
 dsh-audio/node_modules/
 dsh-audio/test/out/
 *.tgz
 *.log
 .DS_Store
 
-# 鍔ㄧ敾鎴愬搧涓庝綋绉緝澶х殑濯掍綋鍙湪鏈湴瀛樺湪锛屼笉杩涗粨搴擄紙闇€瑕佹椂鐢ㄧ敓鎴愯剼鏈噸璺戯級銆?# 淇濈暀鐨勬槸婧愪唬鐮侊細build/render/spec/verify 鑴氭湰涓庤鏄庛€?/demo/bounce.html
+# 动画成品与体积较大的媒体只在本地存在，不进仓库（需要时用生成脚本重跑）。
+# 保留的是源代码：build/render/spec/verify 脚本与说明。
+/demo/bounce.html
 /demo/scene.html
 /demo/showcase.html
 /demo/intro/index.html
@@ -21,13 +24,11 @@ dsh-audio/test/out/
 /demo/intro/audio/*.wav
 /demo/assets/audio/
 /demo/about.png
-
-# 浣?0.1.0 閲嶅缓蹇収鐨?tgz 鏄偅娆＄暀妗ｇ殑涓€閮ㄥ垎
-!versions/0.1.0-reconstructed/dist/*.tgz
-# 全功能演示动画（成品与媒体不进仓库，只留生成脚本与 spec）
 /demo/showall/index.html
 /demo/showall/frames/
-/demo/showall/audio/*.wav
-/demo/showall/reference/
-/demo/showall/assets/
 /demo/showall/audio/
+/demo/showall/assets/
+/demo/showall/reference/
+
+# 0.1.0 重建快照的 tgz 是那次留档的一部分
+!versions/0.1.0-reconstructed/dist/*.tgz
