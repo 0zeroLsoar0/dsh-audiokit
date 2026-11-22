@@ -1,16 +1,16 @@
 {
-  "note": "The demo's own copy. No slogan is borrowed from any reference site; the archive grammar (file numbers, redaction, metadata) is a visual language, not text to copy.",
+  "note": "The demo's own copy. No slogan is borrowed from any reference site; the archive grammar (file numbers, redaction, metadata) is a visual language, not text to copy. The voice scene was cut: audio_tts / audio_voices / audio_sing are listed as available, never faked with audio.",
   "brand": {
     "mark": "dsh-audio",
     "kicker": "DSH · AUDIO ARCHIVE",
     "subtitle": "给 HTML 动画加声音",
-    "meta": ["对象编号  DSH-AUDIO-0.5.6", "密级  公开", "工具  25", "依赖  0"]
+    "meta": ["对象编号  DSH-AUDIO-0.5.9", "密级  公开", "工具  27", "依赖  0"]
   },
   "hud": {
     "clock": "T+{t} / {total}",
-    "scene": "FILE {n} / 08",
+    "scene": "FILE {n} / 07",
     "audio": "AUDIO INLINE · {count} CUES",
-    "toolsActive": "{n}/25"
+    "toolsActive": "{n}/27"
   },
   "scenes": [
     {
@@ -35,7 +35,7 @@
       "headline": "分层设计",
       "line": "26 个配方 · 一层不是一个声音，是一组",
       "detail": "金属门砸 玻璃碎 远近爆炸 魔法 UI 机械 生物 远雷",
-      "tools": ["audio_design"]
+      "tools": ["audio_design", "audio_mix"]
     },
     {
       "id": "compose",
@@ -46,16 +46,8 @@
       "tools": ["audio_compose", "audio_midi", "audio_beats", "audio_loudness"]
     },
     {
-      "id": "voice",
-      "file": "04",
-      "headline": "人声",
-      "line": "旁白 与 唱声 · 词级时间戳 · 嘴型跟得住",
-      "detail": "没有音频也能出口型：字幕直接驱动嘴形",
-      "tools": ["audio_tts", "audio_voices", "audio_sing", "audio_lipsync", "audio_mouth"]
-    },
-    {
       "id": "interactive",
-      "file": "05",
+      "file": "04",
       "headline": "交互",
       "line": "界面反馈音 · 实时合成，零音频字节",
       "detail": "悬停 按下 成功 失败 · 参数连续可变",
@@ -63,19 +55,19 @@
     },
     {
       "id": "analysis",
-      "file": "06",
+      "file": "05",
       "headline": "测量",
       "line": "基频 谐波 共振峰 噪声度 衰减 · 响度 · 空间",
-      "detail": "母带：多段压缩 + 真峰值限制",
-      "tools": ["audio_analyze", "audio_master", "audio_spatial", "audio_bus"]
+      "detail": "母带：多段压缩 + 真峰值限制 · 字幕直接驱动嘴形，不出声",
+      "tools": ["audio_analyze", "audio_master", "audio_spatial", "audio_bus", "audio_mux", "audio_stretch", "audio_lipsync", "audio_mouth"]
     },
     {
       "id": "delivery",
-      "file": "07",
+      "file": "06",
       "headline": "交付",
       "line": "cue 表 · 分轨 · 转码 · 回归",
       "detail": "8/16/24/32 位 · 单双声道 · 5.1",
-      "tools": ["audio_bind", "audio_stems", "audio_convert", "audio_mix", "audio_stretch", "audio_check", "audio_regress"]
+      "tools": ["audio_bind", "audio_stems", "audio_convert", "audio_check", "audio_regress", "audio_tts", "audio_voices", "audio_sing"]
     }
   ],
   "endcard": {

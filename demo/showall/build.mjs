@@ -20,7 +20,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { composeScore } from '../../dsh-audio/lib/compose.js';
-import { analyzeVisemes } from '../../dsh-audio/lib/lipsync.js';
 import { mouthFromText } from '../../dsh-audio/lib/mouth.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -29,7 +28,7 @@ const AUDIO_DIR = path.join(HERE, 'audio');
 const ASSET_DIR = path.join(HERE, 'assets');
 const PALETTE = path.join(HERE, 'palette.json');
 
-const DUR = 44;
+const DUR = 38;
 const MAX_PAGE_BYTES = 2200 * 1024;
 
 // dsh-audio is still being developed while this page is built (audio_spatial and
@@ -102,17 +101,17 @@ const SCENES = [
   { id: 'library', label: '音效库', from: 4, to: 9, tools: ['audio_synth', 'audio_pattern', 'audio_probe'] },
   { id: 'recipes', label: '分层设计', from: 9, to: 14, tools: ['audio_design', 'audio_mix'] },
   { id: 'compose', label: '配乐', from: 14, to: 20, tools: ['audio_compose', 'audio_midi', 'audio_beats', 'audio_loudness'] },
-  { id: 'voice', label: '人声', from: 20, to: 26, tools: ['audio_tts', 'audio_sing', 'audio_lipsync', 'audio_mouth', 'audio_voices'] },
-  { id: 'interactive', label: '交互', from: 26, to: 32, tools: ['audio_react', 'audio_live'] },
-  { id: 'analysis', label: '测量', from: 32, to: 38, tools: ['audio_analyze', 'audio_loudness', 'audio_bus', 'audio_spatial', 'audio_stretch'] },
-  { id: 'delivery', label: '交付', from: 38, to: 44, tools: ['audio_bind', 'audio_stems', 'audio_convert', 'audio_check', 'audio_regress'] },
+  { id: 'interactive', label: '交互', from: 20, to: 26, tools: ['audio_react', 'audio_live'] },
+  { id: 'analysis', label: '测量', from: 26, to: 32, tools: ['audio_analyze', 'audio_loudness', 'audio_master', 'audio_bus', 'audio_spatial', 'audio_stretch', 'audio_lipsync', 'audio_mouth'] },
+  { id: 'delivery', label: '交付', from: 32, to: 38, tools: ['audio_bind', 'audio_stems', 'audio_convert', 'audio_mix', 'audio_mux', 'audio_check', 'audio_regress', 'audio_tts', 'audio_voices', 'audio_sing'] },
 ];
 // Any tool a scene does not cover yet is placed by keyword, then reported.
 const TOOL_HINTS = [
   [/mux|bind|stems|convert|check|regress|mix/, 'delivery'],
   [/spatial|bus|master|loud|analy|probe|stretch/, 'analysis'],
   [/compose|midi|beats/, 'compose'],
-  [/tts|sing|voice|lipsync|mouth/, 'voice'],
+  [/tts|sing|voices/, 'delivery'],
+  [/lipsync|mouth/, 'analysis'],
   [/react|live/, 'interactive'],
   [/design|recipe/, 'recipes'],
   [/synth|pattern/, 'library'],
@@ -296,6 +295,10 @@ if (manifest) {
     }
   }
 }
+// Voice scene cut: the sung and narrating cues are dropped, not re-timed, and
+// everything that used to sit after 20 s slides 6 s earlier with its scene.
+cueList = cueList.filter((c) => !/^(sing|narration|tts|vocal|voice)/i.test(c.name));
+for (const c of cueList) if (c.at >= 20) c.at = Math.max(0, Math.round((c.at - 6) * 1000) / 1000);
 cueList.sort((a, b) => a.at - b.at);
 
 // Encode every cue. Short hits -> 8-bit at <=22.05 kHz; anything over 5 s is a bed
@@ -311,7 +314,9 @@ function encodeCue(cue, bedDepth) {
   const isBed = srcDur > 5 || /bed|music|pad|hum|room|texture|drone/i.test(cue.name);
   const rate = isBed ? 11025 : Math.min(22050, wav.sampleRate);
   const depth = isBed ? bedDepth : 8;
-  const mono2 = resample(wav.mono, wav.sampleRate, rate);
+  let frames = wav.mono;
+  if (isBed && srcDur > DUR) frames = wav.mono.subarray(0, Math.floor(wav.sampleRate * DUR));
+  const mono2 = resample(frames, wav.sampleRate, rate);
   const out = depth === 16 ? wav16(mono2, rate) : wav8(mono2, rate);
   return { wav: out, rate, depth, dur: r3(srcDur), srcRate: wav.sampleRate, mono: mono2, monoRate: rate };
 }
@@ -344,8 +349,6 @@ function cueTimes(re) {
 }
 const ticksCue = encoded.find((e) => /tick/i.test(e.name));
 const openingCue = encoded.find((e) => /(open|impact|hit|intro|logo|start)/i.test(e.name));
-const sungCue = encoded.find((e) => /sing|vocal|voice|lyric/i.test(e.name) && !/tts|narrat/i.test(e.name));
-const ttsCue = encoded.find((e) => /tts|narrat|speech|spoken/i.test(e.name));
 
 // Onsets of the ticks bed, so the 38 cells light up on the actual wav, not on a
 // guessed stagger. Frame RMS with a 1.5x local-average rise and a 28 ms gap.
@@ -402,7 +405,7 @@ const S2 = 4, S3 = 9, S4 = 14;
 // the same file (impact / bed / sing).
 const PROBE_MAP = [
   ['impact', 'impact'], ['tick', 'ticks'], ['chime', 'ui-success'], ['zap', 'ui-error'],
-  ['riser', 'riser'], ['thud', 'design-hit'], ['scrap', 'glass'], ['choir-pad', 'sing'],
+  ['riser', 'riser'], ['thud', 'design-hit'], ['scrap', 'glass'], ['choir-pad', 'bed'],
 ];
 const probe = PROBE_MAP.map((pair) => {
   const preset = pair[0], cue = pair[1];
@@ -502,73 +505,17 @@ for (const track of score.tracks) {
 }
 const rollChords = (score.chords || []).map((c) => ({ bar: c.bar, name: c.name, midi: c.midi }));
 
-// ------------------------------------------------------------ lipsync / mouth
+// ------------------------------------------------------- text-driven mouth
+// The voice scene is gone, so nothing here touches audio: this is the "a caption
+// alone can drive a mouth" case. audio_lipsync is credited as the technique the
+// timing model comes from; audio_mouth is the tool that produces these frames.
 const CAPTION = '给 HTML 动画加声音';
-let visemesA = [];
-let visemeSource = 'placeholder';
-if (sungCue && sungCue.mono) {
-  try {
-    const res = analyzeVisemes(sungCue.mono, sungCue.monoRate, { fps: 24 });
-    const frames = res.frames || res;
-    if (Array.isArray(frames) && frames.length) {
-      visemesA = frames.map((f) => ({ t: r3(f.t), v: f.viseme || 'none', o: r3(clamp01(f.openness)) }));
-      visemeSource = 'analyzeVisemes(' + sungCue.file + ')';
-    }
-  } catch (e) { warn('analyzeVisemes failed: ' + e.message); }
-}
-if (!visemesA.length) {
-  const res = mouthFromText({ text: CAPTION, duration: 3.2, fps: 24 });
-  visemesA = (res.frames || []).map((f) => ({ t: r3(f.t), v: f.viseme || 'none', o: r3(clamp01(f.openness)) }));
-  visemeSource = 'placeholder(mouthFromText)';
-  placeholders.push('lipsync');
-}
-let mouthB = [];
+let textMouth = [];
 try {
   const res = mouthFromText({ text: CAPTION, duration: 3.2, fps: 24 });
-  mouthB = (res.frames || []).map((f) => ({ t: r3(f.t), v: f.viseme || 'none', o: r3(clamp01(f.openness)) }));
+  textMouth = (res.frames || []).map((f) => ({ t: r3(f.t), v: f.viseme || 'none', o: r3(clamp01(f.openness)) }));
 } catch (e) { warn('mouthFromText failed: ' + e.message); }
-
-// Syllable / word timestamps for the sung cue. Prefer manifest data, else the
-// lipsync frames (voiced onsets), else even spacing of the lyric.
-const LYRIC = ['gei', 'html', 'dong', 'hua', 'jia', 'sheng', 'yin'];
-let syllables = [];
-const syllRaw = deepFind(manifest, ['syllables', 'syllabletimes', 'words', 'timestamps']);
-if (Array.isArray(syllRaw) && syllRaw.length) {
-  syllables = syllRaw.map((s, i) => {
-    if (typeof s === 'object') return { t: r3(num(s.t ?? s.at ?? s.start ?? s.time, i * 0.4)), text: String(s.text ?? s.syllable ?? s.word ?? LYRIC[i % LYRIC.length]) };
-    return { t: r3(Number(s) || i * 0.4), text: LYRIC[i % LYRIC.length] };
-  }).filter((s) => Number.isFinite(s.t)).slice(0, 12);
-}
-const sungDur = sungCue ? sungCue.dur : 3.2;
-if (!syllables.length) {
-  // Derived, not measured: the sung cue has no syllable sheet, so the lyric words
-  // are spread over the voiced span (started at the first voiced frame). Labelled
-  // as derived in the build output.
-  const voiced = visemesA.filter((f) => f.v !== 'none');
-  const step = (sungDur - 0.4) / Math.max(1, LYRIC.length);
-  const start = voiced.length ? Math.max(0.08, Math.min(voiced[0].t, 0.3)) : 0.15;
-  syllables = LYRIC.map((w, i) => ({ t: r3(start + i * step), text: w }));
-  placeholders.push('syllables(derived from lyric, evenly spaced)');
-}
-
-// Waveform peaks for the scene-5 waveform (from the sung wav when present).
-const PEAK_BUCKETS = 220;
-let peaks = [];
-if (sungCue && sungCue.mono) {
-  const step = Math.max(1, Math.floor(sungCue.mono.length / PEAK_BUCKETS));
-  for (let i = 0; i < PEAK_BUCKETS; i++) {
-    let m = 0;
-    for (let j = i * step; j < Math.min(sungCue.mono.length, (i + 1) * step); j++) m = Math.max(m, Math.abs(sungCue.mono[j]));
-    peaks.push(r3(Math.min(1, m)));
-  }
-} else {
-  for (let i = 0; i < PEAK_BUCKETS; i++) {
-    const x = i / PEAK_BUCKETS;
-    const env = Math.sin(Math.PI * x) * (0.55 + 0.45 * Math.sin(x * 34));
-    peaks.push(r3(Math.max(0.04, Math.abs(env) * (0.5 + seedHash('pk' + i) * 0.5))));
-  }
-  placeholders.push('peaks');
-}
+if (!textMouth.length) { placeholders.push('textMouth'); textMouth = [{ t: 0, v: 'MM', o: 0.2 }]; }
 
 // ------------------------------------------------------------------- live sfx
 const livePath = path.join(ASSET_DIR, 'live-sfx.js');
@@ -628,16 +575,10 @@ const data = {
   rollBpm: score.bpm,
   rollKey: score.key + ' ' + score.mode,
   rollBars: score.bars,
-  visemesA,
-  mouthB,
-  syllables,
-  peaks,
+  textMouth,
   caption: CAPTION,
-  sungDur: r3(sungDur),
-  sungName: sungCue ? sungCue.name : null,
-  ttsName: ttsCue ? ttsCue.name : null,
-  ttsFile: ttsCue ? ttsCue.file : null,
-  ttsPlaceholder: !!(ttsCue && /placeholder/i.test(String(ttsCue.file || ''))),
+  caption: CAPTION,
+
   tickStart: ticksCue ? r3(ticksCue.at) : 4.2,
   placeholders: [...new Set(placeholders)],
   missing,
@@ -654,7 +595,7 @@ const PAGE_HTML = String.raw`<!doctype html>
 <title>__TITLE__</title>
 <!-- build: __BUILD_NOTE__ -->
 <!-- audio payload: every clip is a PCM WAV byte array embedded as BASE64 text in
-     #showall-data (8-bit for one-shots, and the 44 s bed at 8-bit/11.025 kHz to
+     #showall-data (8-bit for one-shots, and the 38 s bed at 8-bit/11.025 kHz to
      stay inside the page budget). The page decodes them with atob() then
      ctx.decodeAudioData() — there are deliberately no data:audio/... URIs here,
      because the payload is a single JSON blob, not markup. -->
@@ -732,7 +673,7 @@ body{font-family:var(--sans);color:var(--ink);-webkit-font-smoothing:antialiased
 .meta-table .mv.redact{display:block;background:var(--redact);border:1px solid rgba(255,255,255,.05);
   height:11px;margin-top:2px}
 
-/* ---------------- 2 · library ---------------- */
+/* ---------------- 1 · library ---------------- */
 .grid38{display:grid;grid-template-columns:repeat(8,1fr);gap:1px;background:var(--line2);
   border:1px solid var(--line2);margin-top:4px}
 .cell{background:var(--stage);padding:clamp(7px,.95vw,11px) 8px;min-height:0;
@@ -746,7 +687,7 @@ body{font-family:var(--sans);color:var(--ink);-webkit-font-smoothing:antialiased
 .cell.metrics.shown .v{opacity:1}
 .cell.metrics .v i{font-style:normal;color:var(--accent)}
 
-/* ---------------- 3 · recipes ---------------- */
+/* ---------------- 2 · recipes ---------------- */
 .rec-wrap{display:grid;grid-template-columns:minmax(200px,24%) 1fr;gap:clamp(20px,4vw,54px)}
 #rec-list{list-style:none;column-count:2;column-gap:clamp(14px,2vw,26px);font-family:var(--mono);font-size:clamp(9px,.86vw,10.5px)}
 #rec-list li{padding:1.9px 0;color:var(--faint);letter-spacing:.04em;white-space:nowrap;opacity:0}
@@ -770,7 +711,7 @@ body{font-family:var(--sans);color:var(--ink);-webkit-font-smoothing:antialiased
   margin-top:4px;font-variant-numeric:tabular-nums}
 .metric .n em{font-style:normal;color:var(--accent);font-size:.62em;letter-spacing:.1em;margin-left:3px}
 
-/* ---------------- 4 · compose ---------------- */
+/* ---------------- 3 · compose ---------------- */
 .genres{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:clamp(12px,2vh,20px)}
 .chip{font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;
   padding:5px 10px;border:1px solid var(--line2);color:var(--faint)}
@@ -790,24 +731,7 @@ body{font-family:var(--sans);color:var(--ink);-webkit-font-smoothing:antialiased
   color:var(--accent);border:1px solid color-mix(in srgb, var(--accent) 50%, transparent);padding:4px 8px}
 #s-compose .scene-head .meta{padding-right:62px}
 
-/* ---------------- 5 · voice ---------------- */
-#wave{width:100%;height:clamp(64px,10vh,92px);display:block;margin-bottom:4px}
-#sylls{position:relative;height:30px;margin-bottom:clamp(10px,1.6vh,18px)}
-#sylls span{position:absolute;top:0;font-family:var(--mono);font-size:9px;letter-spacing:.08em;
-  color:var(--faint);transform:translateX(-50%);white-space:nowrap}
-#sylls span.alt{top:13px}
-#sylls span:before{content:"";display:block;width:1px;height:5px;background:var(--line);margin:0 auto 3px}
-.voicelow{display:flex;align-items:flex-start;gap:clamp(24px,4vw,60px)}
-.mouths{display:flex;gap:clamp(18px,3vw,34px)}
-.mouths figure{display:flex;flex-direction:column;align-items:center;gap:6px}
-.mouths canvas{width:clamp(74px,8vw,104px);height:clamp(56px,6vw,78px);display:block}
-.mouths figcaption{font-family:var(--mono);font-size:9px;letter-spacing:.12em;color:var(--faint)}
-.voicecol{flex:1;display:flex;flex-direction:column;gap:10px}
-.vchips{display:flex;flex-wrap:wrap;gap:6px}
-.two-line{font-family:var(--mono);font-size:9.5px;letter-spacing:.1em;color:var(--faint);line-height:1.9}
-.two-line b{color:var(--dim);font-weight:400}
-
-/* ---------------- 6 · interactive ---------------- */
+/* ---------------- 5 · interactive ---------------- */
 .btnrow{display:flex;gap:10px;margin-bottom:clamp(16px,2.6vh,26px)}
 .uibtn{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;
   padding:11px 18px;background:transparent;border:1px solid var(--line);color:var(--dim);
@@ -836,7 +760,7 @@ input[type=range]::-moz-range-thumb{width:9px;height:9px;background:var(--accent
 .pad.fire{background:color-mix(in srgb, var(--accent) 12%, transparent);border-color:var(--accent);color:var(--ink)}
 .pad span{font-size:8px;color:var(--ghost);margin-bottom:auto}
 
-/* ---------------- 7 · analysis ---------------- */
+/* ---------------- 6 · analysis ---------------- */
 .an-grid{display:grid;grid-template-columns:1fr minmax(230px,32%);gap:clamp(24px,4vw,60px)}
 #spec{width:100%;height:clamp(120px,21vh,190px);display:block}
 .an-right{display:flex;flex-direction:column;gap:clamp(14px,2.4vh,26px)}
@@ -851,12 +775,17 @@ input[type=range]::-moz-range-thumb{width:9px;height:9px;background:var(--accent
 #r51{width:clamp(104px,11vw,138px);height:clamp(104px,11vw,138px);display:block}
 .ring-legend{font-family:var(--mono);font-size:9px;letter-spacing:.12em;color:var(--faint);line-height:2.1}
 .ring-legend b{color:var(--ink);font-weight:400}
+.tm{display:flex;align-items:center;gap:clamp(14px,2vw,22px);margin-top:clamp(10px,1.8vh,20px)}
+.tm canvas{width:clamp(64px,6.4vw,86px);height:clamp(48px,4.8vw,64px);display:block}
+.tm-meta{display:flex;flex-direction:column;gap:4px;min-width:0}
+.tm-meta .k{font-family:var(--mono);font-size:8.5px;letter-spacing:.16em;color:var(--faint);text-transform:uppercase}
+.tm-meta .v{font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
-/* ---------------- 8 · delivery (the one paper page) ---------------- */
+/* ---------------- 7 · delivery (the one paper page) ---------------- */
 .sheet{background:var(--paper);color:var(--paperInk);height:100%;padding:clamp(14px,2.2vh,22px) clamp(16px,2.4vw,30px);
   display:flex;flex-direction:column;
   --ink:#161616; --dim:#3c3c3c; --faint:#616161; --ghost:#8a8a8a;
-  --line:rgba(0,0,0,.18); --line2:rgba(0,0,0,.1); --accent:#8e5f99; --redact:#111}
+  --line:rgba(0,0,0,.18); --line2:rgba(0,0,0,.1); --accent:var(--accentDim); --redact:#111}
 .sheet .scene-head{border-bottom:1px solid rgba(0,0,0,.28)}
 .sheet .readout{color:#5f5f5f}
 .deliv{display:grid;grid-template-columns:1.15fr 1fr .72fr .9fr;gap:clamp(18px,3vw,42px)}
@@ -870,7 +799,7 @@ input[type=range]::-moz-range-thumb{width:9px;height:9px;background:var(--accent
 .stem .nm{font-family:var(--mono);font-size:9px;letter-spacing:.1em;color:var(--faint);width:38px;text-transform:uppercase}
 .stem .bar{height:3px;background:rgba(0,0,0,.16);flex:1}
 .stem .bar b{display:block;height:3px;background:#161616;width:0;opacity:.6}
-.stem:first-child .bar b{background:#8e5f99;opacity:1}
+.stem:first-child .bar b{background:var(--accentDim);opacity:1}
 .fmtchips{display:flex;flex-wrap:wrap;gap:5px}
 .pass{font-family:var(--mono);font-size:9.5px;letter-spacing:.1em;color:var(--dim);padding:3px 0;opacity:0}
 .pass b{color:var(--accent);font-weight:400}
@@ -883,9 +812,9 @@ input[type=range]::-moz-range-thumb{width:9px;height:9px;background:var(--accent
   text-transform:uppercase;white-space:nowrap}
 
 /* ---------------- strip ---------------- */
-#strip{position:absolute;left:0;right:0;bottom:0;height:clamp(108px,15vh,128px);z-index:20;
+#strip{position:absolute;left:0;right:0;bottom:0;height:clamp(92px,12.5vh,108px);z-index:20;
   border-top:1px solid var(--line2);padding:11px clamp(26px,3.4vw,56px) 10px;
-  display:grid;grid-template-columns:repeat(5,1fr);grid-auto-rows:1fr;gap:0 14px;
+  display:grid;grid-template-columns:repeat(6,1fr);grid-auto-rows:1fr;gap:0 12px;
   background:linear-gradient(180deg,rgba(8,9,11,0),rgba(8,9,11,.75))}
 #strip .t{font-family:var(--mono);font-size:clamp(7.5px,.7vw,9px);letter-spacing:.04em;
   color:rgba(230,230,230,.22);white-space:nowrap;display:flex;align-items:center;gap:5px}
@@ -1004,23 +933,6 @@ input[type=range]::-moz-range-thumb{width:9px;height:9px;background:var(--accent
       <div class="readout" id="cmp-readout">audio_compose · audio_beats · audio_midi · audio_loudness</div>
     </section>
 
-    <section class="scene" id="s-voice">
-      <div class="scene-head"><span class="f" data-f>FILE 4 / 08</span><h2 data-h></h2><span class="hl"><span class="line" data-l></span><span class="detail" data-d></span></span></div>
-      <canvas id="wave"></canvas>
-      <div id="sylls"></div>
-      <div class="voicelow">
-        <div class="mouths">
-          <figure><canvas id="m-a"></canvas><figcaption id="cap-a">— · lipsync</figcaption></figure>
-          <figure><canvas id="m-b"></canvas><figcaption id="cap-b">— · mouth</figcaption></figure>
-        </div>
-        <div class="voicecol">
-          <div class="vchips" id="vchips"></div>
-          <div class="two-line" id="v-note"></div>
-        </div>
-      </div>
-      <div class="readout">audio_tts · audio_sing · audio_lipsync · audio_mouth · audio_voices</div>
-    </section>
-
     <section class="scene" id="s-interactive">
       <div class="scene-head"><span class="f" data-f>FILE 5 / 08</span><h2 data-h></h2><span class="hl"><span class="line" data-l></span><span class="detail" data-d></span></span></div>
       <div class="btnrow">
@@ -1038,7 +950,17 @@ input[type=range]::-moz-range-thumb{width:9px;height:9px;background:var(--accent
     <section class="scene" id="s-analysis">
       <div class="scene-head"><span class="f" data-f>FILE 6 / 08</span><h2 data-h></h2><span class="hl"><span class="line" data-l></span><span class="detail" data-d></span></span></div>
       <div class="an-grid">
-        <div><canvas id="spec"></canvas></div>
+        <div>
+          <canvas id="spec"></canvas>
+          <div class="tm">
+            <canvas id="m-text"></canvas>
+            <div class="tm-meta">
+              <div class="k mono">text → mouth · no audio</div>
+              <div class="v mono" id="tm-vis">—</div>
+              <div class="v mono faint" id="tm-line"></div>
+            </div>
+          </div>
+        </div>
         <div class="an-right">
           <div class="lufs">
             <div class="lab">loudness · integrated</div>
@@ -1062,7 +984,9 @@ input[type=range]::-moz-range-thumb{width:9px;height:9px;background:var(--accent
           <div class="col"><div class="ch">cue sheet · bind</div><div id="cuesheet"></div></div>
           <div class="col"><div class="ch">stems</div><div id="stems"></div></div>
           <div class="col"><div class="ch">convert</div><div class="fmtchips" id="fmtchips"></div></div>
-          <div class="col"><div class="ch">gate</div><div id="checks"></div></div>
+          <div class="col"><div class="ch">gate</div><div id="checks"></div>
+            <div class="ch" style="margin-top:14px">available · not demonstrated</div>
+            <div class="fmtchips" id="availchips"></div></div>
         </div>
         <div class="endcard" id="endcard">
           <div class="ec-l">
@@ -1230,23 +1154,6 @@ function buildCompose(){
   txt(q('#bpm'),'');
   q('#bpm').innerHTML=D.bpm+'<em>BPM</em>';
 }
-function buildVoice(){
-  var box=q('#sylls'), n=D.syllables.length||1;
-  D.syllables.forEach(function(s,i){
-    var sp=mk('span',(i%2?'alt':''),s.text);
-    sp.__t=s.t;
-    syllEls.push(sp); box.appendChild(sp);
-  });
-  var vc=q('#vchips');
-  D.voices.forEach(function(v){
-    vc.appendChild(mk('span','chip sm'+(v==='alto'?' on':''),v));
-  });
-  var lines=['<b>sung</b> '+(D.sungName||D.sungDur+' s — placeholder')+
-             ' · '+D.visemesA.length+' viseme frames',
-             '<b>tts</b> '+(D.ttsPlaceholder?('旁白占位 · '+D.ttsFile):(D.ttsName?D.ttsName:'旁白占位 · 未配置供应商（无密钥）')),
-             '<b>voices</b> alto bass child breathy choir'];
-  q('#v-note').innerHTML=lines.join('<br>');
-}
 function buildInteractive(){
   var defs=[['weight',0.62],['hardness',0.48],['metallic',0.30],['decay',0.55]];
   var box=q('#sliders'); sliders={};
@@ -1276,6 +1183,10 @@ function buildInteractive(){
 function buildAnalysis(){
   txt(q('#r51lab'),'FL FR C LFE RL RR');
 }
+function buildTextMouth(){
+  txt(q('#tm-line'), D.caption||'');
+  drawMouth(q('#m-text'), mouthAt(D.textMouth, 0));
+}
 function buildDelivery(){
   var cs=q('#cuesheet');
   D.cues.slice(0,6).forEach(function(c,i){
@@ -1297,6 +1208,8 @@ function buildDelivery(){
     var c=mk('span','chip sm'+(b==='8'?' on':'')); c.textContent=b+' bit';
     fc.appendChild(c);
   });
+  var av=q('#availchips');
+  ['audio_tts','audio_voices','audio_sing'].forEach(function(n){ av.appendChild(mk('span','chip sm',n)); });
   var ck=q('#checks');
   [['audio_check','PASS'],['audio_regress','PASS'],['audio_bind','inline'],['page','no network']].forEach(function(p){
     var d=mk('div','pass');
@@ -1308,7 +1221,7 @@ function buildDelivery(){
   qa('#s-delivery .ch')[0].textContent='cue sheet · bind · '+cueN+' cues';
 }
 function buildStrip(){
-  var strip=q('#strip'), cols=5, rows=Math.ceil(D.tools.length/cols);
+  var strip=q('#strip'), cols=6, rows=Math.ceil(D.tools.length/cols);
   strip.style.gridTemplateRows='repeat('+rows+',1fr)';
   D.tools.forEach(function(name){
     var t=mk('div','t',name); stripEls[name]=t; strip.appendChild(t);
@@ -1599,42 +1512,6 @@ function drawMouth(cv,fr){
   g.beginPath(); g.moveTo(cx-wide-6,cy); g.lineTo(cx-wide-12,cy); g.stroke();
   g.beginPath(); g.moveTo(cx+wide+6,cy); g.lineTo(cx+wide+12,cy); g.stroke();
 }
-S.voice=function(lt){
-  var t=Math.max(0,lt-0.32);
-  var dur=Math.max(0.5,D.sungDur||3.2);
-  var f=fit(q('#wave')); if(f){
-    var g=f.g,w=f.w,h=f.h, n=D.peaks.length;
-    g.lineWidth=1; g.strokeStyle='rgba(255,255,255,0.09)';
-    g.beginPath(); g.moveTo(0,h/2+0.5); g.lineTo(w,h/2+0.5); g.stroke();
-    var playX=(t/dur)*w;
-    for(var i=0;i<n;i++){
-      var x=(i/n)*w, p=D.peaks[i];
-      var bh=Math.max(1,p*h*0.42);
-      var played=x<=playX;
-      g.strokeStyle=played?acc(0.9):'rgba(230,230,230,0.26)';
-      g.beginPath(); g.moveTo(Math.round(x)+0.5,h/2-bh); g.lineTo(Math.round(x)+0.5,h/2+bh); g.stroke();
-    }
-    g.strokeStyle='rgba(255,255,255,0.3)';
-    g.beginPath(); g.moveTo(Math.round(playX)+0.5,0); g.lineTo(Math.round(playX)+0.5,h); g.stroke();
-  }
-  var syl=q('#sylls');
-  D.syllables.forEach(function(s,i){
-    var sp=syllEls[i]; if(!sp) return;
-    var pct=Math.max(2,Math.min(98,(s.t/dur)*100));
-    if(sp.__pct!==pct){ sp.__pct=pct; sp.style.left=pct.toFixed(2)+'%'; }
-    var on=t>=s.t-0.02;
-    setOp(sp,on?1:0.3);
-    if(on&&!sp.__on){ sp.__on=1; sp.style.color=ACCENT; }
-  });
-  var A=mouthAt(D.visemesA,t), B=mouthAt(D.mouthB,t);
-  drawMouth(q('#m-a'),A); drawMouth(q('#m-b'),B);
-  txt(q('#cap-a'),(A.v||'none')+' · lipsync');
-  txt(q('#cap-b'),(B.v||'none')+' · text');
-};
-var itFired={};
-S.interactive=function(lt){
-  if(!itFired.auto&&lt>4.1){ itFired.auto=1; uiPlay('success'); }
-};
 S.analysis=function(lt){
   var f=fit(q('#spec'));
   if(f){
@@ -1671,6 +1548,9 @@ S.analysis=function(lt){
       +D.lufs.tp.toFixed(1)+' dBTP · LRA '+D.lufs.lra.toFixed(1)+' LU · target '+after.toFixed(1)
       +(D.centroidHz?' · centroid '+D.centroidHz+' Hz':''));
   }
+  var tf=mouthAt(D.textMouth, Math.max(0,lt-0.3));
+  drawMouth(q('#m-text'), tf);
+  txt(q('#tm-vis'), (tf.v||'none')+' · open '+tf.o.toFixed(2));
   var rf=fit(q('#r51')); if(rf){
     var g2=rf.g,w2=rf.w,h2=rf.h,cx=w2/2,cy=h2/2,R=Math.min(w2,h2)*0.4;
     g2.lineWidth=1; g2.strokeStyle='rgba(255,255,255,0.14)';
@@ -1704,7 +1584,7 @@ S.delivery=function(lt){
   passEls.forEach(function(p,i){ setOp(p,ramp((lt-1.35-i*0.12)/0.4)); });
   setOp(q('#endcard'),ramp((lt-3.1)/0.6));
 };
-var SCENE_FN={open:S.open,library:S.library,recipes:S.recipes,compose:S.compose,voice:S.voice,
+var SCENE_FN={open:S.open,library:S.library,recipes:S.recipes,compose:S.compose,
   interactive:S.interactive,analysis:S.analysis,delivery:S.delivery};
 var sceneEls={};
 function initScenes(){
@@ -1783,13 +1663,13 @@ window.showall={
   duration:D.dur,
   tools:D.tools.slice(),
   audio:QA?'none (seek mode)':'base64 PCM wav decoded with atob + decodeAudioData',
-  currentTime:function(){ return (playing||T0)?(clock()-T0):0; },
+  currentTime:function(){ var v=(playing||T0)?(clock()-T0):0; return Math.max(-0.12, Math.min(D.dur, v)); },
   state:function(){ return document.body.getAttribute('data-state')||'gate'; },
   start:begin,
   replay:function(){ begin(); if(finished||!playing) startRun(); }
 };
 function boot(){
-  fillCopy(); initScenes(); buildLibrary(); buildRecipes(); buildCompose(); buildVoice();
+  fillCopy(); initScenes(); buildLibrary(); buildRecipes(); buildCompose(); buildTextMouth();
   buildInteractive(); buildAnalysis(); buildDelivery(); buildStrip();
   document.body.setAttribute('data-state','gate');
   document.body.setAttribute('data-status','gate');
@@ -1863,7 +1743,7 @@ const page = PAGE_HTML
     ' live-sfx=' + (liveSrc ? 'yes' : 'MISSING') +
     ' ui-sfx=' + (uiSrc ? 'yes' : 'MISSING') +
     ' | placeholders: ' + (data.placeholders.length ? data.placeholders.join(',') : 'none') +
-    ' | visemes: ' + visemeSource);
+    ' | textMouth: ' + textMouth.length + ' frames (no audio)');
 
 fs.writeFileSync(OUT, page, 'utf8');
 
@@ -1884,7 +1764,7 @@ console.log('  ' + 'TOTAL PAGE'.padEnd(24) + (htmlBytes / 1024).toFixed(1) + ' K
 console.log('formats: ' + cueFmt);
 console.log('bed: ' + bedDepthUsed + 'bit/11025Hz (16-bit when the page has room, else 8-bit) | total ' + (htmlBytes / 1024 / 1024).toFixed(2) + ' MB of 2.20 MB');
 console.log('beat grid: ' + data.bpm + ' bpm (conf ' + data.beatConf + '), ' + data.beatTimes.length + ' beats in scene 4 | f0 ' + data.f0 + ' Hz, ' + data.harmonics.length + ' harmonics, centroid ' + data.centroidHz + ' Hz | LUFS ' + lufs.measured.toFixed(1) + ' measured -> ' + lufs.target + ' target, tp ' + lufs.tp.toFixed(1) + ' dBTP');
-console.log('build-time calls: composeScore(lofi ' + score.bars + ' bars, drums excluded) ' + rollNotes.length + ' notes, ' + rollChords.length + ' chords | ' + visemeSource + ' ' + visemesA.length + ' frames | mouthFromText ' + mouthB.length + ' frames');
+console.log('build-time calls: composeScore(lofi ' + score.bars + ' bars, drums excluded) ' + rollNotes.length + ' notes, ' + rollChords.length + ' chords | mouthFromText ' + textMouth.length + ' frames (no audio)');
 if (TOOL_NOTES.length) console.log('tool notes: ' + TOOL_NOTES.join(' | '));
 if (COPY_ISSUES.length) console.log('copy notes: ' + COPY_ISSUES.join(' | '));
 if (placeholders.length) console.log('placeholders used: ' + [...new Set(placeholders)].join(', '));

@@ -112,8 +112,8 @@ if (specMatch === null) {
 
 const duration = Number(spec?.duration ?? spec?.seconds ?? spec?.length)
 if (!Number.isFinite(duration)) bug('spec.duration missing / not a number')
-else if (duration >= 40 && duration <= 48) ok(`duration ${duration}s within 40..48`)
-else bug(`duration ${duration}s outside 40..48`)
+else if (duration >= 36 && duration <= 48) ok(`duration ${duration}s within 36..48`)
+else bug(`duration ${duration}s outside 36..48`)
 
 const scenes = Array.isArray(spec?.scenes) ? spec.scenes : Array.isArray(spec?.scene) ? spec.scene : []
 if (scenes.length === 0) {
