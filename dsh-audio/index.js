@@ -28,6 +28,7 @@ import { registerDesignTools } from './lib/tools-design.js'
 import { registerLoudnessTools } from './lib/tools-loudness.js'
 import { registerMouthTools } from './lib/tools-mouth.js'
 import { registerMidiTools } from './lib/tools-midi.js'
+import { registerLiveTools } from './lib/tools-live.js'
 import { registerReactTools } from './lib/tools-react.js'
 import { registerSettingsRoute } from './lib/settings-route.js'
 import { registerSingTools } from './lib/tools-sing.js'
@@ -95,6 +96,7 @@ export function apply (ctx, config = {}) {
   registerBusTools(ctx)
   registerBindTools(ctx)
   registerReactTools(ctx)
+  registerLiveTools(ctx)
   registerComposeTools(ctx)
   registerMidiTools(ctx)
   registerSingTools(ctx, config)
