@@ -1,6 +1,7 @@
 # 只跟踪这个项目本身：工作区里其他目录（其他会话的产物）不进仓库。
 /*
 !/.gitignore
+!/README.md
 !/CHANGELOG.md
 !/dsh-audio/
 !/demo/
