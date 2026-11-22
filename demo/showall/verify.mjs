@@ -455,7 +455,7 @@ head('6. palette')
 const REQUIRED = [
   { name: 'stage', hex: '#121212' },
   { name: 'ink', hex: '#e6e6e6' },
-  { name: 'accent (violet)', hex: '#c56bd6' }
+  { name: 'accent (blue)', hex: '#5b8dd6' }
 ]
 const hexToRgb = (hex) => {
   const h = hex.replace('#', '')

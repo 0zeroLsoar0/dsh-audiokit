@@ -11,14 +11,18 @@
 - **U 盘上的版本目录只增不删。** 需要更新同一版本时覆盖同名文件，不要删目录。
 - 旧版本的唯一权威来源是 git tag；U 盘只是副本。
 
-## 未发布 — 能力扩展（版本号暂不提升，仍为 0.5.6）
+## 0.5.9 — 2026-11-22
 
-按用户要求：功能可以持续合并，但版本号要等确认后才升到 0.6.0。以下内容已实现并逐项提交。
+按用户要求分两步走：功能持续合并，版本号到这一步才从 0.5.6 升到 0.5.9（不直接跳 0.6.0）。
+下面把这一轮的全部能力、修复与实测记录一次，作为 0.5.9 的内容。
 
-### 工具：7 → 17
+### 工具：7 → 27
 
-新增 `audio_design`、`audio_compose`、`audio_sing`、`audio_lipsync`、`audio_beats`、`audio_bind`、
-`audio_regress`、`audio_convert`、`audio_stretch`、`audio_loudness`。
+原有：`audio_synth`、`audio_pattern`、`audio_mix`、`audio_probe`、`audio_tts`、`audio_voices`、`audio_check`。
+
+0.5.9 新增：`audio_convert`、`audio_design`、`audio_compose`、`audio_sing`、`audio_lipsync`、`audio_beats`、
+`audio_bind`、`audio_regress`、`audio_stretch`、`audio_loudness`、`audio_react`、`audio_analyze`、`audio_stems`、
+`audio_mouth`、`audio_midi`、`audio_bus`、`audio_spatial`、`audio_master`、`audio_mux`。
 
 ### 新增能力
 
@@ -48,6 +52,33 @@
   400 ms 块 + 75% 重叠 + −70/−10 LU 门限、EBU 3342 LRA、4x 过采样真峰值。实测 997 Hz/−23 dBFS
   在 22.05/32/44.1/48/96 kHz 全部读 −23.0 LUFS；与 ffmpeg `ebur128` 交叉比对 9 个文件最大偏差 0.05 LU。
 - **回归门**（`audio_regress`）：快照 + 容差比对（峰值 0.5 dB、RMS 1 dB、质心 8%、时长 10 ms、哈希）。
+- **交互音效**（`audio_react`）：16 种界面交互 + 5 个音色家族（实测平均质心 1582–2574 Hz，1.63 倍差），
+  生成零胶水绑定脚本（`data-sound` 属性、手势解锁、限声部且增益补偿——三次同步连点叠加 0.00 dB）。
+- **频谱分析**（`audio_analyze`）：基频（自相关 + 谐波乘积谱）、谐波电平与非谐性、共振峰、噪声度、
+  衰减时间与曲线、起音类型、频段平衡，并支持容差比对。实测 440 Hz 基频误差 0.077%、1.6 s 指数衰减测得
+  1.60 s（R²=1）、白噪声置信度 0、合成 /a/ 的 F1 632 Hz / F2 1287 Hz。
+- **分轨导出**（`audio_stems`）：每层一个 wav + master，且 `sum(stems) == master`（实测误差 4.8e-8，
+  限幅介入时 9.3e-8）；8/16/24/32 位，附哈希清单。
+- **文本口型**（`audio_mouth`）：没有音频也能按拼音/字幕出口型，与音频口型共用同一套 viseme 与四种输出格式。
+- **MIDI 读写**（`audio_midi`）：零依赖 SMF 编解码。compose 乐谱往返 5 轨 49 音符、时长误差 5e-6 s、
+  起音偏差 0 tick；6514 个模糊输入 0 崩溃；导入后唱出的音高误差最差 0.2 音分。
+- **混音总线**（`audio_bus`）：高通/低通/搁架/钟形、压缩、侧链闪避、声像与宽度。实测 200 Hz 高通对 60 Hz
+  衰减 −20.95 dB（理论值一致）、4:1 压缩 6.85 dB（理论 6.74）、闪避 11.98 dB（请求 12）。
+- **空间音频**（`audio_spatial`）：立体声/双耳/quad/5.1/7.1/一阶 Ambisonics，自带 WAVE_FORMAT_EXTENSIBLE
+  多声道写出。实测双耳 90° ITD 660.5 µs（Woodworth 655.8）、5.1 的 0° 全进中置、距离加倍 −6.020 dB。
+- **母带链**（`audio_master`）：LR4 三段压缩 + 宽度与低频单声道 + 前瞻真峰值限制，迭代到目标响度。
+  实测 −24 LUFS → −14.03 LUFS / −1.24 dBTP；不可达时如实报 shortfall 而不硬削。
+- **视频联动**（`audio_mux`）：probe / mux（replace·mix·attach）/ cuts / extract，走本机 ffmpeg。
+  实测 3.000 s 视频混流、循环铺满、四种容器均可；不做分镜/转写分析（那是视频插件的职责）。
+- **页面内实时合成**（`audio_live`）：生成 15.8 KB 的 WebAudio 模块，9 个音色实时合成、零音频字节；
+  伪造的严格 WebAudio 环境里验证解锁前不出声、连点限声部、结束后总线回收。
+- **作曲渲染提速**：16 小节最慢 1212 ms → 507 ms（2.0–3.3 倍），5 个曲风逐字节不变。
+- **循环接缝修复**：直流阻断与滤波器改为周期预热，循环回绕从"冷启动"变成延续；`texture` 的五种底噪
+  改成真正不同的五条链；循环审计 40 BUG → 0 BUG，单次音效输出逐字节不变。
+- **设置页**：全部文案走 DSH 的 locale 服务（中英双语，缺失时静默降级中文）；新增实验性的「模型自检」
+  （默认关闭，只校验已保存的配置）。
+- **文档与素材**：README/技能文档按 27 个工具重写并加了对账门（文档漂移即失败）；插件详情页素材
+  （`docs/preview.svg` + 中英详情图 + 市场文案）；演示动画与介绍页的生成脚本。
 
 ### 修复
 

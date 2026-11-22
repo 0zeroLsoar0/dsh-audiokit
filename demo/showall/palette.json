@@ -1,6 +1,6 @@
 {
-  "source": "https://scp-wiki-cn.wikidot.com/scp-cn-1109 — sampled 2026-11-22 11:5x with headless Chrome (computed styles + screenshot). The page renders in the wiki's dark reader theme: near-black paper, light grey type, violet links, monospace metadata, hairline rules.",
-  "mood": "SCP 基金会档案 / 黑白为主 + 极少量蓝紫。没有任何橙色。像一份被归档的技术文档，而不是产品落地页。",
+  "source": "https://scp-wiki-cn.wikidot.com/scp-cn-1109 — sampled 2026-11-22 with headless Chrome (computed styles + screenshot). Structure borrowed from the wiki's dark archive reading theme; the accent is a cold blue, not the wiki's violet.",
+  "mood": "SCP 基金会档案 / 黑白为主 + 一点点冷蓝。没有任何橙色、没有任何紫色。像一份被归档的技术文档，而不是产品落地页。",
   "tokens": {
     "stage": "#121212",
     "bg": "#171717",
@@ -16,9 +16,9 @@
     "rule": "rgba(255,255,255,0.16)",
     "ruleSoft": "rgba(255,255,255,0.08)",
     "rulePaper": "rgba(0,0,0,0.18)",
-    "accent": "#c56bd6",
-    "accentDim": "#8e5f99",
-    "accentBlue": "#5b8dd6",
+    "accent": "#5b8dd6",
+    "accentDim": "#3f6ba8",
+    "accentDeep": "#2f5384",
     "redaction": "#0a0a0a"
   },
   "type": {
@@ -28,8 +28,8 @@
   },
   "rules": [
     "Base is black and white: #121212 stage, #171717 panels, #e6e6e6 type, hairlines at 8–16% white. Nothing is coloured unless it is the one active thing.",
-    "Accent is violet #c56bd6, used for the current scene's marker, the active tool name, and link-like metadata only — under ~5% of the frame. Blue #5b8dd6 is a secondary marker only when two states must be told apart.",
-    "No orange, no amber, no warm hue anywhere. If something needs emphasis, use white, a hairline, or a redaction bar (#0a0a0a) — not colour.",
+    "Accent is cold blue #5b8dd6 (dim #3f6ba8), used for the current scene's marker, the active tool name, the caret and the one live readout — under ~10% of the frame. Purple and orange are both out.",
+    "If something needs emphasis without colour, use white, a hairline, or a redaction bar (#0a0a0a).",
     "Archive grammar: mono uppercase metadata with file numbers (FILE 03 / 08), thin rules, small-caps or letter-spaced labels, black redaction bars over text, a stamp-like box for the end card. No rounded cards above 4px, no shadows, no glass.",
     "Numbers are the ornament: let counts, dB, Hz and timings sit in mono, aligned in columns.",
     "Motion: type-on, line-draw, counter ticks, a caret. No bounces, no glowing gradients, no particles.",

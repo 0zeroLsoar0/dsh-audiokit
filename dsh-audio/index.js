@@ -46,7 +46,7 @@ import { registerVideoTools } from './lib/tools-video.js'
 export const name = 'dsh-audio'
 
 /** Shown by the settings page; keep in sync with package.json. */
-const VERSION = '0.5.6'
+const VERSION = '0.5.9'
 
 /** The tool registry is required; the other seams are used when present. */
 export const inject = ['tools']
