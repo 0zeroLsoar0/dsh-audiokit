@@ -26,6 +26,7 @@ import { registerConvertTools } from './lib/tools-convert.js'
 import { registerDesignTools } from './lib/tools-design.js'
 import { registerLoudnessTools } from './lib/tools-loudness.js'
 import { registerMouthTools } from './lib/tools-mouth.js'
+import { registerMidiTools } from './lib/tools-midi.js'
 import { registerReactTools } from './lib/tools-react.js'
 import { registerSettingsRoute } from './lib/settings-route.js'
 import { registerSingTools } from './lib/tools-sing.js'
@@ -93,6 +94,7 @@ export function apply (ctx, config = {}) {
   registerBindTools(ctx)
   registerReactTools(ctx)
   registerComposeTools(ctx)
+  registerMidiTools(ctx)
   registerSingTools(ctx, config)
   registerStemsTools(ctx)
   registerStretchTools(ctx)
