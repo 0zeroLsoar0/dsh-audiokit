@@ -27,6 +27,7 @@ import { registerLoudnessTools } from './lib/tools-loudness.js'
 import { registerSettingsRoute } from './lib/settings-route.js'
 import { registerSingTools } from './lib/tools-sing.js'
 import { registerSkill } from './lib/skill.js'
+import { registerStemsTools } from './lib/tools-stems.js'
 import { registerStretchTools } from './lib/tools-stretch.js'
 import { registerTools } from './lib/tools.js'
 import { registerTtsTool, registerVoicesTool } from './lib/tts.js'
@@ -84,6 +85,7 @@ export function apply (ctx, config = {}) {
   registerBindTools(ctx)
   registerComposeTools(ctx)
   registerSingTools(ctx, config)
+  registerStemsTools(ctx)
   registerStretchTools(ctx)
   registerSettingsRoute(ctx, config, VERSION)
 
