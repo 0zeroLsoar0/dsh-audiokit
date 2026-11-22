@@ -52,6 +52,7 @@ const CONTENT = `# 给 HTML 动画配音
 | 把几条声音混成一条 | \`audio_mix\` | 多轨叠加，逐条给增益与时间偏移 |
 | 改已有文件 | \`audio_convert\` / \`audio_stretch\` | 裁剪、拼接、淡入、转码 / 变速不变调 |
 | 交付前把关 | \`audio_probe\` / \`audio_loudness\` / \`audio_check\` / \`audio_regress\` | 度量、响度、质量闸、回归 |
+| 要跟商业素材一样响、又不削波 | \`audio_master\` | 多段压缩 + 真峰值限制，迭代到目标 LUFS |
 
 ## 同步契约（决定成片是"配过声"还是"贴上去的"）
 

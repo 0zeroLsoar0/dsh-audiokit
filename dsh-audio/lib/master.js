@@ -1,0 +1,1381 @@
+/**
+ * Mastering chain: multiband compression, stereo width, true-peak limiting and
+ * the loop that lands a cue on an integrated-loudness target.
+ *
+ * Why this module exists: `audio_loudness` can measure a file and apply one
+ * linear gain, but a gain alone cannot make a quiet cue sit next to commercial
+ * audio — moving it +10 dB either clips or is refused, so the tool reports the
+ * target as unreachable. A master earns that loudness with three stages instead:
+ * band-split dynamics control, a width/bass-mono stage that keeps the low end
+ * mono-compatible, and a lookahead limiter that holds the true peak while the
+ * gain goes up. This file is those three stages plus the outer search that
+ * decides how much gain they can take.
+ *
+ * Metering is deliberately *not* reimplemented here. Loudness and true peak are
+ * read from `lib/lufs.js` (`analyzeLoudness` / `truePeak`), the same code the
+ * reporting tools use, so the number a master is tuned against is the number
+ * the next tool will report. The only DSP this module owns is the crossover,
+ * the compressor detector, the mid/side matrix and the limiter's gain curve.
+ *
+ * Everything is pure and deterministic: the same samples, rate and options
+ * produce identical output. No randomness, no state that survives a call.
+ */
+
+import { clamp, dbToGain } from './dsp.js'
+import { analyzeLoudness, truePeak } from './lufs.js'
+
+/* ---------------------------------------------------------------- constants -- */
+
+/** The limiter detects inter-sample peaks on a 4x grid (the true-peak grid). */
+const TRUE_PEAK_OVERSAMPLE = 4
+
+/**
+ * Detection kernel length. Detection runs on every sample, so it uses the
+ * cheap 8-tap phase interpolator; the result is then *verified* against the
+ * 16-tap meter kernel (lib/lufs.js) and trimmed. The guard below absorbs the
+ * 8-tap kernel's underestimation of near-Nyquist peaks so the trim is usually
+ * zero.
+ */
+const DETECTION_TAPS = 8
+const METER_TAPS = 16
+
+/** Headroom kept below the ceiling by the detector, in dB. */
+const DETECTION_GUARD_DB = 0.3
+
+/** A trim never lands exactly on the ceiling: a hundredth of a dB of margin. */
+const TRIM_MARGIN_DB = 0.01
+
+/** The chain stops iterating once the measured loudness is this close. */
+const TARGET_TOLERANCE_LU = 0.3
+
+/**
+ * Secant corrections are oversized by this little factor: loudness is a concave
+ * function of gain once the limiter works, so the slope measured between the
+ * last two attempts is already stale by the time the step is applied.
+ */
+const SECANT_OVER_RELAXATION = 1.1
+
+/** A gain move outside these limits is a bad request, not a mastering choice. */
+const GAIN_LIMITS_DB = Object.freeze([-40, 40])
+
+/**
+ * The compressor updates its detector and gain law once per block of N samples
+ * and interpolates the gain inside the block. At 48 kHz that is a 0.17 ms
+ * attack resolution — far finer than any mastering attack time — and it removes
+ * an `exp` and a branch per sample from the hot loop (3 bands x 2 channels x
+ * 48 kHz is 288k transcendental calls a second otherwise).
+ */
+const COMPRESSOR_CONTROL_SAMPLES = 8
+
+/** ln(10) / 20: converts a dB gain change to a natural-exponential factor. */
+const DB_TO_NEPER = Math.LN10 / 20
+
+const MAX_CHANNELS = 2
+
+/* ------------------------------------------------------------------ helpers -- */
+
+function round3 (value) {
+  return Number.isFinite(value) ? Math.round(value * 1000) / 1000 : value
+}
+
+function round2 (value) {
+  return Number.isFinite(value) ? Math.round(value * 100) / 100 : value
+}
+
+/**
+ * Read a numeric option: `undefined`/`null` mean "use the default", anything
+ * else must be finite (a NaN target silently producing silence is worse than an
+ * error) and is clamped to the documented range.
+ */
+function numberOr (value, fallback, label, min, max) {
+  if (value === undefined || value === null) return fallback
+  const number = Number(value)
+  if (!Number.isFinite(number)) throw new Error(`${label} must be a finite number, got ${String(value)}`)
+  return clamp(number, min, max)
+}
+
+function validateRate (sampleRate) {
+  const rate = Math.round(Number(sampleRate))
+  if (!Number.isFinite(rate) || rate < 8000 || rate > 192000) {
+    throw new Error(`mastering needs a sample rate between 8000 and 192000 Hz, got ${sampleRate}`)
+  }
+  return rate
+}
+
+/**
+ * Accept one mono buffer or one buffer per channel and validate the shape.
+ *
+ * A non-finite sample would poison every envelope and gain curve downstream, and
+ * no deliverable should ever contain one, so the stages that read the input
+ * sanitise it (see `sanitiseChannels`); this function only rejects a shape that
+ * cannot be processed at all.
+ */
+function asChannelList (samples) {
+  if (samples === null || samples === undefined) throw new Error('mastering needs sample data')
+  const list = Array.isArray(samples) ? samples : [samples]
+  if (list.length === 0) throw new Error('mastering needs at least one channel')
+  if (list.length > MAX_CHANNELS) throw new Error(`mastering handles mono or stereo only, got ${list.length} channels`)
+  const frames = list[0] === null || list[0] === undefined ? 0 : list[0].length
+  if (!Number.isInteger(frames) || frames <= 0) throw new Error('mastering needs non-empty sample arrays')
+  for (const channel of list) {
+    if (channel === null || channel === undefined || typeof channel.length !== 'number' || channel.length !== frames) {
+      throw new Error('mastering needs same-length sample arrays for every channel')
+    }
+  }
+  return list
+}
+
+/** Copy a channel, replacing non-finite samples with silence. */
+function copyChannel (source) {
+  const out = new Float32Array(source.length)
+  for (let i = 0; i < source.length; i += 1) {
+    const value = source[i]
+    out[i] = Number.isFinite(value) ? value : 0
+  }
+  return out
+}
+
+/**
+ * Read a channel list defensively: a clean list is used as-is (stage code only
+ * reads its input), a list containing NaN/Infinity is copied with those samples
+ * folded to silence first. Copying every input unconditionally costs a full
+ * allocation pass per stage — tens of megabytes on a 60 s stereo master — so the
+ * common clean case is scanned instead.
+ */
+function sanitiseChannels (list) {
+  for (const channel of list) {
+    for (let i = 0; i < channel.length; i += 1) {
+      if (!Number.isFinite(channel[i])) return list.map(copyChannel)
+    }
+  }
+  return list
+}
+
+/** Return the shape the caller used: one buffer stays mono, an array stays stereo. */
+function restoreShape (channels, mono) {
+  return mono ? channels[0] : channels
+}
+
+function scaleChannels (channels, gain) {
+  for (const channel of channels) {
+    for (let i = 0; i < channel.length; i += 1) channel[i] *= gain
+  }
+}
+
+/** Analyze a channel list with the shared meter, stereo power summed. */
+function analyseChannels (channels, rate) {
+  return channels.length === 1
+    ? analyzeLoudness(channels[0], rate)
+    : analyzeLoudness(channels[0], rate, { channels })
+}
+
+/** Channel-aware true peak: the worst channel wins, like the meter reports it. */
+function measuredTruePeak (channels, rate) {
+  let peak = Number.NEGATIVE_INFINITY
+  for (const channel of channels) {
+    const value = truePeak(channel, rate)
+    if (value > peak) peak = value
+  }
+  return peak
+}
+
+/* ------------------------------------------------------------------ biquads -- */
+
+/**
+ * Second-order Butterworth (Q = 1/sqrt2) low/high pass, RBJ cookbook form.
+ *
+ * Two of these in series is a Linkwitz-Riley 4th order, which is the crossover
+ * this module uses. Squaring the Butterworth pair is what makes the crossover
+ * clean: LR4 low + LR4 high is an allpass (magnitude flat at every frequency),
+ * so a split pair sums back to the input in magnitude and the crossover adds no
+ * ripple. A bare 2nd-order pair does not have that property — at the corner its
+ * low and high outputs cancel — which is exactly why LR4 is the standard.
+ * Cascading two identical sections is also why both band outputs can be taken
+ * from one pass over the input.
+ */
+function butterworthCoefficients (rate, hz, highPass) {
+  const frequency = clamp(hz, 10, rate * 0.45)
+  const w0 = 2 * Math.PI * frequency / rate
+  const cosine = Math.cos(w0)
+  const sine = Math.sin(w0)
+  const alpha = sine / (2 * Math.SQRT1_2)
+  const a0 = 1 + alpha
+  const numerator = highPass ? (1 + cosine) / 2 : (1 - cosine) / 2
+  return {
+    b0: numerator / a0,
+    b1: (highPass ? -(1 + cosine) : (1 - cosine)) / a0,
+    b2: numerator / a0,
+    a1: -2 * cosine / a0,
+    a2: (1 - alpha) / a0
+  }
+}
+
+/** Run one channel through an LR4 low- or high-pass at `hz`. */
+function lr4Pass (channel, rate, hz, highPass) {
+  const { b0, b1, b2, a1, a2 } = butterworthCoefficients(rate, hz, highPass)
+  const frames = channel.length
+  const out = new Float32Array(frames)
+  let x1 = 0
+  let x2 = 0
+  let y1 = 0
+  let y2 = 0
+  let u1 = 0
+  let u2 = 0
+  let v1 = 0
+  let v2 = 0
+  for (let i = 0; i < frames; i += 1) {
+    const input = channel[i]
+    const first = b0 * input + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+    x2 = x1
+    x1 = input
+    y2 = y1
+    y1 = first
+    const second = b0 * first + b1 * u1 + b2 * u2 - a1 * v1 - a2 * v2
+    u2 = u1
+    u1 = first
+    v2 = v1
+    v1 = second
+    out[i] = second
+  }
+  return out
+}
+
+/**
+ * Split channels into bands with a cascaded LR4 tree.
+ *
+ * Band k is the high-path through splits[0..k-1] low-passed at splits[k]; the
+ * last band is the high-path through every split. This tree (rather than
+ * filtering every band from the dry signal in parallel) is what keeps the sum
+ * free of the phase cancellation that a parallel split produces at each
+ * crossover. Both sides of a split are produced in the same pass over the input
+ * (four biquad sections per split per channel), so a three-band split costs two
+ * passes over the file rather than eight.
+ */
+function splitPair (channels, rate, hz) {
+  const lowPass = butterworthCoefficients(rate, hz, false)
+  const highPass = butterworthCoefficients(rate, hz, true)
+  // Hoisted into scalars: this loop runs once per sample of the whole file and
+  // a property load per coefficient would double the work it does.
+  const lb0 = lowPass.b0
+  const lb1 = lowPass.b1
+  const lb2 = lowPass.b2
+  const la1 = lowPass.a1
+  const la2 = lowPass.a2
+  const hb0 = highPass.b0
+  const hb1 = highPass.b1
+  const hb2 = highPass.b2
+  const ha1 = highPass.a1
+  const ha2 = highPass.a2
+  const lows = []
+  const highs = []
+  for (const channel of channels) {
+    const frames = channel.length
+    const low = new Float32Array(frames)
+    const high = new Float32Array(frames)
+    // Low-pass state, then high-pass state, both cascaded twice (LR4).
+    let lx1 = 0
+    let lx2 = 0
+    let ly1 = 0
+    let ly2 = 0
+    let lu1 = 0
+    let lu2 = 0
+    let lv1 = 0
+    let lv2 = 0
+    let hx1 = 0
+    let hx2 = 0
+    let hy1 = 0
+    let hy2 = 0
+    let hu1 = 0
+    let hu2 = 0
+    let hv1 = 0
+    let hv2 = 0
+    for (let i = 0; i < frames; i += 1) {
+      const input = channel[i]
+      const lowFirst = lb0 * input + lb1 * lx1 + lb2 * lx2 - la1 * ly1 - la2 * ly2
+      lx2 = lx1
+      lx1 = input
+      ly2 = ly1
+      ly1 = lowFirst
+      const lowSecond = lb0 * lowFirst + lb1 * lu1 + lb2 * lu2 - la1 * lv1 - la2 * lv2
+      lu2 = lu1
+      lu1 = lowFirst
+      lv2 = lv1
+      lv1 = lowSecond
+      low[i] = lowSecond
+      const highFirst = hb0 * input + hb1 * hx1 + hb2 * hx2 - ha1 * hy1 - ha2 * hy2
+      hx2 = hx1
+      hx1 = input
+      hy2 = hy1
+      hy1 = highFirst
+      const highSecond = hb0 * highFirst + hb1 * hu1 + hb2 * hu2 - ha1 * hv1 - ha2 * hv2
+      hu2 = hu1
+      hu1 = highFirst
+      hv2 = hv1
+      hv1 = highSecond
+      high[i] = highSecond
+    }
+    lows.push(low)
+    highs.push(high)
+  }
+  return { low: lows, high: highs }
+}
+
+function splitIntoBands (channels, rate, splits) {
+  const bands = []
+  let highPath = channels
+  let lo = 0
+  for (const splitHz of splits) {
+    const pair = splitPair(highPath, rate, splitHz)
+    bands.push({ lo, hi: splitHz, channels: pair.low })
+    highPath = pair.high
+    lo = splitHz
+  }
+  bands.push({ lo, hi: rate / 2, channels: highPath })
+  return bands
+}
+
+function bandName (index, count) {
+  if (count === 1) return 'full'
+  if (count === 2) return index === 0 ? 'low' : 'high'
+  if (count === 3) return ['low', 'mid', 'high'][index]
+  if (count === 4) return ['low', 'low-mid', 'high-mid', 'high'][index]
+  return `band-${index + 1}`
+}
+
+/**
+ * Resolve the caller's band list.
+ *
+ * `splitHz` is the crossover at the *top* of a band, so a three-band request
+ * carries two split frequencies (the last band's `splitHz` is unused and may be
+ * omitted). Bands are validated before any filtering: a split outside the
+ * audible band or out of order would silently produce silence in a band rather
+ * than an error the caller can act on.
+ */
+function resolveBands (requested, rate) {
+  const source = requested === undefined || requested === null ? DEFAULT_BANDS : requested
+  if (!Array.isArray(source) || source.length === 0) throw new Error('bands must be a non-empty array')
+  if (source.length > 5) throw new Error('bands supports at most 5 bands')
+  const resolved = []
+  let previous = 0
+  for (let index = 0; index < source.length; index += 1) {
+    const raw = source[index]
+    if (raw === null || raw === undefined || typeof raw !== 'object') {
+      throw new Error(`bands[${index}] must be an object with ratio, thresholdDb, attackMs, releaseMs and makeupDb`)
+    }
+    const isLast = index === source.length - 1
+    let splitHz = null
+    if (!isLast) {
+      const requestedSplit = numberOr(raw.splitHz, index === 0 ? 150 : previous * 4, `bands[${index}].splitHz`, 20, rate * 0.45)
+      if (requestedSplit <= previous + 1) {
+        throw new Error(`bands[${index}].splitHz (${requestedSplit} Hz) must be above the previous crossover (${previous} Hz)`)
+      }
+      splitHz = requestedSplit
+      previous = splitHz
+    }
+    resolved.push({
+      index,
+      name: bandName(index, source.length),
+      lo: index === 0 ? 0 : resolved[index - 1].hi,
+      hi: splitHz === null ? rate / 2 : splitHz,
+      splitHz,
+      ratio: numberOr(raw.ratio, 1.5, `bands[${index}].ratio`, 1, 40),
+      thresholdDb: numberOr(raw.thresholdDb, -30, `bands[${index}].thresholdDb`, -60, 0),
+      attackMs: numberOr(raw.attackMs, 10, `bands[${index}].attackMs`, 0.1, 200),
+      releaseMs: numberOr(raw.releaseMs, 120, `bands[${index}].releaseMs`, 5, 2000),
+      makeupDb: numberOr(raw.makeupDb, 0, `bands[${index}].makeupDb`, -12, 24)
+    })
+  }
+  return resolved
+}
+
+/* --------------------------------------------------------- peak detection -- */
+
+const KERNEL_CACHE = new Map()
+
+/**
+ * Windowed-sinc interpolation kernels for the 4x true-peak grid.
+ *
+ * This is the same construction `lib/lufs.js` uses (Blackman-windowed sinc,
+ * DC-normalised, 16 taps per phase): detection and measurement then look at the
+ * same inter-sample positions, so the limiter is not guarding against a metric
+ * that is measured differently. The limiter asks for the 8-tap variant (cheap,
+ * every sample) and verifies against the 16-tap meter.
+ */
+function interpolationKernel (taps) {
+  const cached = KERNEL_CACHE.get(taps)
+  if (cached !== undefined) return cached
+  const radius = taps / 2
+  const phases = []
+  for (let phase = 0; phase < TRUE_PEAK_OVERSAMPLE; phase += 1) {
+    const offset = phase / TRUE_PEAK_OVERSAMPLE
+    const kernel = new Float64Array(taps)
+    let sum = 0
+    for (let tap = 0; tap < taps; tap += 1) {
+      const distance = offset - (tap - (taps / 2 - 1))
+      const sinc = Math.abs(distance) < 1e-9 ? 1 : Math.sin(Math.PI * distance) / (Math.PI * distance)
+      const position = (distance + radius) / (2 * radius)
+      const window = 0.42 - 0.5 * Math.cos(2 * Math.PI * position) + 0.08 * Math.cos(4 * Math.PI * position)
+      kernel[tap] = sinc * window
+      sum += kernel[tap]
+    }
+    for (let tap = 0; tap < taps; tap += 1) kernel[tap] /= sum
+    phases.push(kernel)
+  }
+  const built = { phases, taps }
+  KERNEL_CACHE.set(taps, built)
+  return built
+}
+
+/**
+ * Peak envelope of a channel list on the 4x grid: for every sample position,
+ * the largest magnitude between it and the next sample (or the sample itself).
+ *
+ * Only positions whose whole interpolation window fits inside the file are
+ * evaluated, exactly like the meter: extending a file past its own samples
+ * invents a peak the file does not contain.
+ *
+ * The 8-tap convolution is unrolled because this is the one loop in the module
+ * that touches every sample of every channel; the phases are visited one at a
+ * time so each pass over the channel is a straight, prefetch-friendly read.
+ */
+function peakEnvelope (channels) {
+  const frames = channels[0].length
+  const envelope = new Float32Array(frames)
+  for (const channel of channels) {
+    for (let i = 0; i < frames; i += 1) {
+      const magnitude = channel[i] < 0 ? -channel[i] : channel[i]
+      if (magnitude > envelope[i]) envelope[i] = magnitude
+    }
+  }
+  const { phases } = interpolationKernel(DETECTION_TAPS)
+  const first = DETECTION_TAPS / 2 - 1
+  const last = frames - DETECTION_TAPS / 2 - 1
+  if (last < first) return envelope
+  for (const channel of channels) {
+    for (let phase = 1; phase < TRUE_PEAK_OVERSAMPLE; phase += 1) {
+      const kernel = phases[phase]
+      const k0 = kernel[0]
+      const k1 = kernel[1]
+      const k2 = kernel[2]
+      const k3 = kernel[3]
+      const k4 = kernel[4]
+      const k5 = kernel[5]
+      const k6 = kernel[6]
+      const k7 = kernel[7]
+      let base = 0
+      for (let i = first; i <= last; i += 1) {
+        const accumulator = channel[base] * k0 + channel[base + 1] * k1 + channel[base + 2] * k2 +
+          channel[base + 3] * k3 + channel[base + 4] * k4 + channel[base + 5] * k5 +
+          channel[base + 6] * k6 + channel[base + 7] * k7
+        const magnitude = accumulator < 0 ? -accumulator : accumulator
+        if (magnitude > envelope[i]) envelope[i] = magnitude
+        base += 1
+      }
+    }
+  }
+  return envelope
+}
+
+/* ----------------------------------------------------------------- limiter -- */
+
+function resolveLimiterOptions (options = {}) {
+  if (options === null || typeof options !== 'object') throw new Error('limiter options must be an object')
+  return {
+    ceilingDbtp: numberOr(options.ceilingDbtp, -1, 'ceilingDbtp', -20, 0),
+    lookaheadMs: numberOr(options.lookaheadMs, 5, 'lookaheadMs', 0.5, 20),
+    releaseMs: numberOr(options.releaseMs, 120, 'releaseMs', 20, 1000)
+  }
+}
+
+/**
+ * Build the gain curve that holds the peak envelope under the ceiling.
+ *
+ * Three passes are all it takes:
+ *
+ * 1. Required gain: r[n] = ceiling / peak[n] (clamped to 1). Gain at sample n
+ *    never exceeds r[n], so the sample and its inter-sample peak cannot exceed
+ *    the ceiling.
+ * 2. Lookahead ramp: a backward min-filter with a slope limit,
+ *    g[n] = min(r[n], g[n+1] + 1/W). It is a true lookahead (a peak W samples
+ *    ahead already lowers the gain now) and the gain can fall by at most 1/W
+ *    per sample, i.e. the whole dynamic range is covered exactly over the
+ *    lookahead window. This is what turns a brickwall step into an attack ramp;
+ *    a step is broadband and would itself create the inter-sample peak the
+ *    limiter is trying to prevent.
+ * 3. Release: g may only rise at the release rate, and never above step 2's
+ *    value, so the ceiling bound survives smoothing.
+ *
+ * `inputGainDb` folds the chain's static gain into the required-gain
+ * computation. Because scaling is linear it scales the envelope exactly, which
+ * lets the outer loop re-plan the curve without re-running detection.
+ */
+function limiterGainCurve (envelope, rate, options) {
+  const ceiling = dbToGain(options.ceilingDbtp - DETECTION_GUARD_DB)
+  const inputGain = dbToGain(options.inputGainDb ?? 0)
+  const frames = envelope.length
+  const lookahead = Math.max(1, Math.round(options.lookaheadMs * 0.001 * rate))
+  const slope = 1 / lookahead
+  const gain = new Float32Array(frames)
+  let next = 1
+  for (let n = frames - 1; n >= 0; n -= 1) {
+    const peak = envelope[n] * inputGain
+    const required = peak > ceiling ? ceiling / peak : 1
+    const limited = required < next + slope ? required : next + slope
+    gain[n] = limited
+    next = limited
+  }
+  const releaseCoefficient = 1 - Math.exp(-1 / Math.max(1, options.releaseMs * 0.001 * rate))
+  let smoothed = 1
+  for (let n = 0; n < frames; n += 1) {
+    const target = gain[n]
+    smoothed = target < smoothed ? target : smoothed + (target - smoothed) * releaseCoefficient
+    gain[n] = smoothed
+  }
+  return gain
+}
+
+function applyGainCurve (channels, curve, inputGain = 1) {
+  const frames = curve.length
+  if (channels.length > 1) {
+    const left = channels[0]
+    const right = channels[1]
+    const outLeft = new Float32Array(frames)
+    const outRight = new Float32Array(frames)
+    for (let i = 0; i < frames; i += 1) {
+      const gain = curve[i] * inputGain
+      outLeft[i] = left[i] * gain
+      outRight[i] = right[i] * gain
+    }
+    return [outLeft, outRight]
+  }
+  const source = channels[0]
+  const out = new Float32Array(frames)
+  for (let i = 0; i < frames; i += 1) out[i] = source[i] * curve[i] * inputGain
+  return [out]
+}
+
+function maxGainReductionDb (curve) {
+  let minimum = 1
+  for (let i = 0; i < curve.length; i += 1) if (curve[i] < minimum) minimum = curve[i]
+  return minimum > 0 ? -20 * Math.log10(minimum) : 120
+}
+
+/**
+ * Mean gain reduction over the file (sampled every 16th value).
+ *
+ * This is the link between peak control and loudness: the average dB the
+ * limiter takes out of the signal is a good predictor of how much loudness the
+ * static gain buys, which is what lets the chain plan the next move before
+ * spending a measurement on it.
+ */
+function meanGainReductionDb (curve) {
+  const stride = 16
+  let sum = 0
+  let count = 0
+  for (let i = 0; i < curve.length; i += stride) {
+    const value = curve[i]
+    if (value < 1) sum += -20 * Math.log10(value)
+    count += 1
+  }
+  return count > 0 ? sum / count : 0
+}
+
+/** One limiting pass; no metering, so the chain can call it per iteration. */
+function limitOnce (channels, rate, envelope, options, inputGainDb) {
+  const curve = limiterGainCurve(envelope, rate, { ...options, inputGainDb })
+  return {
+    samples: applyGainCurve(channels, curve, dbToGain(inputGainDb)),
+    gainReductionDb: maxGainReductionDb(curve)
+  }
+}
+
+/* --------------------------------------------------------- multiband comp -- */
+
+/**
+ * RMS compressor for one band, stereo-linked.
+ *
+ * The detector is a one-pole RMS follower across the loudest channel, so a hard
+ * left-panned hit ducks both channels (an unlinked detector moves the stereo
+ * image). Detector and gain law run once per control block of
+ * `COMPRESSOR_CONTROL_SAMPLES` samples and the gain is interpolated inside the
+ * block: at 48 kHz that is a 0.17 ms attack resolution, far finer than any
+ * mastering attack time, and it removes a transcendental call and a branch per
+ * sample from the hot loop.
+ */
+function compressBand (channels, rate, spec, kneeDb) {
+  const frames = channels[0].length
+  const first = channels[0]
+  const second = channels.length > 1 ? channels[1] : null
+  const slope = spec.ratio > 1 ? 1 - 1 / spec.ratio : 0
+  const makeupGain = dbToGain(spec.makeupDb)
+  const blockSeconds = COMPRESSOR_CONTROL_SAMPLES / rate
+  const attackCoefficient = 1 - Math.exp(-blockSeconds / Math.max(1e-4, spec.attackMs * 0.001))
+  const releaseCoefficient = 1 - Math.exp(-blockSeconds / Math.max(1e-4, spec.releaseMs * 0.001))
+  const halfKnee = kneeDb / 2
+  const thresholdDb = spec.thresholdDb
+  let envelope = 0
+  let maxGainReduction = 0
+  let previousGain = makeupGain
+  for (let start = 0; start < frames; start += COMPRESSOR_CONTROL_SAMPLES) {
+    const end = start + COMPRESSOR_CONTROL_SAMPLES < frames ? start + COMPRESSOR_CONTROL_SAMPLES : frames
+    // Block peak power (max across channels) drives the linked detector.
+    let power = 0
+    for (let i = start; i < end; i += 1) {
+      const left = first[i]
+      let square = left * left
+      if (second !== null) {
+        const right = second[i]
+        const rightSquare = right * right
+        if (rightSquare > square) square = rightSquare
+      }
+      if (square > power) power = square
+    }
+    envelope = power > envelope
+      ? envelope + (power - envelope) * attackCoefficient
+      : envelope + (power - envelope) * releaseCoefficient
+    const levelDb = 10 * Math.log10(envelope + 1e-18)
+    const overDb = levelDb - thresholdDb
+    let gainReduction = 0
+    if (overDb > halfKnee) gainReduction = overDb * slope
+    else if (kneeDb > 0 && overDb > -halfKnee) {
+      gainReduction = slope * (overDb + halfKnee) * (overDb + halfKnee) / (2 * kneeDb)
+    }
+    if (gainReduction > maxGainReduction) maxGainReduction = gainReduction
+    const target = makeupGain * Math.exp(-gainReduction * DB_TO_NEPER)
+    const step = (target - previousGain) / (end - start)
+    for (let i = start; i < end; i += 1) {
+      previousGain += step
+      first[i] *= previousGain
+      if (second !== null) second[i] *= previousGain
+    }
+  }
+  return maxGainReduction
+}
+
+/* --------------------------------------------------------------- presets -- */
+
+/**
+ * Default multiband setup: three bands, near-transparent ratios.
+ *
+ * This is the "do no harm" split used when a caller asks for the chain without
+ * describing its own bands. The ratios are close to 1 and the thresholds sit
+ * high enough that quiet material passes essentially untouched, so the default
+ * chain's dynamics work is delegated to the limiter; a caller who wants
+ * compression to shape the material passes bands (or uses a preset).
+ */
+const DEFAULT_BANDS = [
+  { splitHz: 160, ratio: 1.3, thresholdDb: -20, attackMs: 25, releaseMs: 250, makeupDb: 0 },
+  { splitHz: 2400, ratio: 1.2, thresholdDb: -24, attackMs: 12, releaseMs: 180, makeupDb: 0 },
+  { ratio: 1.1, thresholdDb: -30, attackMs: 6, releaseMs: 120, makeupDb: 0 }
+]
+
+/* ---------------------------------------------------------------- exports -- */
+
+/**
+ * Split the signal into bands and compress each one independently (Linkwitz-Riley
+ * 4th-order crossovers, cascaded tree), then sum them back.
+ *
+ * The report is the number an agent needs to judge the result: per band, the
+ * maximum gain reduction in dB. A band's reduction says whether the compressor
+ * touched that part of the spectrum at all, which is the difference between
+ * "the low end is being controlled" and "the whole mix is just quieter".
+ *
+ * @param {Float32Array|Float32Array[]} samples - mono buffer or one per channel.
+ * @param {number} sampleRate - Hz.
+ * @param {object} [options] - band list and knee.
+ * @param {object[]} [options.bands] - per band `{ splitHz, ratio, thresholdDb,
+ *   attackMs, releaseMs, makeupDb }`; `splitHz` is the crossover at the band's
+ *   top and is ignored on the last band.
+ * @param {number} [options.kneeDb=6] - soft-knee width in dB.
+ * @returns {{ samples: Float32Array|Float32Array[], report: { crossover: string,
+ *   kneeDb: number, bandCount: number, bands: { name: string, lo: number,
+ *   hi: number, gainReductionDb: number }[] } }}
+ */
+export function multibandCompressor (samples, sampleRate, options = {}) {
+  const rate = validateRate(sampleRate)
+  const mono = !Array.isArray(samples)
+  const list = asChannelList(samples)
+  if (options === null || typeof options !== 'object') throw new Error('multibandCompressor options must be an object')
+  const bands = resolveBands(options.bands, rate)
+  const kneeDb = numberOr(options.kneeDb, 6, 'kneeDb', 0, 24)
+  const frames = list[0].length
+  const splits = bands.slice(0, -1).map((band) => band.hi)
+  // With no split the "bands" list is the input itself, which compression would
+  // then modify in place; copy it so the caller's samples stay untouched.
+  const working = splits.length === 0 ? list.map(copyChannel) : sanitiseChannels(list)
+  const split = splitIntoBands(working, rate, splits)
+
+  const reports = split.map((band, index) => {
+    const gainReductionDb = compressBand(band.channels, rate, bands[index], kneeDb)
+    return {
+      name: bands[index].name,
+      lo: Math.round(band.lo),
+      hi: Math.round(band.hi),
+      gainReductionDb: round2(gainReductionDb)
+    }
+  })
+
+  // Fuse the band sum into one destination write per sample: summing band by
+  // band would stream the destination three times for a three-band split.
+  const bandChannels = split.map((band) => band.channels)
+  const mixed = []
+  for (let channel = 0; channel < list.length; channel += 1) {
+    const sum = new Float32Array(frames)
+    const firstBand = bandChannels[0][channel]
+    for (let i = 0; i < frames; i += 1) sum[i] = firstBand[i]
+    for (let band = 1; band < bandChannels.length; band += 1) {
+      const source = bandChannels[band][channel]
+      for (let i = 0; i < frames; i += 1) sum[i] += source[i]
+    }
+    mixed.push(sum)
+  }
+
+  return {
+    samples: restoreShape(mixed, mono),
+    report: {
+      crossover: 'linkwitz-riley-4',
+      kneeDb,
+      bandCount: bands.length,
+      bands: reports
+    }
+  }
+}
+
+/**
+ * Boost (or soften) transients with a two-envelope gain, then boost the sustain.
+ *
+ * Optional in the chain — this is a creative shaper, not part of the loudness
+ * search. A fast envelope (attack tracks a click within ~1 ms) compared with a
+ * slow one gives a "how much is this a transient right now" signal: where the
+ * fast envelope leads, the attack term adds gain; where it trails, the sustain
+ * term adds gain. Both are 0..1 so the maximum lift is +6 dB minus whatever the
+ * other term already added, and a bare call with both terms zero is a bit-exact
+ * pass-through. The gain is applied as a wide-band envelope, so it does not
+ * oversample: a very aggressive setting can raise the true peak a little, which
+ * is what the limiter after it is for.
+ *
+ * @param {Float32Array|Float32Array[]} samples - mono buffer or one per channel.
+ * @param {number} sampleRate - Hz.
+ * @param {object} [options] - `{ attack, sustain }`, each 0..1; 0 is a no-op.
+ * @returns {{ samples: Float32Array|Float32Array[], report: { attack: number,
+ *   sustain: number, applied: boolean, maxBoostDb: number } }}
+ */
+export function transientShaper (samples, sampleRate, options = {}) {
+  const rate = validateRate(sampleRate)
+  const mono = !Array.isArray(samples)
+  const list = asChannelList(samples)
+  if (options === null || typeof options !== 'object') throw new Error('transientShaper options must be an object')
+  const attack = numberOr(options.attack, 0, 'attack', 0, 1)
+  const sustain = numberOr(options.sustain, 0, 'sustain', 0, 1)
+  const output = list.map(copyChannel)
+  if (attack === 0 && sustain === 0) {
+    return {
+      samples: restoreShape(output, mono),
+      report: { attack, sustain, applied: false, maxBoostDb: 0 }
+    }
+  }
+
+  const fastAttack = 1 - Math.exp(-1 / Math.max(1, 0.001 * rate))
+  const fastRelease = 1 - Math.exp(-1 / Math.max(1, 0.030 * rate))
+  const slowAttack = 1 - Math.exp(-1 / Math.max(1, 0.012 * rate))
+  const slowRelease = 1 - Math.exp(-1 / Math.max(1, 0.180 * rate))
+  const frames = list[0].length
+  const channelCount = list.length
+  let fast = 0
+  let slow = 0
+  let maxGain = 1
+  for (let i = 0; i < frames; i += 1) {
+    let peak = 0
+    for (let channel = 0; channel < channelCount; channel += 1) {
+      const magnitude = Math.abs(list[channel][i])
+      if (magnitude > peak) peak = magnitude
+    }
+    fast = peak > fast ? fast + (peak - fast) * fastAttack : fast + (peak - fast) * fastRelease
+    slow = peak > slow ? slow + (peak - slow) * slowAttack : slow + (peak - slow) * slowRelease
+    const reference = slow > 1e-9 ? slow : 1e-9
+    const transient = clamp((fast - slow) / reference, 0, 1)
+    const decay = clamp((slow - fast) / reference, 0, 1)
+    const gain = 1 + attack * transient + sustain * decay
+    if (gain > maxGain) maxGain = gain
+    for (let channel = 0; channel < channelCount; channel += 1) output[channel][i] *= gain
+  }
+
+  return {
+    samples: restoreShape(output, mono),
+    report: {
+      attack,
+      sustain,
+      applied: true,
+      maxBoostDb: round2(20 * Math.log10(maxGain))
+    }
+  }
+}
+
+/**
+ * Mid/side stereo width with optional bass mono-folding.
+ *
+ * Width scales the side signal; the mid is untouched, so the mono fold-down
+ * (L + R) is preserved exactly and the result stays mono-safe. Below
+ * `bassMonoHz` the side is high-passed with a Linkwitz-Riley 4th order, which
+ * removes the side's low content and therefore folds everything under the
+ * corner to the centre without losing it — the standard fix for a wide synth
+ * bass that cancels on a phone speaker. The report proves the promise rather
+ * than asserting it: it measures the mono sum error and the polarity of each
+ * channel against its input.
+ *
+ * A mono input has no side signal to widen; it is returned unchanged with
+ * `applied: false` (inventing a stereo image from a mono source is a creative
+ * decision, not a mastering one).
+ *
+ * @param {Float32Array|Float32Array[]} samples - mono buffer or one per channel.
+ * @param {number} sampleRate - Hz.
+ * @param {object} [options] - `{ width, bassMonoHz }`; width 0 = mono, 1 =
+ *   unchanged, 1.5 = wider, up to 2. `bassMonoHz` 0 disables bass mono.
+ * @returns {{ samples: Float32Array|Float32Array[], report: { width: number,
+ *   bassMonoHz: number, mode: string, applied: boolean, channelCount: number,
+ *   sideEnergyBeforeDb: number, sideEnergyAfterDb: number, monoSumPreserved: boolean,
+ *   polarityPreserved: boolean, monoSafe: boolean } }}
+ */
+export function stereoWidth (samples, sampleRate, options = {}) {
+  const rate = validateRate(sampleRate)
+  const mono = !Array.isArray(samples)
+  const list = asChannelList(samples)
+  if (options === null || typeof options !== 'object') throw new Error('stereoWidth options must be an object')
+  const width = numberOr(options.width, 1, 'width', 0, 2)
+  const bassMonoHz = numberOr(options.bassMonoHz, 120, 'bassMonoHz', 0, 800)
+  const input = sanitiseChannels(list)
+
+  if (input.length < 2) {
+    return {
+      samples: restoreShape(input.map(copyChannel), mono),
+      report: {
+        width: 1,
+        bassMonoHz,
+        mode: 'mono',
+        applied: false,
+        channelCount: 1,
+        sideEnergyBeforeDb: -120,
+        sideEnergyAfterDb: -120,
+        monoSumPreserved: true,
+        polarityPreserved: true,
+        monoSafe: true
+      }
+    }
+  }
+
+  const frames = input[0].length
+  const mid = new Float32Array(frames)
+  const side = new Float32Array(frames)
+  let sideSquaresBefore = 0
+  for (let i = 0; i < frames; i += 1) {
+    const leftSample = input[0][i]
+    const rightSample = input[1][i]
+    mid[i] = (leftSample + rightSample) * 0.5
+    side[i] = (leftSample - rightSample) * 0.5
+    sideSquaresBefore += side[i] * side[i]
+  }
+
+  let shaped = side
+  if (bassMonoHz > 0) {
+    // Bass mono is a high-pass of the side signal: below the corner the side is
+    // gone, so L and R share the same low content and fold to mono. Subtracting
+    // a low-pass from the side would not do this — an LR4 low-pass shifted in
+    // phase leaves a residual that can be *louder* than the original side at the
+    // corner, which is the opposite of mono bass.
+    shaped = lr4Pass(side, rate, bassMonoHz, true)
+  }
+
+  const left = new Float32Array(frames)
+  const right = new Float32Array(frames)
+  let maxMonoError = 0
+  let monoScale = 0
+  let sideSquaresAfter = 0
+  let crossLeft = 0
+  let crossRight = 0
+  let energyLeft = 0
+  let energyRight = 0
+  for (let i = 0; i < frames; i += 1) {
+    const scaled = shaped[i] * width
+    const outLeft = mid[i] + scaled
+    const outRight = mid[i] - scaled
+    left[i] = outLeft
+    right[i] = outRight
+    const sideAfter = (outLeft - outRight) * 0.5
+    sideSquaresAfter += sideAfter * sideAfter
+    const sampleLeft = input[0][i]
+    const sampleRight = input[1][i]
+    const monoOriginal = Math.abs(sampleLeft + sampleRight)
+    if (monoOriginal > monoScale) monoScale = monoOriginal
+    const monoError = Math.abs(outLeft + outRight - sampleLeft - sampleRight)
+    if (monoError > maxMonoError) maxMonoError = monoError
+    crossLeft += sampleLeft * outLeft
+    crossRight += sampleRight * outRight
+    energyLeft += sampleLeft * sampleLeft
+    energyRight += sampleRight * sampleRight
+  }
+  const monoSumPreserved = maxMonoError <= Math.max(1e-5, monoScale * 1e-5)
+  const denominator = Math.sqrt(energyLeft * energyRight)
+  const polarityPreserved = denominator > 0 ? (crossLeft >= 0 && crossRight >= 0) : true
+  const sideDbBefore = sideSquaresBefore > 0 ? 10 * Math.log10(sideSquaresBefore / frames) : -120
+  const sideDbAfter = sideSquaresAfter > 0 ? 10 * Math.log10(sideSquaresAfter / frames) : -120
+
+  return {
+    samples: restoreShape([left, right], mono),
+    report: {
+      width,
+      bassMonoHz,
+      mode: 'stereo',
+      applied: true,
+      channelCount: 2,
+      sideEnergyBeforeDb: round2(sideDbBefore),
+      sideEnergyAfterDb: round2(sideDbAfter),
+      monoSumPreserved,
+      polarityPreserved,
+      monoSafe: monoSumPreserved && polarityPreserved
+    }
+  }
+}
+
+/**
+ * Lookahead true-peak limiter.
+ *
+ * Detection is 4x oversampled (see `peakEnvelope`), the gain curve is the
+ * slope-limited lookahead ramp described on `limiterGainCurve`, and the result
+ * is then *measured* with `lib/lufs.js`'s `truePeak` — the same meter the rest
+ * of the plugin reports. If the measurement is above the ceiling (an 8-tap
+ * detector can under-read near-Nyquist content by a fraction of a dB), the
+ * whole file is trimmed by the exact ratio and measured again, so the promise
+ * is "measured true peak <= ceiling", not "the curve says so".
+ *
+ * Trimming scales linearly, which lowers true peak by exactly the trim amount;
+ * that is why one correction is enough and why the reported true peak is a real
+ * measurement rather than a prediction.
+ *
+ * @param {Float32Array|Float32Array[]} samples - mono buffer or one per channel.
+ * @param {number} sampleRate - Hz.
+ * @param {object} [options] - `{ ceilingDbtp, lookaheadMs, releaseMs }`.
+ * @returns {{ samples: Float32Array|Float32Array[], report: { ceilingDbtp: number,
+ *   lookaheadMs: number, releaseMs: number, oversample: number, detectionTaps: number,
+ *   verifiedTaps: number, detectionGuardDb: number, maxGainReductionDb: number,
+ *   trimDb: number, truePeakBeforeDbtp: number, truePeakAfterDbtp: number,
+ *   overshootDb: number } }}
+ */
+export function truePeakLimiter (samples, sampleRate, options = {}) {
+  const rate = validateRate(sampleRate)
+  const mono = !Array.isArray(samples)
+  const list = asChannelList(samples)
+  const settings = resolveLimiterOptions(options)
+  const input = sanitiseChannels(list)
+  const truePeakBefore = measuredTruePeak(input, rate)
+  const envelope = peakEnvelope(input)
+  const pass = limitOnce(input, rate, envelope, settings, 0)
+  const output = pass.samples
+
+  let trimDb = 0
+  let truePeakAfter = measuredTruePeak(output, rate)
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (!Number.isFinite(truePeakAfter) || truePeakAfter <= settings.ceilingDbtp) break
+    const correction = settings.ceilingDbtp - TRIM_MARGIN_DB - truePeakAfter
+    trimDb += correction
+    scaleChannels(output, dbToGain(correction))
+    truePeakAfter = measuredTruePeak(output, rate)
+  }
+
+  return {
+    samples: restoreShape(output, mono),
+    report: {
+      ceilingDbtp: settings.ceilingDbtp,
+      lookaheadMs: settings.lookaheadMs,
+      releaseMs: settings.releaseMs,
+      oversample: TRUE_PEAK_OVERSAMPLE,
+      detectionTaps: DETECTION_TAPS,
+      verifiedTaps: METER_TAPS,
+      detectionGuardDb: DETECTION_GUARD_DB,
+      maxGainReductionDb: round2(pass.gainReductionDb),
+      trimDb: round3(trimDb),
+      truePeakBeforeDbtp: round3(truePeakBefore),
+      truePeakAfterDbtp: round3(truePeakAfter),
+      overshootDb: round3(Math.max(0, truePeakAfter - settings.ceilingDbtp))
+    }
+  }
+}
+
+/* ------------------------------------------------------------- master chain -- */
+
+function resolveChainOptions (options, rate) {
+  if (options === null || typeof options !== 'object') throw new Error('masterChain options must be an object')
+  return {
+    targetLufs: numberOr(options.targetLufs, -14, 'targetLufs', -45, 0),
+    ceilingDbtp: numberOr(options.ceilingDbtp, -1, 'ceilingDbtp', -20, 0),
+    bands: resolveBands(options.bands, rate),
+    width: numberOr(options.width, 1, 'width', 0, 2),
+    bassMonoHz: numberOr(options.bassMonoHz, 120, 'bassMonoHz', 0, 800),
+    driveDb: numberOr(options.driveDb, 0, 'driveDb', -24, 24),
+    kneeDb: numberOr(options.kneeDb, 6, 'kneeDb', 0, 24),
+    lookaheadMs: numberOr(options.lookaheadMs, 5, 'lookaheadMs', 0.5, 20),
+    releaseMs: numberOr(options.releaseMs, 120, 'releaseMs', 20, 1000),
+    maxGainReductionDb: numberOr(options.maxGainReductionDb, 12, 'maxGainReductionDb', 0, 30),
+    maxIterations: Math.round(numberOr(options.maxIterations, 5, 'maxIterations', 1, 8))
+  }
+}
+
+/**
+ * Offset and clamp a gain so the resulting limiter curve stays inside the
+ * allowed gain-reduction budget.
+ *
+ * The limiter's gain reduction is monotone in the input gain, and near the cap
+ * the two move one for one, so subtracting the overshoot lands within a few
+ * tenths of a dB in one pass; the loop repeats because band-limited material
+ * can have a shallower slope than 1. This is all curve arithmetic (no audio
+ * pass, no measurement), which is why the chain can afford it before every
+ * iteration.
+ */
+function settleGainUnderCap (envelope, rate, settings, gainDb) {
+  let gain = gainDb
+  let curve = limiterGainCurve(envelope, rate, { ...settings, inputGainDb: gain })
+  let reduction = maxGainReductionDb(curve)
+  for (let attempt = 0; attempt < 8 && reduction > settings.maxGainReductionDb + 0.01; attempt += 1) {
+    gain = Math.max(GAIN_LIMITS_DB[0], gain - (reduction - settings.maxGainReductionDb) - 0.15)
+    curve = limiterGainCurve(envelope, rate, { ...settings, inputGainDb: gain })
+    reduction = maxGainReductionDb(curve)
+  }
+  return {
+    curve,
+    gainDb: gain,
+    gainReductionDb: reduction,
+    // "At the cap" is deliberately not "exactly the cap": the settle loop stops
+    // a fraction of a dB short so the curve never exceeds the budget, and the
+    // difference between 11.9 and 12 dB of reduction is not a decision point.
+    atCap: reduction >= settings.maxGainReductionDb - 0.5
+  }
+}
+
+function selectAttempt (attempts, targetLufs) {
+  let best = attempts[attempts.length - 1]
+  let bestError = Math.abs(best.lufs - targetLufs)
+  for (const attempt of attempts) {
+    const error = Math.abs(attempt.lufs - targetLufs)
+    if (error < bestError) {
+      best = attempt
+      bestError = error
+    }
+  }
+  return best
+}
+
+/**
+ * Plan the gain that should hit the target, using the measured residual.
+ *
+ * A limiter makes loudness a compressed function of gain, so the naive
+ * "target - measured" step overshoots and the secant needs two measured points
+ * to learn the slope — one measurement more than the budget really has. The
+ * limiter's own gain reduction predicts that loss for free. It sits between the
+ * *mean* reduction over the file (what happens to the quiet parts) and the
+ * *maximum* reduction (what happens to the peaks); because loudness is an RMS
+ * measure it is dominated by the loud passages, and half way between the two
+ * tracks the measured loss closely on both sparse and dense material:
+ *
+ *   lufs(g) ~= lufsBefore + g - (meanGainReduction(g) + maxGainReduction(g)) / 2 + residual
+ *
+ * where `residual` is the part the model does not explain (compressor level
+ * change, the trim, kernel bias), measured from the first real attempt. Solving
+ * for g is a fixed-point iteration over a decimated copy of the peak envelope,
+ * so it costs a handful of milliseconds instead of a metering pass; the
+ * measured attempt that follows confirms it, or the chain falls back to the
+ * measured secant.
+ */
+function predictGainForTarget (envelope, rate, settings, lufsBefore, residual) {
+  const stride = 8
+  const decimated = new Float32Array(Math.ceil(envelope.length / stride))
+  for (let i = 0, block = 0; i < envelope.length; i += stride, block += 1) {
+    let peak = 0
+    const end = Math.min(i + stride, envelope.length)
+    for (let j = i; j < end; j += 1) if (envelope[j] > peak) peak = envelope[j]
+    decimated[block] = peak
+  }
+  // The lookahead is a sample count and the release is a per-sample coefficient,
+  // so both time constants must be scaled by the decimation stride for the
+  // decimated curve to describe the same limiter in real time.
+  const decimatedSettings = {
+    ...settings,
+    lookaheadMs: settings.lookaheadMs / stride,
+    releaseMs: settings.releaseMs / stride
+  }
+  let gain = clamp(settings.targetLufs - lufsBefore - residual, GAIN_LIMITS_DB[0], GAIN_LIMITS_DB[1])
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const settled = settleGainUnderCap(decimated, rate, decimatedSettings, gain)
+    const loss = (meanGainReductionDb(settled.curve) + settled.gainReductionDb) / 2
+    const predicted = lufsBefore + settled.gainDb - loss + residual
+    const error = settings.targetLufs - predicted
+    if (Math.abs(error) <= 0.02) return settled.gainDb
+    if (Math.abs(error) <= 0.02) return settled.gainDb
+    gain = clamp(settled.gainDb + error, GAIN_LIMITS_DB[0], GAIN_LIMITS_DB[1])
+  }
+  return gain
+}
+
+/**
+ * Master a cue onto a loudness target without ever clipping.
+ *
+ * The chain is fixed once and the search only moves the gain: drive into the
+ * multiband compressor (its thresholds are absolute dBFS, so the drive knob is
+ * what decides how hard it works), width/bass-mono, then gain and limiter. The
+ * compressor and width stages are level-independent in structure, so they run
+ * once and every iteration re-plans the limiter curve over the cached peak
+ * envelope — an iteration costs one limiter apply plus one loudness
+ * measurement, not a full re-render.
+ *
+ * Iteration: pick a gain, settle it under the gain-reduction budget, limit,
+ * measure. The next gain comes from the measured response (secant on the last
+ * two attempts) because a limiter makes loudness a compressed function of gain:
+ * a naive "+error dB" overshoots and oscillates on hot material. The loop stops
+ * when the target is inside +/-0.3 LU, when the gain-reduction budget is the
+ * limit, or when the iteration cap is reached — and in the last two cases it
+ * says so instead of clipping: the output is the loudest attempt that respected
+ * both the ceiling and the budget, and the report carries the shortfall.
+ *
+ * @param {Float32Array|Float32Array[]} samples - mono buffer or one per channel.
+ * @param {number} sampleRate - Hz.
+ * @param {object} [options] - `{ targetLufs, ceilingDbtp, bands, width,
+ *   bassMonoHz, driveDb }` plus `kneeDb`, `lookaheadMs`, `releaseMs`,
+ *   `maxGainReductionDb` (default 12) and `maxIterations` (default 5).
+ * @returns {{ samples: Float32Array|Float32Array[],
+ *   report: { lufsBefore: number, lufsAfter: number, truePeakBefore: number,
+ *   truePeakAfter: number, gainReductionDb: number, bands: object[],
+ *   iterations: number, achievable: boolean, shortfallLu: number,
+ *   limitedBy: string } }}
+ */
+export function masterChain (samples, sampleRate, options = {}) {
+  const rate = validateRate(sampleRate)
+  const mono = !Array.isArray(samples)
+  const list = asChannelList(samples)
+  const settings = resolveChainOptions(options, rate)
+  const source = list.map(copyChannel)
+  const before = analyseChannels(source, rate)
+  const lufsBefore = before.integratedLufs
+  const truePeakBefore = before.truePeakDbtp
+
+  // --- fixed front of the chain: drive, compression, width ------------------
+  if (settings.driveDb !== 0) scaleChannels(source, dbToGain(settings.driveDb))
+  const compression = multibandCompressor(source, rate, { bands: settings.bands, kneeDb: settings.kneeDb })
+  const width = stereoWidth(compression.samples, rate, { width: settings.width, bassMonoHz: settings.bassMonoHz })
+  const preMastered = asChannelList(width.samples)
+  const compressorGainReductionDb = compression.report.bands.reduce(
+    (maximum, band) => (band.gainReductionDb > maximum ? band.gainReductionDb : maximum), 0)
+
+  const baseReport = {
+    targetLufs: round2(settings.targetLufs),
+    ceilingDbtp: round2(settings.ceilingDbtp),
+    lufsBefore: round3(lufsBefore),
+    truePeakBefore: round3(truePeakBefore),
+    gainReductionDb: 0,
+    bands: compression.report.bands,
+    iterations: 0,
+    crossover: compression.report.crossover,
+    compressorGainReductionDb: round2(compressorGainReductionDb),
+    appliedGainDb: 0,
+    trimDb: 0,
+    driveDb: round2(settings.driveDb),
+    width: width.report.width,
+    widthApplied: width.report.applied,
+    bassMonoHz: width.report.bassMonoHz,
+    maxGainReductionDb: round2(settings.maxGainReductionDb),
+    detectionGuardDb: DETECTION_GUARD_DB,
+    lufsTolerance: TARGET_TOLERANCE_LU
+  }
+
+  if (!Number.isFinite(lufsBefore)) {
+    // No loudness to move: a gain derived from -infinity is meaningless, so the
+    // chain hands back the shaped silence instead of inventing a number.
+    return {
+      samples: restoreShape(preMastered, mono),
+      report: {
+        ...baseReport,
+        lufsAfter: Number.NEGATIVE_INFINITY,
+        truePeakAfter: Number.NEGATIVE_INFINITY,
+        achievable: false,
+        shortfallLu: Number.POSITIVE_INFINITY,
+        limitedBy: 'silence'
+      }
+    }
+  }
+
+  const envelope = peakEnvelope(preMastered)
+  const boundedBefore = clamp(settings.targetLufs - lufsBefore, GAIN_LIMITS_DB[0], GAIN_LIMITS_DB[1])
+  let gainDb = boundedBefore
+  const attempts = []
+  let achieved = false
+
+  for (let round = 1; round <= settings.maxIterations; round += 1) {
+    const settled = settleGainUnderCap(envelope, rate, settings, gainDb)
+    gainDb = settled.gainDb
+    const limited = applyGainCurve(preMastered, settled.curve, dbToGain(gainDb))
+    const analysis = analyseChannels(limited, rate)
+
+    // The limiter promises the *sample* grid plus a detection guard; the meter
+    // is the authority, and a linear trim is an exact correction.
+    let trimDb = 0
+    if (Number.isFinite(analysis.truePeakDbtp) && analysis.truePeakDbtp > settings.ceilingDbtp) {
+      trimDb = settings.ceilingDbtp - TRIM_MARGIN_DB - analysis.truePeakDbtp
+      scaleChannels(limited, dbToGain(trimDb))
+    }
+    const lufsAfter = analysis.integratedLufs + trimDb
+    const truePeakAfter = Number.isFinite(analysis.truePeakDbtp)
+      ? analysis.truePeakDbtp + trimDb
+      : Number.NEGATIVE_INFINITY
+    const error = settings.targetLufs - lufsAfter
+    const meanReductionDb = meanGainReductionDb(settled.curve)
+    attempts.push({
+      gainDb,
+      lufs: lufsAfter,
+      truePeak: truePeakAfter,
+      trimDb,
+      gainReductionDb: settled.gainReductionDb,
+      atCap: settled.atCap,
+      samples: limited
+    })
+
+    if (Math.abs(error) <= TARGET_TOLERANCE_LU) {
+      achieved = true
+      break
+    }
+    // At the budget there is nothing left to give: more gain would only mean
+    // more limiting than the chain is willing to apply.
+    if (settled.atCap && error > 0) break
+
+    // Next move. The first round plans the gain from the limiter loss model;
+    // later rounds have two measured points and use a secant step, which
+    // handles whatever the model could not explain.
+    let nextGain
+    if (attempts.length === 1) {
+      // Residual of the same loss model the predictor uses, measured on the one
+      // real attempt the chain has: the model itself is not assumed exact.
+      const modelLoss = (meanReductionDb + settled.gainReductionDb) / 2
+      const residual = lufsAfter - (lufsBefore + gainDb - modelLoss)
+      nextGain = predictGainForTarget(envelope, rate, settings, lufsBefore, residual)
+    } else {
+      const previous = attempts[attempts.length - 2]
+      const gainDelta = gainDb - previous.gainDb
+      let step = error / 0.7
+      if (Math.abs(gainDelta) > 1e-6) {
+        // The loudness-vs-gain curve is concave (each further dB of gain buys
+        // less loudness once the limiter is working), so the secant's slope is
+        // steeper than the local one by the time the correction is applied; a
+        // small over-relaxation lands on the target instead of one step short.
+        const slope = clamp((lufsAfter - previous.lufs) / gainDelta, 0.1, 1.2)
+        step = (error / slope) * SECANT_OVER_RELAXATION
+      }
+      nextGain = gainDb + step
+    }
+    nextGain = clamp(nextGain, GAIN_LIMITS_DB[0], GAIN_LIMITS_DB[1])
+    if (Math.abs(nextGain - gainDb) < 0.05) break
+    gainDb = nextGain
+  }
+
+  const chosen = selectAttempt(attempts, settings.targetLufs)
+  const hitTarget = Math.abs(chosen.lufs - settings.targetLufs) <= TARGET_TOLERANCE_LU
+
+  return {
+    samples: restoreShape(chosen.samples, mono),
+    report: {
+      ...baseReport,
+      lufsAfter: round3(chosen.lufs),
+      truePeakAfter: round3(chosen.truePeak),
+      gainReductionDb: round2(chosen.gainReductionDb),
+      appliedGainDb: round2(chosen.gainDb),
+      trimDb: round3(chosen.trimDb),
+      iterations: attempts.length,
+      achievable: hitTarget,
+      shortfallLu: hitTarget ? 0 : round2(Math.max(0, settings.targetLufs - chosen.lufs)),
+      lufsErrorLu: round2(chosen.lufs - settings.targetLufs),
+      limitedBy: hitTarget ? 'target' : (chosen.atCap ? 'true-peak' : 'iterations')
+    }
+  }
+}
+
+/**
+ * Named mastering presets: defensible starting points, not magic.
+ *
+ * The numbers follow the published delivery targets: streaming services
+ * normalise to -14 LUFS and lossy encoders need about 1 dB of true-peak
+ * headroom (AES TD1004), EBU R128 broadcast is -23 LUFS at <= -1 dBTP, Apple
+ * Podcasts is -16 LUFS at <= -1 dBTP. `streaming-loud` deliberately sits above
+ * the -14 normalisation target: that is where loud commercial masters live, and
+ * a normaliser turns the extra level back down — the reason to use it is the
+ * *compression character*, not a louder playback.
+ *
+ * Every preset returns a fresh object, so a caller may mutate its bands.
+ *
+ * @returns {Record<string, { description: string, targetLufs: number,
+ *   ceilingDbtp: number, bands: object[], width: number, bassMonoHz: number,
+ *   driveDb: number, maxGainReductionDb: number }>}
+ */
+export function masterPresets () {
+  const streaming = [
+    { splitHz: 140, ratio: 2.4, thresholdDb: -26, attackMs: 18, releaseMs: 200, makeupDb: 0 },
+    { splitHz: 1800, ratio: 1.8, thresholdDb: -28, attackMs: 9, releaseMs: 140, makeupDb: 0 },
+    { ratio: 1.5, thresholdDb: -32, attackMs: 5, releaseMs: 100, makeupDb: 0 }
+  ]
+  const broadcast = [
+    { splitHz: 120, ratio: 2.0, thresholdDb: -30, attackMs: 20, releaseMs: 240, makeupDb: 0 },
+    { splitHz: 2000, ratio: 1.6, thresholdDb: -32, attackMs: 10, releaseMs: 160, makeupDb: 0 },
+    { ratio: 1.4, thresholdDb: -36, attackMs: 6, releaseMs: 120, makeupDb: 0 }
+  ]
+  const voice = [
+    { splitHz: 180, ratio: 1.8, thresholdDb: -28, attackMs: 20, releaseMs: 220, makeupDb: 0 },
+    { splitHz: 2600, ratio: 1.5, thresholdDb: -30, attackMs: 10, releaseMs: 150, makeupDb: 0 },
+    { ratio: 1.3, thresholdDb: -34, attackMs: 6, releaseMs: 110, makeupDb: 0 }
+  ]
+  return {
+    'streaming-safe': {
+      description: 'The default web target: -14 LUFS integrated (streaming normalisation) at <= -1 dBTP, gentle 3-band control, a touch of width. Use when the cue must not be turned down by a normaliser.',
+      targetLufs: -14,
+      ceilingDbtp: -1,
+      bands: streaming.map((band) => ({ ...band })),
+      width: 1.05,
+      bassMonoHz: 110,
+      driveDb: 0,
+      maxGainReductionDb: 12
+    },
+    'streaming-loud': {
+      description: 'Commercial loud master: -9 LUFS integrated at <= -1 dBTP, harder band compression and 2 dB of drive. Playback is normalised back to -14, so use it for density and character, not for a louder result.',
+      targetLufs: -9,
+      ceilingDbtp: -1,
+      bands: streaming.map((band) => ({ ...band })),
+      width: 1.12,
+      bassMonoHz: 120,
+      driveDb: 2,
+      maxGainReductionDb: 14
+    },
+    'broadcast-23': {
+      description: 'EBU R128 broadcast delivery: -23 LUFS integrated at <= -1 dBTP, slower attacks and a stricter band balance so the loudness meter stays inside the +/-0.5 LU tolerance.',
+      targetLufs: -23,
+      ceilingDbtp: -1,
+      bands: broadcast.map((band) => ({ ...band })),
+      width: 1,
+      bassMonoHz: 90,
+      driveDb: 0,
+      maxGainReductionDb: 10
+    },
+    podcast: {
+      description: 'Podcast delivery (Apple/AES): -16 LUFS integrated at <= -1 dBTP, dialogue-first band split with the low band left comparatively alone.',
+      targetLufs: -16,
+      ceilingDbtp: -1,
+      bands: voice.map((band) => ({ ...band })),
+      width: 1,
+      bassMonoHz: 0,
+      driveDb: 0,
+      maxGainReductionDb: 10
+    },
+    gentle: {
+      description: 'Transparent touch-up: -16 LUFS at <= -2 dBTP with near-transparent band ratios and no width change. Use when the material is already well mixed and only needs levelling and peak safety.',
+      targetLufs: -16,
+      ceilingDbtp: -2,
+      bands: DEFAULT_BANDS.map((band) => ({ ...band })),
+      width: 1,
+      bassMonoHz: 80,
+      driveDb: 0,
+      maxGainReductionDb: 6
+    }
+  }
+}

@@ -28,6 +28,7 @@ import { registerDesignTools } from './lib/tools-design.js'
 import { registerLoudnessTools } from './lib/tools-loudness.js'
 import { registerMouthTools } from './lib/tools-mouth.js'
 import { registerMidiTools } from './lib/tools-midi.js'
+import { registerMasterTools } from './lib/tools-master.js'
 import { registerLiveTools } from './lib/tools-live.js'
 import { registerReactTools } from './lib/tools-react.js'
 import { registerSettingsRoute } from './lib/settings-route.js'
@@ -76,7 +77,7 @@ const PROMPT_SECTION = [
   '- what a sound is made of: f0, harmonics, formants, noise, decay → `audio_analyze`',
   '- fixing an existing file: trim/join/fade/re-encode → `audio_convert`; retime or transpose → `audio_stretch`',
   '- before delivery: `audio_probe` (measure), `audio_loudness` (LUFS/true peak), `audio_check` (quality gate),',
-  '  `audio_regress` (prove a change did not break a sound)',
+  '  `audio_regress` (prove a change did not break a sound), `audio_master` (multiband + true-peak limiting to a target LUFS)',
   '',
   'Call the `animation-sound` skill before the first render: it carries the timing contract that keeps picture and',
   'sound in sync, the preset and recipe cheat sheets, and the recipe for inlining audio into a single-file HTML.'
@@ -98,6 +99,7 @@ export function apply (ctx, config = {}) {
   registerConvertTools(ctx)
   registerLoudnessTools(ctx)
   registerDesignTools(ctx)
+  registerMasterTools(ctx)
   registerVisualTools(ctx)
   registerMouthTools(ctx)
   registerBusTools(ctx)

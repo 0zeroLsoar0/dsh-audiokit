@@ -108,6 +108,7 @@ audio_check({ paths: ['assets/audio/slam.wav'], cues: [{ at: 0.82, src: 'assets/
 | `audio_convert` | 裁剪/增益/淡入淡出/反转/拼接/批量归一/转码（8/16/24/32 位，单双声道） |
 | `audio_stretch` | 变速不变调、移调不变时长、精确贴合目标时长 |
 | `audio_loudness` | BS.1770 LUFS、真峰值、响度范围，按目标响度写校正副本 |
+| `audio_master` | 母带链：多段压缩、瞬态整形、立体声宽度与低频单声道、真峰值限制，迭代到目标响度 |
 | `audio_probe` | 度量单文件：峰值、RMS、波峰因数、质心、起音数、循环接缝、直流 |
 | `audio_check` | 交付前质量闸，含 cue 时间轴校验与叠加峰值 |
 | `audio_regress` | 快照 + 容差比对，证明改动没把别的指标带歪 |
