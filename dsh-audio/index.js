@@ -21,6 +21,7 @@ import { registerExtraPresets } from './lib/presets-extra.js'
 import { registerCheckTool } from './lib/check.js'
 import { registerAnalyzeTools } from './lib/tools-analyze.js'
 import { registerBindTools } from './lib/tools-bind.js'
+import { registerBusTools } from './lib/tools-bus.js'
 import { registerComposeTools } from './lib/tools-compose.js'
 import { registerConvertTools } from './lib/tools-convert.js'
 import { registerDesignTools } from './lib/tools-design.js'
@@ -91,6 +92,7 @@ export function apply (ctx, config = {}) {
   registerDesignTools(ctx)
   registerVisualTools(ctx)
   registerMouthTools(ctx)
+  registerBusTools(ctx)
   registerBindTools(ctx)
   registerReactTools(ctx)
   registerComposeTools(ctx)
