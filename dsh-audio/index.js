@@ -19,6 +19,7 @@
 import { registerExtraPresets } from './lib/presets-extra.js'
 
 import { registerCheckTool } from './lib/check.js'
+import { registerAnalyzeTools } from './lib/tools-analyze.js'
 import { registerBindTools } from './lib/tools-bind.js'
 import { registerComposeTools } from './lib/tools-compose.js'
 import { registerConvertTools } from './lib/tools-convert.js'
@@ -79,6 +80,7 @@ export function apply (ctx, config = {}) {
   registerTtsTool(ctx, config)
   registerVoicesTool(ctx, config)
   registerCheckTool(ctx, config)
+  registerAnalyzeTools(ctx)
   registerConvertTools(ctx)
   registerLoudnessTools(ctx)
   registerDesignTools(ctx)
