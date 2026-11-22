@@ -39,6 +39,7 @@ import { registerStretchTools } from './lib/tools-stretch.js'
 import { registerTools } from './lib/tools.js'
 import { registerTtsTool, registerVoicesTool } from './lib/tts.js'
 import { registerVisualTools } from './lib/tools-visual.js'
+import { registerVideoTools } from './lib/tools-video.js'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'dsh-audio'
@@ -69,6 +70,8 @@ const PROMPT_SECTION = [
   '  drop-in binding script); per-layer deliverables for video/games → `audio_stems` (stems + master)',
   '- the page must react live and ship no audio bytes → `audio_live` (generates a ~16 KB WebAudio module)',
   '- EQ / compression / ducking on a cue set → `audio_bus`; exchange scores with a DAW → `audio_midi`',
+  '- a sound that must come from a direction, or a file wider than stereo → `audio_spatial`',
+  '- the final deliverable is a video → `audio_mux` (probe, mux, shot-cut times, extract)',
   '- a mouth track without any voice audio (captions, silent comics) → `audio_mouth`',
   '- what a sound is made of: f0, harmonics, formants, noise, decay → `audio_analyze`',
   '- fixing an existing file: trim/join/fade/re-encode → `audio_convert`; retime or transpose → `audio_stretch`',
@@ -99,6 +102,7 @@ export function apply (ctx, config = {}) {
   registerMouthTools(ctx)
   registerBusTools(ctx)
   registerSpatialTools(ctx)
+  registerVideoTools(ctx)
   registerBindTools(ctx)
   registerReactTools(ctx)
   registerLiveTools(ctx)
