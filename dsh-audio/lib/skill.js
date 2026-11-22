@@ -40,6 +40,9 @@ const CONTENT = `# 给 HTML 动画配音
 | 角色口型 | \`audio_lipsync\` | 每帧 viseme + 连续张嘴量 |
 | 画面卡在音乐上 | \`audio_beats\` | 从成品音乐里测出 bpm 与节拍网格 |
 | 把声音接到事件上 | \`audio_bind\` | 生成 cue 表 + 播放器代码 |
+| 界面自己的声音（hover/click/成功/失败） | \`audio_react\` | 16 种交互 + 5 个音色家族，一次生成绑定脚本 |
+| 想知道一个声音"里面是什么" | \`audio_analyze\` | 基频、谐波、共振峰、噪声度、衰减时间 |
+| 给视频/游戏交分轨 | \`audio_stems\` | 每层一个 wav + master，且能重建 |
 | 把几条声音混成一条 | \`audio_mix\` | 多轨叠加，逐条给增益与时间偏移 |
 | 改已有文件 | \`audio_convert\` / \`audio_stretch\` | 裁剪、拼接、淡入、转码 / 变速不变调 |
 | 交付前把关 | \`audio_probe\` / \`audio_loudness\` / \`audio_check\` / \`audio_regress\` | 度量、响度、质量闸、回归 |

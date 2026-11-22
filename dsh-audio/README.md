@@ -95,6 +95,9 @@ audio_check({ paths: ['assets/audio/slam.wav'], cues: [{ at: 0.82, src: 'assets/
 | `audio_lipsync` | 每帧口型轨（json / srt / css / ae） |
 | `audio_beats` | 测 bpm、起音、节拍网格、重拍推测 |
 | `audio_bind` | 生成 cue 表与页面播放器（可内联成单文件） |
+| `audio_react` | 交互音效：16 种 UI 事件 + 5 个音色家族，产出零胶水绑定脚本 |
+| `audio_analyze` | 频谱分析：基频、谐波、共振峰、噪声度、衰减时间、频段平衡，可做容差比对 |
+| `audio_stems` | 分轨导出：每层一个 wav + master，`sum(stems) == master` |
 | `audio_mix` | 多轨合一，逐条增益与时间偏移 |
 | `audio_convert` | 裁剪/增益/淡入淡出/反转/拼接/批量归一/转码（8/16/24/32 位，单双声道） |
 | `audio_stretch` | 变速不变调、移调不变时长、精确贴合目标时长 |
