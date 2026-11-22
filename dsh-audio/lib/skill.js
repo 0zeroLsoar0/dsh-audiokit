@@ -36,7 +36,7 @@ const CONTENT = `# 给 HTML 动画配音
 | 一段音乐 | \`audio_compose\` | 真和声 + 声部进行 + 鼓，返回节拍表 |
 | 旁白/台词 | \`audio_tts\` | MiniMax / OpenAI 兼容 / 免费 Edge |
 | 选音色 | \`audio_voices\` | 列出当前供应商可用的音色（不产出音频） |
-| 唱歌 | \`audio_sing\` | 共振峰合成，零素材、零网络 |
+| 风格化唱腔（提示音/机器人声） | \`audio_sing\` | 共振峰合成，零素材、零网络；不用于真人歌曲 |
 | 角色口型 | \`audio_lipsync\` | 每帧 viseme + 连续张嘴量 |
 | 画面卡在音乐上 | \`audio_beats\` | 从成品音乐里测出 bpm 与节拍网格 |
 | 把声音接到事件上 | \`audio_bind\` | 生成 cue 表 + 播放器代码 |
@@ -118,9 +118,10 @@ const CONTENT = `# 给 HTML 动画配音
   供应商在「设置 → 声音」里选（不是工具参数）：MiniMax 默认，换成 Edge 就是免费免密钥的微软朗读
   （300+ 音色，**只给压缩音频**，本机有 ffmpeg 时自动解码成 wav，没有则写出可直接播放的 .mp3）。
   音色列表用 \`audio_voices\` 查。返回时间戳时可直接喂给 \`audio_lipsync\`；端点不返回时工具会如实说明。
-- \`audio_sing({ notes|melody, lyric, bpm, voice, vibrato, breath, harmony, seed })\`：零素材唱歌。
+- \`audio_sing({ notes|melody, lyric, bpm, voice, vibrato, breath, harmony, seed })\`：**风格化唱腔**，不是人声。
   \`melody: "C4:1 E4:1 G4:2"\`，\`lyric: "wo ai ni"\`（拼音；汉字没有字典，会退化成 "a" 并给出警告）。
-  它是合成嗓音——像"唱歌的合成器"，不是真人。要真人质感请用 TTS 或样本。
+  它适合提示音、机器人声、卡通哼唱；**不要用它做真人歌曲、翻唱或模仿具体歌手**。
+  要人声请用 \`audio_tts\` + 后期；要演唱请用你自己有授权的录音素材——插件不内置也不模仿他人作品。
 - 时间戳缺失时不要编（MiniMax T2A v2 同步接口实测不返回时间戳）；用 \`audio_beats\`/\`audio_lipsync\` 自己测。
 
 ## 画面对齐：audio_lipsync / audio_beats
