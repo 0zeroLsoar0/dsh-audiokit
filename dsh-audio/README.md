@@ -20,7 +20,7 @@
 | 能力 | 说明 |
 |---|---|
 | **音效** | 38 个合成预设：撞击、掠过、点击、铃、上升、放电、闷响、摩擦、环境底噪，加上脚步、门、抽屉、开关、布料、纸、水滴、溅水、气泡、阵风、伺服、电机、警报、HUD、充能、心跳、低吼、虫鸣、骨折、下潜贝斯、钟声、合唱垫 |
-| **分层设计** | 26 个配方（金属门砸、玻璃碎、远近爆炸、魔法、UI 一套、机械循环、生物、金币、远雷……）一次调用出成品，不再是"叠四个音" |
+| **分层设计** | 38 个配方（金属门砸、玻璃碎、远近爆炸、魔法、UI 一套、机械循环、生物、鸟群、鲸歌、狼嚎、马蹄、虫群、金币、远雷……）一次调用出成品，不再是"叠四个音" |
 | **作曲** | 8 种曲风（cinematic / lofi / chiptune / ambient / action / horror / fantasy / ui-menu），真和声、声部进行、鼓组、段落强度曲线，返回节拍表给小节对齐 |
 | **旁白 / 唱腔** | 旁白支持 MiniMax、任意 OpenAI 兼容端点，以及**免费免密钥的微软 Edge 朗读**（300+ 音色，带词级时间戳）；另外有一个零素材的共振峰合成"唱腔"，用来做风格化的提示音/机器人声，**不给人声歌曲用** |
 | **对画面** | 口型轨（每帧 viseme + 连续张嘴量，可导出 json/srt/css/ae）+ 节拍检测（从成品音乐里测 bpm 与网格） |
@@ -90,7 +90,7 @@ audio_check({ paths: ['assets/audio/slam.wav'], cues: [{ at: 0.82, src: 'assets/
 | `audio_synth` | 渲染单个音效（38 个预设，感知参数 0..1，可循环） |
 | `audio_synth_graph` | 运行时合成图：用振荡器/噪声/滤波/包络/LFO/FM/折叠/混响自己搭一个新音色 |
 | `audio_pattern` | 用一条规则填满一段时间（train / scatter / riser） |
-| `audio_design` | 分层设计引擎，26 个配方，或自定义层叠 |
+| `audio_design` | 分层设计引擎，38 个配方，或自定义层叠 |
 | `audio_sampler` | 采样器：用你自己的 wav 做键位/力度分区、变调、循环、包络（不内置素材） |
 | `audio_compose` | 作曲并渲染配乐，返回节拍表与和弦 |
 | `audio_midi` | 标准 MIDI 读写：作曲导出给 DAW，外部旋律导入后可唱/可渲 |
@@ -106,7 +106,7 @@ audio_check({ paths: ['assets/audio/slam.wav'], cues: [{ at: 0.82, src: 'assets/
 | `audio_live` | 页面内实时合成：生成 ~16 KB 的 WebAudio 模块，一个音频字节都不用传；可带 automation 车道（pitch/filter/gain/pan/send 的斜坡与 LFO） |
 | `audio_analyze` | 频谱分析：基频、谐波、共振峰、噪声度、衰减时间、频段平衡，可做容差比对 |
 | `audio_stems` | 分轨导出：每层一个 wav + master，`sum(stems) == master` |
-| `audio_daw` | 工程导出：CMX3600 EDL / Reaper .rpp / CSV cue 表 / Audacity labels |
+| `audio_daw` | 工程导出：CMX3600 EDL / Reaper .rpp / CSV cue 表 / Audacity labels / OpenTimelineIO .otio / FCP7 xmeml（后两者 Resolve、Premiere 可导入）/ AAF 结构子集 / OMF 骨架（见 docs/INTEROP.zh.md） |
 | `audio_mix` | 多轨合一，逐条增益与时间偏移 |
 | `audio_bus` | 混音总线：高通/低通/搁架/钟形、压缩、侧链闪避、声像与宽度 |
 | `audio_spatial` | 空间音频：立体声/双耳/quad/5.1/7.1/一阶 Ambisonics，自带多声道 WAV |
@@ -137,6 +137,10 @@ audio_check({ paths: ['assets/audio/slam.wav'], cues: [{ at: 0.82, src: 'assets/
 `whoosh-into-impact` `sci-fi-charge` `sci-fi-hum-loop` `magic-sparkle` `magic-dark` `water-drip`
 `water-splash` `footstep-gravel` `cloth-rustle` `ui-success` `ui-error` `ui-hover` `ui-toggle`
 `machinery-loop` `creature-scream` `creature-growl` `heartbeat` `alarm-loop` `coin-pickup` `thunder-distant`
+`bird-chirp` `bird-flock` `insect-swarm` `whale-song` `wolf-howl` `frog-croak` `hoofbeats` `wing-flap`
+`creature-breath` `creature-hiss` `rodent-squeak` `bat-echolocation`
+
+生物/动物配方按"像不像"排序，逐条说明（像什么 / 层构成 / 怎么调 / 哪些动物做不到）见 [docs/CREATURES.zh.md](docs/CREATURES.zh.md)。
 
 ## 设置
 

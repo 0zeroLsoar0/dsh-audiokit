@@ -32,6 +32,14 @@
  *             full strength instead of starting from silence.
  */
 
+// The creature recipes below are built from the extended preset table
+// (`creature-growl`, `insect-buzz`, `breath-inhale`, `choir-pad`, ...), so this
+// module registers those presets itself instead of depending on `index.js`
+// having done it first. The registration is idempotent and a plain side-effect
+// import, which keeps `designSound` working for any caller (including a test or
+// another plugin module that imports this file directly).
+import './presets-extra.js'
+
 import { renderPreset } from './audio.js'
 import {
   PRESETS,
@@ -388,6 +396,222 @@ export const RECIPES = {
       { preset: 'thud', params: { weight: 1, softness: 0.9, space: 0.6 }, gainDb: -8 }
     ],
     master: { reverb: { amount: 0.45, size: 0.9 }, targetDurationMs: 3000 }
+  },
+
+  /* ------------------------------------------------ creatures and animals -- */
+
+  // The animal recipes are arrangements of the same fixed preset family, so
+  // what separates a bird from a rodent is register, event rate and space, not
+  // a new oscillator. Two rules learned while voicing these:
+  //   - a call is defined by its *event rate*: four chirps 90 ms apart read as
+  //     a flock, one chirp every 300 ms reads as two birds;
+  //   - the body layer carries the species, the noise layer carries the air, so
+  //     none of these designs stacks noise on noise.
+
+  'bird-chirp': {
+    id: 'bird-chirp',
+    description: 'Single small bird: two or three fast bright chirps in a tiny outdoor space.',
+    layers: [
+      { preset: 'zap', params: { pitch: 0.95, roughness: 0.12, space: 0.08 }, duration: 0.16, gainDb: -2 },
+      { preset: 'chime', params: { pitch: 0.92, decay: 0.06, metallic: 0.12, space: 0.12 }, duration: 0.18, offsetMs: 9, gainDb: -8 },
+      { preset: 'zap', params: { pitch: 0.8, roughness: 0.1, space: 0.08 }, duration: 0.14, offsetMs: 125, gainDb: -6 },
+      { preset: 'riser', params: { tone: 0.95, tension: 0.9, space: 0.08 }, duration: 0.1, offsetMs: 255, gainDb: -15, filter: { mode: 'bp', cutoffHz: 3200, q: 2.5 } },
+      { preset: 'tick', params: { pitch: 0.95, hardness: 0.5 }, gainDb: -20 },
+      { preset: 'texture', params: { kind: 'room', density: 0.2, tone: 0.55, movement: 0.1 }, duration: 0.5, gainDb: -32 }
+    ],
+    master: { reverb: { amount: 0.16, size: 0.3 }, targetDurationMs: 900 }
+  },
+
+  'bird-flock': {
+    id: 'bird-flock',
+    description: 'Scattered flock: many overlapping chirps at different heights over a bed of foliage air.',
+    layers: [
+      { preset: 'zap', params: { pitch: 0.9, roughness: 0.12, space: 0.1 }, duration: 0.15, gainDb: -3 },
+      { preset: 'zap', params: { pitch: 0.74, roughness: 0.15, space: 0.12 }, duration: 0.14, offsetMs: 150, gainDb: -6 },
+      { preset: 'zap', params: { pitch: 0.97, roughness: 0.1, space: 0.1 }, duration: 0.13, offsetMs: 330, gainDb: -5 },
+      { preset: 'zap', params: { pitch: 0.82, roughness: 0.13, space: 0.12 }, duration: 0.14, offsetMs: 560, gainDb: -7 },
+      { preset: 'zap', params: { pitch: 0.9, roughness: 0.11, space: 0.1 }, duration: 0.12, offsetMs: 900, gainDb: -9 },
+      { preset: 'chime', params: { pitch: 0.85, decay: 0.05, metallic: 0.1, space: 0.15 }, duration: 0.16, offsetMs: 60, gainDb: -11 },
+      { preset: 'chime', params: { pitch: 0.95, decay: 0.04, metallic: 0.08, space: 0.15 }, duration: 0.14, offsetMs: 480, gainDb: -14 },
+      { preset: 'riser', params: { tone: 0.9, tension: 0.85, space: 0.12 }, duration: 0.09, offsetMs: 1050, gainDb: -16, filter: { mode: 'bp', cutoffHz: 3000, q: 2.4 } },
+      { preset: 'tick', params: { pitch: 0.9, hardness: 0.45 }, offsetMs: 300, gainDb: -24 },
+      { preset: 'tick', params: { pitch: 0.8, hardness: 0.4 }, offsetMs: 760, gainDb: -26 },
+      { preset: 'tick', params: { pitch: 0.98, hardness: 0.5 }, offsetMs: 1430, gainDb: -25 },
+      { preset: 'texture', params: { kind: 'rain', density: 0.35, tone: 0.9, movement: 0.5 }, duration: 1.8, offsetMs: 200, gainDb: -23, filter: { mode: 'hp', cutoffHz: 3000 } },
+      { preset: 'texture', params: { kind: 'wind', density: 0.25, tone: 0.6, movement: 0.35 }, duration: 2.0, gainDb: -30, filter: { mode: 'lp', cutoffHz: 2600 } }
+    ],
+    master: { reverb: { amount: 0.26, size: 0.5 }, targetDurationMs: 2200 }
+  },
+
+  'insect-swarm': {
+    id: 'insect-swarm',
+    description: 'Insect swarm: layered wing buzzes beating against each other over a band-passed hiss.',
+    // One buzz is the swarm and the rest only thicken it: three buzz layers at
+    // comparable level beat into each other, and then the loudest 46 ms of the
+    // file lands on a different interference peak every time the design is
+    // re-performed (which shows up as a wandering spectral centroid).
+    layers: [
+      { preset: 'insect-buzz', params: { pitch: 1.15, movement: 0.8, tone: 0.62, space: 0.05 }, duration: 2.6, gainDb: -4 },
+      { preset: 'insect-buzz', params: { pitch: 0.85, movement: 0.55, tone: 0.45, space: 0.06 }, duration: 2.4, offsetMs: 130, gainDb: -15 },
+      { preset: 'insect-buzz', params: { pitch: 1.35, movement: 0.9, tone: 0.7, space: 0.05 }, duration: 2.2, offsetMs: 260, gainDb: -18 },
+      { preset: 'texture', params: { kind: 'rain', density: 0.6, tone: 0.82, movement: 0.7 }, duration: 2.8, gainDb: -10, filter: { mode: 'hp', cutoffHz: 1800 } },
+      { preset: 'texture', params: { kind: 'room', density: 0.3, tone: 0.5, movement: 0.2 }, duration: 2.8, gainDb: -26 },
+      { preset: 'whoosh', params: { speed: 0.3, tone: 0.85, rise: 0.55, space: 0.1 }, duration: 1.4, offsetMs: 500, gainDb: -19, filter: { mode: 'bp', cutoffHz: 2800, q: 2.5 } },
+      { preset: 'tick', params: { pitch: 0.72, hardness: 0.5 }, offsetMs: 300, gainDb: -28 },
+      { preset: 'tick', params: { pitch: 0.9, hardness: 0.55 }, offsetMs: 1100, gainDb: -29 },
+      { preset: 'tick', params: { pitch: 0.62, hardness: 0.45 }, offsetMs: 1900, gainDb: -30 }
+    ],
+    master: { reverb: { amount: 0.18, size: 0.45 }, targetDurationMs: 3000 }
+  },
+
+  'whale-song': {
+    id: 'whale-song',
+    description: 'Whale song: slow low moans, a second phrase and an ocean-sized tail.',
+    // The low chime is the moan and the pad underneath is the body: a pad-led
+    // version is prettier as a drone but it is a chord, so it has no measurable
+    // fundamental and the call loses the one pitch a whale actually holds.
+    layers: [
+      { preset: 'chime', params: { pitch: 0.05, decay: 0.95, metallic: 0.12, space: 0.5 }, duration: 3.2, detuneCents: -700, gainDb: -5, filter: { mode: 'lp', cutoffHz: 700 } },
+      { preset: 'choir-pad', params: { pitch: 0.55, bright: 0.25, movement: 0.85, space: 0.35 }, duration: 2.4, gainDb: -11, filter: { mode: 'lp', cutoffHz: 900 } },
+      { preset: 'chime', params: { pitch: 0.12, decay: 0.88, metallic: 0.18, space: 0.5 }, duration: 2.2, offsetMs: 1950, detuneCents: -500, gainDb: -13, filter: { mode: 'lp', cutoffHz: 800 } },
+      { preset: 'texture', params: { kind: 'hum', density: 0.35, tone: 0.18, movement: 0.55 }, duration: 3.6, gainDb: -15, filter: { mode: 'lp', cutoffHz: 320 } },
+      { preset: 'texture', params: { kind: 'room', density: 0.3, tone: 0.22, movement: 0.4 }, duration: 3.8, gainDb: -24 },
+      { preset: 'whoosh', params: { speed: 0.2, tone: 0.25, rise: 0.4, space: 0.4, pitch: 0.7 }, duration: 1.6, offsetMs: 400, gainDb: -26, filter: { mode: 'lp', cutoffHz: 600 } }
+    ],
+    master: { reverb: { amount: 0.5, size: 0.8 }, targetDurationMs: 5000 }
+  },
+
+  'wolf-howl': {
+    id: 'wolf-howl',
+    description: 'Distant canid howl: a rising call that holds on a wavering vowel, then an echo answers.',
+    // The sustained pad is the vowel and it dominates; the growls only add rasp
+    // and a second formant underneath. Voicing a growl as the lead makes the
+    // loudest frame of the file depend on the phase of its own pitch LFO, so the
+    // measured spectrum moves from take to take.
+    layers: [
+      { preset: 'riser', params: { tone: 0.6, tension: 0.45, space: 0.5 }, duration: 0.85, gainDb: -20, filter: { mode: 'bp', cutoffHz: 1000, q: 2 } },
+      { preset: 'choir-pad', params: { pitch: 0.95, bright: 0.3, movement: 0.85, space: 0.45 }, duration: 2.2, offsetMs: 130, gainDb: -4, filter: { mode: 'bp', cutoffHz: 1150, q: 1.4 } },
+      { preset: 'creature-growl', params: { pitch: 1.7, roughness: 0.35, space: 0.5 }, duration: 1.9, gainDb: -13, filter: { mode: 'bp', cutoffHz: 950, q: 2 } },
+      { preset: 'creature-growl', params: { pitch: 1.35, roughness: 0.55, space: 0.5 }, duration: 1.5, offsetMs: 620, gainDb: -17, filter: { mode: 'bp', cutoffHz: 1350, q: 2.6 } },
+      { preset: 'creature-growl', params: { pitch: 1.55, roughness: 0.3, space: 0.6 }, duration: 1.2, offsetMs: 1650, gainDb: -22, filter: { mode: 'bp', cutoffHz: 1100, q: 2.2 } },
+      { preset: 'texture', params: { kind: 'wind', density: 0.35, tone: 0.3, movement: 0.5 }, duration: 3.1, gainDb: -23, filter: { mode: 'lp', cutoffHz: 1200 } }
+    ],
+    master: { reverb: { amount: 0.5, size: 0.85 }, targetDurationMs: 3200 }
+  },
+
+  'frog-croak': {
+    id: 'frog-croak',
+    description: 'Frog croak: a fast low pulse train rattling inside a throaty resonance.',
+    layers: [
+      { preset: 'thud', params: { weight: 0.5, softness: 0.4, space: 0.08 }, gainDb: -4 },
+      { preset: 'creature-growl', params: { pitch: 0.55, roughness: 0.8, space: 0.12 }, duration: 0.6, gainDb: -12, filter: { mode: 'lp', cutoffHz: 520 } },
+      { preset: 'tick', params: { pitch: 0.3, hardness: 0.65 }, gainDb: -7, filter: { mode: 'lp', cutoffHz: 420, q: 1.4 } },
+      { preset: 'tick', params: { pitch: 0.3, hardness: 0.65 }, offsetMs: 42, gainDb: -8, filter: { mode: 'lp', cutoffHz: 420, q: 1.4 } },
+      { preset: 'tick', params: { pitch: 0.3, hardness: 0.65 }, offsetMs: 84, gainDb: -8.5, filter: { mode: 'lp', cutoffHz: 420, q: 1.4 } },
+      { preset: 'tick', params: { pitch: 0.32, hardness: 0.6 }, offsetMs: 126, gainDb: -9.5, filter: { mode: 'lp', cutoffHz: 420, q: 1.4 } },
+      { preset: 'tick', params: { pitch: 0.3, hardness: 0.65 }, offsetMs: 168, gainDb: -10.5, filter: { mode: 'lp', cutoffHz: 420, q: 1.4 } },
+      { preset: 'tick', params: { pitch: 0.28, hardness: 0.6 }, offsetMs: 210, gainDb: -11.5, filter: { mode: 'lp', cutoffHz: 420, q: 1.4 } },
+      { preset: 'tick', params: { pitch: 0.3, hardness: 0.6 }, offsetMs: 252, gainDb: -13, filter: { mode: 'lp', cutoffHz: 420, q: 1.4 } },
+      { preset: 'scrap', params: { density: 0.4, tone: 0.25, roughness: 0.7, space: 0.1 }, duration: 0.32, offsetMs: 20, gainDb: -13, filter: { mode: 'bp', cutoffHz: 520, q: 1.6 } },
+      { preset: 'texture', params: { kind: 'room', density: 0.25, tone: 0.3, movement: 0.15 }, duration: 0.5, gainDb: -30 }
+    ],
+    master: { reverb: { amount: 0.15, size: 0.35 }, targetDurationMs: 1400 }
+  },
+
+  'hoofbeats': {
+    id: 'hoofbeats',
+    description: 'Hoofbeats: four wooden clops on a shortening stride, each with body and dirt.',
+    layers: [
+      { preset: 'footstep-wood', params: { weight: 0.7, hardness: 0.8, space: 0.12 }, pitchScale: 1, gainDb: -2 },
+      { preset: 'thud', params: { weight: 0.5, softness: 0.3, space: 0.08 }, gainDb: -10 },
+      { preset: 'scrap', params: { density: 0.3, tone: 0.3, roughness: 0.8, space: 0.06 }, duration: 0.14, offsetMs: 10, gainDb: -18 },
+      { preset: 'footstep-wood', params: { weight: 0.72, hardness: 0.78, space: 0.12 }, pitchScale: 0.96, offsetMs: 330, gainDb: -3 },
+      { preset: 'thud', params: { weight: 0.5, softness: 0.32, space: 0.08 }, offsetMs: 330, gainDb: -11 },
+      { preset: 'scrap', params: { density: 0.32, tone: 0.32, roughness: 0.8, space: 0.06 }, duration: 0.14, offsetMs: 340, gainDb: -19 },
+      { preset: 'footstep-wood', params: { weight: 0.68, hardness: 0.82, space: 0.12 }, pitchScale: 1.04, offsetMs: 610, gainDb: -3.5 },
+      { preset: 'thud', params: { weight: 0.48, softness: 0.3, space: 0.08 }, offsetMs: 610, gainDb: -11.5 },
+      { preset: 'scrap', params: { density: 0.28, tone: 0.3, roughness: 0.85, space: 0.06 }, duration: 0.14, offsetMs: 620, gainDb: -19.5 },
+      { preset: 'footstep-wood', params: { weight: 0.72, hardness: 0.76, space: 0.14 }, pitchScale: 0.92, offsetMs: 860, gainDb: -4 },
+      { preset: 'thud', params: { weight: 0.52, softness: 0.34, space: 0.08 }, offsetMs: 860, gainDb: -12 },
+      { preset: 'scrap', params: { density: 0.34, tone: 0.3, roughness: 0.8, space: 0.06 }, duration: 0.16, offsetMs: 870, gainDb: -20 }
+    ],
+    master: { reverb: { amount: 0.18, size: 0.4 }, targetDurationMs: 1800 }
+  },
+
+  'wing-flap': {
+    id: 'wing-flap',
+    description: 'Wingbeats: three low air pulses with feather rustle, like a bird taking off.',
+    layers: [
+      { preset: 'whoosh', params: { speed: 0.35, tone: 0.22, rise: 0.3, space: 0.15, pitch: 0.7 }, duration: 0.4, gainDb: -5 },
+      { preset: 'thud', params: { weight: 0.6, softness: 0.6, space: 0.1 }, duration: 0.3, gainDb: -13 },
+      { preset: 'cloth', params: { movement: 0.75, tone: 0.3, space: 0.12 }, duration: 0.32, offsetMs: 15, gainDb: -14 },
+      { preset: 'whoosh', params: { speed: 0.35, tone: 0.22, rise: 0.3, space: 0.15, pitch: 0.72 }, duration: 0.38, offsetMs: 420, gainDb: -7 },
+      { preset: 'thud', params: { weight: 0.58, softness: 0.62, space: 0.1 }, duration: 0.28, offsetMs: 420, gainDb: -15 },
+      { preset: 'cloth', params: { movement: 0.72, tone: 0.32, space: 0.12 }, duration: 0.3, offsetMs: 435, gainDb: -16 },
+      { preset: 'whoosh', params: { speed: 0.35, tone: 0.22, rise: 0.3, space: 0.15, pitch: 0.68 }, duration: 0.36, offsetMs: 830, gainDb: -9 },
+      { preset: 'thud', params: { weight: 0.55, softness: 0.65, space: 0.1 }, duration: 0.26, offsetMs: 830, gainDb: -17 },
+      { preset: 'cloth', params: { movement: 0.7, tone: 0.34, space: 0.12 }, duration: 0.28, offsetMs: 845, gainDb: -18 },
+      { preset: 'texture', params: { kind: 'wind', density: 0.25, tone: 0.45, movement: 0.4 }, duration: 1.5, gainDb: -28 }
+    ],
+    master: { reverb: { amount: 0.16, size: 0.4 }, targetDurationMs: 1600 }
+  },
+
+  'creature-breath': {
+    id: 'creature-breath',
+    description: 'Large creature breathing: a strained inhale, a growling exhale and a chest you can hear.',
+    layers: [
+      { preset: 'breath-inhale', params: { effort: 0.85, tone: 0.3, space: 0.2 }, duration: 1.2, gainDb: -4 },
+      { preset: 'thud', params: { weight: 0.85, softness: 0.85, space: 0.15 }, duration: 0.9, gainDb: -13 },
+      { preset: 'creature-growl', params: { pitch: 0.6, roughness: 0.8, space: 0.3 }, duration: 2.3, gainDb: -17, filter: { mode: 'lp', cutoffHz: 500 } },
+      { preset: 'whoosh', params: { speed: 0.3, tone: 0.2, rise: 0.55, space: 0.15, pitch: 0.8 }, duration: 0.95, offsetMs: 1250, gainDb: -7 },
+      { preset: 'thud', params: { weight: 0.8, softness: 0.9, space: 0.15 }, duration: 0.85, offsetMs: 1250, gainDb: -15 },
+      { preset: 'breath-inhale', params: { effort: 0.7, tone: 0.35, space: 0.2 }, duration: 1.1, offsetMs: 1350, gainDb: -11 },
+      { preset: 'texture', params: { kind: 'room', density: 0.3, tone: 0.25, movement: 0.2 }, duration: 2.4, gainDb: -26 }
+    ],
+    master: { reverb: { amount: 0.22, size: 0.5 }, targetDurationMs: 2600 }
+  },
+
+  'creature-hiss': {
+    id: 'creature-hiss',
+    description: 'Threat hiss: a sharp wall of high noise over a barely-there growl.',
+    layers: [
+      { preset: 'whoosh', params: { speed: 0.55, tone: 0.9, rise: 0.3, space: 0.12, pitch: 1.3 }, duration: 0.35, gainDb: -8 },
+      { preset: 'texture', params: { kind: 'rain', density: 0.9, tone: 0.9, movement: 0.45 }, duration: 0.75, gainDb: -3, filter: { mode: 'hp', cutoffHz: 2600 } },
+      { preset: 'texture', params: { kind: 'rain', density: 0.7, tone: 0.85, movement: 0.35 }, duration: 0.5, offsetMs: 160, gainDb: -8, filter: { mode: 'hp', cutoffHz: 3400 } },
+      { preset: 'scrap', params: { density: 0.9, tone: 0.95, roughness: 0.5, space: 0.1 }, duration: 0.6, gainDb: -11, filter: { mode: 'hp', cutoffHz: 3000 } },
+      { preset: 'creature-growl', params: { pitch: 0.6, roughness: 0.95, space: 0.3 }, duration: 0.8, gainDb: -14, filter: { mode: 'lp', cutoffHz: 600 } },
+      { preset: 'thud', params: { weight: 0.7, softness: 0.8, space: 0.12 }, duration: 0.5, gainDb: -17 }
+    ],
+    master: { reverb: { amount: 0.16, size: 0.4 }, targetDurationMs: 1800 }
+  },
+
+  'rodent-squeak': {
+    id: 'rodent-squeak',
+    description: 'Small mammal squeak: two thin high squeals, more air than body.',
+    layers: [
+      { preset: 'zap', params: { pitch: 0.98, roughness: 0.08, space: 0.12 }, duration: 0.12, detuneCents: 500, gainDb: -3 },
+      { preset: 'chime', params: { pitch: 1, decay: 0.05, metallic: 0.1, space: 0.15 }, duration: 0.16, offsetMs: 10, detuneCents: 400, gainDb: -9 },
+      { preset: 'zap', params: { pitch: 0.86, roughness: 0.1, space: 0.12 }, duration: 0.1, offsetMs: 150, detuneCents: 300, gainDb: -7 },
+      { preset: 'chime', params: { pitch: 0.95, decay: 0.04, metallic: 0.08, space: 0.15 }, duration: 0.12, offsetMs: 160, detuneCents: 250, gainDb: -13 },
+      { preset: 'tick', params: { pitch: 1, hardness: 0.85 }, detuneCents: 400, gainDb: -14 },
+      { preset: 'texture', params: { kind: 'room', density: 0.2, tone: 0.7, movement: 0.1 }, duration: 0.4, gainDb: -33 }
+    ],
+    master: { reverb: { amount: 0.2, size: 0.3 }, targetDurationMs: 900 }
+  },
+
+  'bat-echolocation': {
+    id: 'bat-echolocation',
+    description: 'Bat echolocation: tight bursts of ultrasonic-style clicks that land as hard ticks.',
+    layers: [
+      { preset: 'tick', params: { pitch: 1, hardness: 1 }, detuneCents: 600, gainDb: -6, filter: { mode: 'hp', cutoffHz: 3200 } },
+      { preset: 'tick', params: { pitch: 1, hardness: 1 }, offsetMs: 90, detuneCents: 500, gainDb: -9, filter: { mode: 'hp', cutoffHz: 3200 } },
+      { preset: 'tick', params: { pitch: 0.95, hardness: 1 }, offsetMs: 170, detuneCents: 500, gainDb: -12, filter: { mode: 'hp', cutoffHz: 3000 } },
+      { preset: 'tick', params: { pitch: 1, hardness: 0.95 }, offsetMs: 640, detuneCents: 550, gainDb: -8, filter: { mode: 'hp', cutoffHz: 3200 } },
+      { preset: 'tick', params: { pitch: 0.98, hardness: 0.95 }, offsetMs: 720, detuneCents: 450, gainDb: -11, filter: { mode: 'hp', cutoffHz: 3000 } },
+      { preset: 'chime', params: { pitch: 1, decay: 0.02, metallic: 0.08, space: 0.3 }, duration: 0.08, detuneCents: 600, gainDb: -24, filter: { mode: 'hp', cutoffHz: 4200 } },
+      { preset: 'texture', params: { kind: 'room', density: 0.2, tone: 0.75, movement: 0.15 }, duration: 1.3, gainDb: -30 }
+    ],
+    master: { reverb: { amount: 0.3, size: 0.6 }, targetDurationMs: 1600 }
   }
 }
 

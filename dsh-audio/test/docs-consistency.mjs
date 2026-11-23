@@ -182,7 +182,7 @@ const presetIds = new Set(Object.keys(PRESETS))
 const recipeIds = new Set(Object.keys(RECIPES))
 const genreIds = new Set(Object.keys(GENRES))
 
-const EXPECTED = { presets: 38, recipes: 26, genres: 8 }
+const EXPECTED = { presets: 38, recipes: 38, genres: 8 }
 
 function enumOf (toolName, dottedPath) {
   let schema = toolByName.get(toolName)?.parameters

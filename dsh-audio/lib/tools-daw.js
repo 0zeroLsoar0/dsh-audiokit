@@ -4,26 +4,33 @@
  * `audio_bind` keeps a cue set inside one HTML page and `audio_stems` writes the
  * layers as wavs, but there was no way to say "here is the timeline, open it in
  * your editor". This tool is that hand-off: it writes a CMX3600 EDL, a REAPER
- * project, an RFC4180 CSV cue sheet or an Audacity label track.
+ * project, an RFC4180 CSV cue sheet, an Audacity label track, an AAF (structural
+ * subset), an OMF skeleton, an OpenTimelineIO document or an FCP7 XML sequence.
  *
- * Two things it does that a naive file writer would not:
+ * Three things it does that a naive file writer would not:
  *
- * 1. It reads back every project it writes (`parseEdl` / `parseRpp`) and refuses
- *    to report success when the writer and the reader disagree. A broken EDL
- *    fails silently inside an NLE, so the check has to happen here.
+ * 1. It reads back every project it writes (`parseEdl` / `parseRpp` / `parseAaf`
+ *    / `parseOtio` / `parseXmeml` / `readCompoundFile`) and refuses to report
+ *    success when the writer and the reader disagree. A broken EDL or AAF fails
+ *    silently inside an NLE, so the check has to happen here.
  * 2. It measures the duration of each media file from the RIFF header, because
  *    RPP stores an item LENGTH. Reading the whole file through the engine's
  *    `readTrack` to learn one number would cost hundreds of megabytes for a
  *    stem set; walking the chunks costs one 8 KB read per file.
+ * 3. For AAF it reads the PCM and embeds it, because that is what makes an AAF
+ *    a self-contained timeline rather than a list of paths — and for FCP7 XML it
+ *    passes an absolute `file://` URL, which is what Premiere links against.
  *
  * Paths are written so a project can find its media: CSV and EDL carry the
- * working-directory-relative path, while the RPP gets paths relative to the
- * directory the project is written into (which is what REAPER resolves them
- * against).
+ * working-directory-relative path, the RPP gets paths relative to the directory
+ * the project is written into (which is what REAPER resolves them against), the
+ * OTIO document carries the relative path as `target_url`, and the xmeml
+ * document carries an absolute file URL.
  */
 
-import { open, stat } from 'node:fs/promises'
+import { open, readFile, stat } from 'node:fs/promises'
 import { dirname, join, relative } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { hashSpec, resolvePath, writeFileAtomic } from './audio.js'
 import {
   EXPORT_EXTENSIONS,
@@ -33,14 +40,25 @@ import {
   parseRpp,
   timecodeToSeconds
 } from './daw.js'
+import { parseAaf } from './aaf.js'
+import { readCompoundFile } from './cfb.js'
+import { parseOtio } from './otio.js'
+import { parseXmeml } from './xmeml.js'
 
 /** Human name per format, used in the result line a model reads. */
 const FORMAT_LABELS = Object.freeze({
   edl: 'CMX3600 EDL',
   rpp: 'REAPER project',
   csv: 'CSV cue sheet',
-  labels: 'Audacity label track'
+  labels: 'Audacity label track',
+  aaf: 'AAF (structural subset)',
+  omf: 'OMF skeleton (not importable)',
+  otio: 'OpenTimelineIO document',
+  xmeml: 'Final Cut Pro 7 XML'
 })
+
+/** Formats that write a binary container instead of text. */
+const BINARY_FORMATS = Object.freeze(['aaf', 'omf'])
 
 /** A tool result is a summary: past this many warnings the rest is counted. */
 const MAX_WARNINGS = 8
@@ -102,7 +120,8 @@ function readFormat (value) {
   if (!EXPORT_FORMATS.includes(format)) {
     throw new Error(
       `audio_daw: format must be one of ${EXPORT_FORMATS.join(', ')}, got ${describeValue(value)} ` +
-      '(edl=cut list for a video editor, rpp=REAPER project, csv=cue sheet, labels=Audacity labels)'
+      '(edl=cut list for a video editor, rpp=REAPER project, csv=cue sheet, labels=Audacity labels, ' +
+      'aaf=AAF structural subset, omf=OMF skeleton, otio=OpenTimelineIO, xmeml=Final Cut Pro 7 XML)'
     )
   }
   return format
@@ -178,6 +197,68 @@ async function readWavDuration (path) {
   }
 }
 
+/**
+ * Read a wav file's PCM frames and format, for the AAF essence embedding.
+ *
+ * Only integer PCM is returned: AAF's `PCMDescriptor` describes integer samples
+ * (a float file would need a different descriptor class, which this subset does
+ * not write), so a float or compressed file is reported instead of being
+ * embedded under a descriptor that lies about it.
+ *
+ * @param {string} path - absolute .wav path.
+ * @returns {Promise<{ data: Buffer, sampleRate: number, channels: number, bitDepth: number, frames: number }>}
+ */
+async function readWavPcm (path) {
+  let bytes
+  try {
+    bytes = await readFile(path)
+  } catch (error) {
+    throw new Error(`audio_daw: cannot read ${path}: ${error.code ?? describeError(error)}; pass embed false to write an offline AAF`)
+  }
+  if (bytes.length < 44) throw new Error(`audio_daw: ${path} is too short to be a WAVE file`)
+  if (bytes.toString('ascii', 0, 4) !== 'RIFF' || bytes.toString('ascii', 8, 12) !== 'WAVE') {
+    throw new Error(`audio_daw: ${path} is not a RIFF/WAVE file; aaf needs a PCM wav to embed (pass embed false for an offline timeline)`)
+  }
+  let format = null
+  let cursor = 12
+  for (let guard = 0; guard < 4096; guard += 1) {
+    if (cursor + 8 > bytes.length) break
+    const id = bytes.toString('ascii', cursor, cursor + 4)
+    const size = bytes.readUInt32LE(cursor + 4)
+    const body = cursor + 8
+    if (id === 'fmt ' && size >= 16) {
+      format = {
+        audioFormat: bytes.readUInt16LE(body),
+        channelCount: bytes.readUInt16LE(body + 2),
+        sampleRate: bytes.readUInt32LE(body + 4),
+        bitsPerSample: bytes.readUInt16LE(body + 14),
+        blockAlign: bytes.readUInt16LE(body + 12)
+      }
+    } else if (id === 'data') {
+      if (format === null) throw new Error(`audio_daw: ${path} has no fmt chunk before its data chunk; aaf needs the sample format`)
+      if (format.audioFormat !== 1) {
+        throw new Error(`audio_daw: ${path} is not integer PCM (wFormatTag ${format.audioFormat}); aaf can only embed PCM`)
+      }
+      if (![8, 16, 24, 32].includes(format.bitsPerSample)) {
+        throw new Error(`audio_daw: ${path} is ${format.bitsPerSample}-bit; aaf can only embed 8, 16, 24 or 32 bit PCM`)
+      }
+      const available = Math.max(0, bytes.length - body)
+      const declared = size === 0xffffffff ? available : Math.min(size, available)
+      const usable = Math.floor(declared / format.blockAlign) * format.blockAlign
+      if (usable === 0) throw new Error(`audio_daw: ${path} has no audio frames`)
+      return {
+        data: Buffer.from(bytes.subarray(body, body + usable)),
+        sampleRate: format.sampleRate,
+        channels: format.channelCount,
+        bitDepth: format.bitsPerSample,
+        frames: usable / format.blockAlign
+      }
+    }
+    cursor = body + size + (size % 2)
+  }
+  throw new Error(`audio_daw: ${path} has no data chunk; aaf needs a PCM wav to embed`)
+}
+
 /* ------------------------------------------------------------------ plan -- */
 
 /** Read a cue's `path` into both the display form and the resolved form. */
@@ -219,6 +300,29 @@ function planCues (cwd, args, format) {
     }
   })
   return { entries, notes: [] }
+}
+
+/**
+ * Plan a format that needs a real clip length (otio, xmeml).
+ *
+ * Unlike the EDL, these formats describe media rather than a cut list, so a cue
+ * with a path gets the length of its wav when the caller did not state one —
+ * measured from the header, exactly like the RPP path does. A cue with no path
+ * and no duration is still rejected by the exporter with a readable message.
+ *
+ * @returns {Promise<{ entries: object[], notes: string[] }>}
+ */
+async function planTimed (cwd, args, format) {
+  const { entries, notes } = planCues(cwd, args, format)
+  let measured = 0
+  for (const entry of entries) {
+    if ((entry.duration === undefined || entry.duration === null) && entry.absolute !== undefined) {
+      entry.duration = await readWavDuration(entry.absolute)
+      measured += 1
+    }
+  }
+  if (measured > 0) notes.push(`${measured} clip length(s) measured from the wav header; pass duration to override`)
+  return { entries, notes }
 }
 
 /**
@@ -270,6 +374,50 @@ async function planReaper (cwd, args) {
   }
   if (fromCues) notes.push('cues were written as one REAPER track each (offset = cue at)')
   if (measured > 0) notes.push(`${measured} item length(s) measured from the wav header; pass duration to override`)
+  return { entries, notes }
+}
+
+/**
+ * Turn cues into the AAF writer's entries, reading the PCM to embed.
+ *
+ * AAF is the one format that carries the audio itself, so the samples have to be
+ * read here. A cue whose file is not integer PCM is kept as an offline clip
+ * (length only) with a note instead of failing the whole export: a timeline with
+ * one linked file and nine embedded ones is still useful, and a silent drop is
+ * not.
+ *
+ * @returns {Promise<{ entries: object[], notes: string[] }>}
+ */
+async function planAaf (cwd, args, embed) {
+  const { entries: cues, notes } = planCues(cwd, args, 'aaf')
+  const entries = []
+  let embedded = 0
+  let offline = 0
+  for (const entry of cues) {
+    if (entry.absolute === undefined || embed === false) {
+      offline += 1
+      entries.push(entry)
+      continue
+    }
+    try {
+      const pcm = await readWavPcm(entry.absolute)
+      // A clip with no explicit duration gets the one its samples have: an AAF
+      // clip needs a length, and the media is the authority on it.
+      const duration = entry.duration === undefined || entry.duration === null
+        ? pcm.frames / pcm.sampleRate
+        : entry.duration
+      entries.push({ ...entry, duration, pcm, channels: pcm.channels, bitDepth: pcm.bitDepth })
+      embedded += 1
+    } catch (error) {
+      // AAF is generated from wavs this plugin wrote, so a non-PCM file is a
+      // caller mistake worth reporting — but not worth losing the timeline.
+      notes.push(`cue ${JSON.stringify(entry.name ?? '')} was written offline: ${describeError(error)}`)
+      offline += 1
+      entries.push(entry)
+    }
+  }
+  if (embedded > 0) notes.push(`${embedded} cue(s) embedded as raw PCM frames (no RIFF header; the AAF descriptor carries the format)`)
+  if (offline > 0) notes.push(`${offline} cue(s) written as offline clips (length only, no embedded audio)`)
   return { entries, notes }
 }
 
@@ -359,6 +507,114 @@ function verifyRpp (text, entries) {
   return { tracks: parsed.tracks.length, items }
 }
 
+/**
+ * Parse an AAF back and prove the container and the object graph say what was
+ * asked: the CFB is valid, the root is the AAF root class, the header carries
+ * the version and operational pattern, every cue has a mob, and the timeline
+ * holds one clip per cue at the requested position.
+ *
+ * @returns {object} `{ storages, streams, mobs, clips, embeddedBytes }` for the tool result.
+ */
+function verifyAaf (buffer, entries, embed) {
+  let parsed
+  try {
+    parsed = parseAaf(buffer)
+  } catch (error) {
+    pluginBug(describeError(error))
+  }
+  if (parsed.rootClassId === undefined || parsed.rootClassId === null) pluginBug('its root storage has no class id')
+  if (parsed.header.byteOrder !== 0x4949) pluginBug(`its header byte order is ${parsed.header.byteOrder} instead of 0x4949`)
+  if (parsed.header.objectModelVersion !== 1) pluginBug(`its object model version is ${parsed.header.objectModelVersion} instead of 1`)
+  const clips = parsed.timeline.tracks.reduce((total, track) => total + track.clips.length, 0)
+  if (clips !== entries.length) pluginBug(`its timeline holds ${clips} clip(s) for ${entries.length} cue(s)`)
+  const embeddedBytes = parsed.content.essenceData.reduce((total, item) => total + item.bytes, 0)
+  if (embed === true && embeddedBytes === 0) pluginBug('it claims to embed PCM but no essence data was found')
+  if (embed !== true && embeddedBytes !== 0) pluginBug('it embeds PCM although embed was false')
+  // Every timeline clip has to resolve to a master mob, or the reference graph is
+  // broken even though the bytes parse.
+  const mobIds = new Set(parsed.content.mobs.map((mob) => mob.mobId))
+  for (const track of parsed.timeline.tracks) {
+    for (const clip of track.clips) {
+      if (!mobIds.has(clip.sourceMobId)) pluginBug(`clip ${JSON.stringify(clip.name)} points at mob ${String(clip.sourceMobId).slice(0, 16)}… which is not in the file`)
+    }
+  }
+  return {
+    storages: parsed.container.storages,
+    streams: parsed.container.streams,
+    mobs: parsed.content.mobs.length,
+    clips,
+    embeddedBytes
+  }
+}
+
+/**
+ * Parse an OMF skeleton back: the container has to be a valid CFB and carry the
+ * two streams the skeleton promises.
+ */
+function verifyOmf (buffer, entries) {
+  let container
+  try {
+    container = readCompoundFile(buffer)
+  } catch (error) {
+    pluginBug(describeError(error))
+  }
+  const names = container.list.filter((node) => node.kind === 'stream').map((node) => node.name)
+  for (const required of ['OMFI:HEADER', 'DSH:MANIFEST']) {
+    if (!names.includes(required)) pluginBug(`its container has no ${required} stream`)
+  }
+  const manifestNode = container.list.find((node) => node.name === 'DSH:MANIFEST')
+  let manifest
+  try {
+    manifest = JSON.parse(manifestNode.data.toString('utf8'))
+  } catch (error) {
+    pluginBug(`its manifest is not valid JSON (${describeError(error)})`)
+  }
+  if (manifest.importable !== false) pluginBug('its manifest does not mark the file as a skeleton')
+  if (manifest.events !== entries.length) pluginBug(`its manifest lists ${manifest.events} cue(s) for ${entries.length} cue(s)`)
+  return { streams: names.length, events: manifest.events, importable: false }
+}
+
+/** Parse an OTIO document back and compare it with the cues that were written. */
+function verifyOtio (text, entries) {
+  let parsed
+  try {
+    parsed = parseOtio(text)
+  } catch (error) {
+    pluginBug(describeError(error))
+  }
+  const clips = parsed.tracks.reduce((total, track) => total + track.clips.length, 0)
+  if (clips !== entries.length) pluginBug(`it holds ${clips} clip(s) for ${entries.length} cue(s)`)
+  for (const track of parsed.tracks) {
+    let cursor = 0
+    for (const clip of track.clips) {
+      if (clip.at + 1e-6 < cursor) pluginBug(`clip ${JSON.stringify(clip.name)} starts before the previous clip ends`)
+      cursor = clip.at + clip.duration
+    }
+  }
+  return { tracks: parsed.tracks.length, clips, rate: parsed.rate }
+}
+
+/** Parse an FCP7 XML sequence back and compare it with the cues that were written. */
+function verifyXmeml (text, entries) {
+  let parsed
+  try {
+    parsed = parseXmeml(text)
+  } catch (error) {
+    pluginBug(describeError(error))
+  }
+  const clips = parsed.tracks.reduce((total, track) => total + track.clips.length, 0)
+  if (clips !== entries.length) pluginBug(`it holds ${clips} clipitem(s) for ${entries.length} cue(s)`)
+  for (const track of parsed.tracks) {
+    for (const clip of track.clips) {
+      if (!(clip.end > clip.start)) pluginBug(`clipitem ${JSON.stringify(clip.name)} has start ${clip.start} >= end ${clip.end}`)
+      if (clip.pathUrl !== null && !/^file:|^\//.test(clip.pathUrl)) {
+        pluginBug(`clipitem ${JSON.stringify(clip.name)} has a media path ${JSON.stringify(clip.pathUrl)} that is not resolvable`)
+      }
+    }
+  }
+  return { tracks: parsed.tracks.length, clips, timebase: parsed.timebase }
+}
+
 /* ------------------------------------------------------------------ text -- */
 
 /** Does any entry carry a level or fade the EDL cannot express? */
@@ -378,7 +634,20 @@ function dawLine (format, result, entries) {
   if (format === 'csv') {
     return `A spreadsheet or script sees ${result.events} row(s) of name,path,at,duration,gainDb,fadeIn,fadeOut.`
   }
-  return `Audacity (File > Import > Labels) sees ${result.events} label(s) spanning the same timeline.`
+  if (format === 'aaf') {
+    return `An AAF reader that has this file's class dictionary would see ${result.lanes} timeline track(s), ` +
+      `${result.objects} mob(s) and ${sizeText(result.embeddedBytes)} of embedded PCM: the container and object ` +
+      'graph are real, but Pro Tools/Resolve/Avid refuse the file at the MetaDictionary (see docs/INTEROP.zh.md).'
+  }
+  if (format === 'omf') {
+    return 'This is a labelled skeleton, not an OMF document: Avid will refuse it. The container and manifest are real; use otio or xmeml for an importable timeline.'
+  }
+  if (format === 'otio') {
+    return `Resolve 18+, Nuke and the OTIO adapters see a ${result.tracks} track audio timeline at ${result.rate} Hz ` +
+      `with ${result.events} clip(s); gain and fades ride in clip metadata because OTIO has no audio level field.`
+  }
+  return `Premiere Pro (File > Import) and Resolve (File > Import Timeline) see a ${result.tracks} track sequence ` +
+    `at ${result.frameRateLabel} with ${result.events} audio clipitem(s); frame-accurate, gain by Audio Levels filter.`
 }
 
 /* ----------------------------------------------------------------- tools -- */
@@ -390,28 +659,28 @@ function dawLine (format, result, entries) {
 export function registerDawTools (ctx) {
   ctx.tools.register({
     name: 'audio_daw',
-    description: 'Export a cue set or a stem set as a project a real editor can open: a CMX3600 EDL cut list for a video editor, a REAPER .rpp project (the only format that keeps gain and fades), an RFC4180 CSV cue sheet, or Audacity labels. Use it when the work has to leave the plugin and be edited by a human, instead of being played back inside the page.',
+    description: 'Export a cue set or a stem set as a project a real editor can open: a CMX3600 EDL cut list, a REAPER .rpp project (the only format that keeps gain and fades natively), an RFC4180 CSV cue sheet, Audacity labels, an OpenTimelineIO .otio document or an FCP7 xmeml XML sequence (both of which Resolve and Premiere import), an AAF (MS-CFB container with a real object graph and embedded PCM, but no MetaDictionary — Pro Tools still refuses it), or an OMF skeleton (explicitly not importable). Use it when the work has to leave the plugin and be edited by a human instead of being played back inside the page.',
     parameters: {
       type: 'object',
       properties: {
         format: {
           type: 'string',
           enum: EXPORT_FORMATS,
-          description: 'edl=CMX3600 cut list for an NLE (one record track, cuts only: no gain, no fades, no overlaps); rpp=REAPER project, one track per stem with position, length, gain and fades (the least lossy); csv=spreadsheet/script cue sheet with every field; labels=Audacity label track.'
+          description: 'edl=CMX3600 cut list for an NLE (one record track, cuts only: no gain, no fades, no overlaps); rpp=REAPER project, one track per stem with position, length, gain and fades (the least lossy); csv=spreadsheet/script cue sheet with every field; labels=Audacity label track; aaf=AAF structural subset: valid CFB container, AAF class ids and property encodings, mob/slot timeline and embedded PCM, but no MetaDictionary so AAF SDK apps refuse it; omf=OMF skeleton (container + manifest only, NOT importable); otio=OpenTimelineIO JSON, sample accurate, one audio track per lane (Resolve/Nuke/premiere adapter); xmeml=Final Cut Pro 7 XML, frame accurate, Premiere and Resolve import it directly.'
         },
         cues: {
           type: 'array',
-          description: 'The cue set to export (edl, csv, labels, and rpp unless tracks is given): one entry per sound event on the timeline.',
+          description: 'The cue set to export (every format except rpp, which also takes tracks): one entry per sound event on the timeline.',
           items: {
             type: 'object',
             properties: {
               name: { type: 'string', description: 'Label of the cue; defaults to the file stem.' },
-              path: { type: 'string', description: 'Source .wav path, relative to the working directory or absolute. Required by edl and rpp; optional for csv and labels.' },
+              path: { type: 'string', description: 'Source .wav path, relative to the working directory or absolute. Required by edl, rpp and aaf; optional for csv, labels, otio, xmeml and omf.' },
               at: { type: 'number', description: 'Start on the animation timeline in seconds, >= 0.' },
-              duration: { type: 'number', description: 'Length in seconds, > 0. Required by edl; rpp measures the wav when it is missing.' },
-              gainDb: { type: 'number', description: 'Level trim in dB, -120..24. Carried by rpp and csv only; EDL has no level field.' },
-              fadeIn: { type: 'number', description: 'Fade-in seconds, >= 0. Carried by rpp and csv only.' },
-              fadeOut: { type: 'number', description: 'Fade-out seconds, >= 0. Carried by rpp and csv only.' }
+              duration: { type: 'number', description: 'Length in seconds, > 0. Required by edl; rpp and aaf measure the wav when it is missing.' },
+              gainDb: { type: 'number', description: 'Level trim in dB, -120..24. Carried by rpp, csv, xmeml (Audio Levels filter) and OTIO clip metadata; EDL and AAF have no level field here.' },
+              fadeIn: { type: 'number', description: 'Fade-in seconds, >= 0. Carried by rpp and csv; reported (not applied) by otio and xmeml.' },
+              fadeOut: { type: 'number', description: 'Fade-out seconds, >= 0. Carried by rpp and csv; reported (not applied) by otio and xmeml.' }
             },
             required: ['at'],
             additionalProperties: false
@@ -436,9 +705,11 @@ export function registerDawTools (ctx) {
           }
         },
         out: { type: 'string', description: 'Output path, relative to the working directory. Defaults to assets/audio/<format>-<hash>.<ext>.' },
-        frameRate: { type: 'number', description: 'edl only: 24 (default), 25, 30 or 29.97 (drop-frame). 23.976 is written as 24 with a warning; 59.94 cannot be expressed in CMX3600.' },
+        frameRate: { type: 'number', description: 'edl and xmeml only: 24 (edl default), 25 (xmeml default), 30, 50, 60 or 29.97 (drop-frame). EDL maps 23.976 to 24 with a warning; xmeml accepts 23.976 and 29.97 as NTSC.' },
         bpm: { type: 'number', description: 'rpp only: project tempo 20..300; defaults to 120.' },
-        sampleRate: { type: 'integer', description: 'rpp only: project sample rate 8000..96000; defaults to 44100.' }
+        sampleRate: { type: 'integer', description: 'rpp: project sample rate 8000..96000, defaults to 44100. aaf: project edit rate (timeline positions in samples), defaults to the first embedded clip. otio/xmeml: declared media sample rate, defaults to 48000.' },
+        embed: { type: 'boolean', description: 'aaf only: embed the PCM in the file (default true). Pass false to write an offline timeline that only describes the clips.' },
+        title: { type: 'string', description: 'aaf/otio/xmeml/omf only: timeline name written into the project (default "dsh-audiokit timeline").' }
       },
       required: ['format'],
       additionalProperties: false
@@ -456,18 +727,27 @@ export function registerDawTools (ctx) {
       const frameRate = readNumber('audio_daw', 'frameRate', args.frameRate)
       const bpm = readNumber('audio_daw', 'bpm', args.bpm)
       const sampleRate = readNumber('audio_daw', 'sampleRate', args.sampleRate)
+      const embed = args.embed !== false
 
-      const plan = format === 'rpp' ? await planReaper(cwd, args) : planCues(cwd, args, format)
+      const plan = format === 'rpp'
+        ? await planReaper(cwd, args)
+        : format === 'aaf'
+          ? await planAaf(cwd, args, embed)
+          : format === 'otio' || format === 'xmeml'
+            ? await planTimed(cwd, args, format)
+            : planCues(cwd, args, format)
 
       // The hash covers the request, not the output path, so re-running the same
       // export lands on the same file. Display paths are cwd-relative and stay
       // stable across a session, which keeps the name stable too.
       const hash = hashSpec({
-        engine: 'daw/1',
+        engine: 'daw/2',
         format,
         frameRate: frameRate ?? null,
         bpm: bpm ?? null,
         sampleRate: sampleRate ?? null,
+        embed: BINARY_FORMATS.includes(format) ? embed : null,
+        title: args.title === undefined ? null : String(args.title),
         entries: plan.entries.map((entry) => [
           entry.name ?? null,
           entry.declared ?? null,
@@ -505,13 +785,23 @@ export function registerDawTools (ctx) {
             cues: plan.entries.map((entry) => ({
               name: entry.name,
               path: entry.declared,
-              at: entry.at,
+              // Absolute file URL: Premiere links xmeml media by <pathurl>, and
+              // a relative one would not resolve. Only xmeml uses it.
+              url: entry.absolute === undefined ? undefined : pathToFileURL(entry.absolute).href,
+              at: entry.at ?? entry.offsetSeconds,
               duration: entry.duration,
               gainDb: entry.gainDb,
               fadeIn: entry.fadeIn,
-              fadeOut: entry.fadeOut
+              fadeOut: entry.fadeOut,
+              pcm: entry.pcm,
+              // Wav format facts the AAF descriptor needs when PCM is embedded.
+              channels: entry.channels,
+              bitDepth: entry.bitDepth
             })),
-            frameRate
+            frameRate,
+            sampleRate,
+            title: args.title,
+            embed
           }
 
       let result
@@ -525,9 +815,17 @@ export function registerDawTools (ctx) {
         ? verifyEdl(result.text, plan.entries, result.frameRate)
         : format === 'rpp'
           ? verifyRpp(result.text, plan.entries)
-          : { events: result.events }
+          : format === 'aaf'
+            ? verifyAaf(result.buffer, plan.entries, embed && plan.entries.some((entry) => entry.pcm !== undefined))
+            : format === 'omf'
+              ? verifyOmf(result.buffer, plan.entries)
+              : format === 'otio'
+                ? verifyOtio(result.text, plan.entries)
+                : format === 'xmeml'
+                  ? verifyXmeml(result.text, plan.entries)
+                  : { events: result.events }
 
-      const bytes = Buffer.from(result.text, 'utf8')
+      const bytes = result.buffer === undefined ? Buffer.from(result.text, 'utf8') : result.buffer
       await writeFileAtomic(target, bytes)
       const info = await stat(target)
 
@@ -552,12 +850,26 @@ export function registerDawTools (ctx) {
         verified,
         warnings,
         warningsOmitted: omitted,
+        binary: BINARY_FORMATS.includes(format),
         frameRate: result.frameRate,
         frameRateLabel: result.frameRateLabel,
         recordStart: result.recordStart,
         trackType: result.trackType,
         sampleRate: result.sampleRate,
         bpm: result.bpm,
+        // Format-specific extras: present only for the formats that report them.
+        rate: result.rate,
+        tracks: result.tracks,
+        lanes: result.lanes,
+        objects: result.objects,
+        timebase: result.timebase,
+        ntsc: result.ntsc,
+        frames: result.frames,
+        embeddedBytes: result.embeddedBytes,
+        importable: result.importable,
+        skeleton: result.skeleton,
+        capabilities: result.capabilities,
+        structure: result.structure,
         text: lines.join('\n')
       }
     },

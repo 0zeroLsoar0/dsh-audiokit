@@ -81,7 +81,12 @@ const REQUIRED = [
   'sci-fi-charge', 'sci-fi-hum-loop', 'magic-sparkle', 'magic-dark',
   'water-drip', 'water-splash', 'footstep-gravel', 'cloth-rustle',
   'ui-success', 'ui-error', 'ui-hover', 'machinery-loop',
-  'creature-scream', 'creature-growl', 'heartbeat', 'alarm-loop'
+  'creature-scream', 'creature-growl', 'heartbeat', 'alarm-loop',
+  // the creature family: its own test (test/creatures.mjs) checks the zoology,
+  // this list only guarantees the ids cannot silently leave the vocabulary.
+  'bird-chirp', 'bird-flock', 'insect-swarm', 'whale-song', 'wolf-howl',
+  'frog-croak', 'hoofbeats', 'wing-flap', 'creature-breath', 'creature-hiss',
+  'rodent-squeak', 'bat-echolocation'
 ]
 const missing = REQUIRED.filter((id) => RECIPES[id] === undefined)
 check('required vocabulary present', missing.length === 0, `missing ${missing.join(', ')}`)

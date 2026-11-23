@@ -11,6 +11,8 @@
 # 依赖与生成物
 dsh-audio/node_modules/
 dsh-audio/test/out/
+dsh-audio/assets/
+dsh-audio/auto/
 *.tgz
 *.log
 .DS_Store

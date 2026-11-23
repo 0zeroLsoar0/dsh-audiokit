@@ -25,6 +25,7 @@ import { registerBusTools } from './lib/tools-bus.js'
 import { registerComposeTools } from './lib/tools-compose.js'
 import { registerConvertTools } from './lib/tools-convert.js'
 import { registerDesignTools } from './lib/tools-design.js'
+import { registerEditorRoute } from './lib/editor-route.js'
 import { registerGraphTools } from './lib/tools-graph.js'
 import { registerDawTools } from './lib/tools-daw.js'
 import { registerLoudnessTools } from './lib/tools-loudness.js'
@@ -64,7 +65,7 @@ const PROMPT_SECTION = [
   '- one hit, texture or foley sound → `audio_synth` (38 presets; deterministic, same seed = same bytes)',
   '- a sound no preset covers → `audio_synth_graph` (write the synthesis graph yourself: osc/noise/filter/env/LFO/FM/drive/reverb)',
   '- many events from one rule (typing, rain, accelerating ticks) → `audio_pattern`',
-  '- a designed object ("metal door slam", "magic sparkle") → `audio_design` (26 layered recipes)',
+  '- a designed object ("metal door slam", "magic sparkle") → `audio_design` (38 layered recipes)',
   '- your own recorded wav, pitched and mapped across a keyboard → `audio_sampler` (no bundled assets)',
   '- combining rendered files into one cue → `audio_mix` (per-track gain and time offsets)',
   '- music: a cue with harmony and a groove → `audio_compose` (8 genres, returns beat times for sync)',
@@ -78,7 +79,7 @@ const PROMPT_SECTION = [
   '- EQ / compression / ducking on a cue set → `audio_bus`; exchange scores with a DAW → `audio_midi`',
   '- a sound that must come from a direction, or a file wider than stereo → `audio_spatial`',
   '- the final deliverable is a video → `audio_mux` (probe, mux, shot-cut times, extract)',
-  '- handing the work to a DAW or editor → `audio_daw` (EDL, Reaper project, CSV, labels)',
+  '- handing the work to a DAW or editor → `audio_daw` (EDL, Reaper project, CSV, labels, OpenTimelineIO, FCP7 xmeml; AAF/OMF are structural exports)',
   '- a mouth track without any voice audio (captions, silent comics) → `audio_mouth`',
   '- what a sound is made of: f0, harmonics, formants, noise, decay → `audio_analyze`',
   '- fixing an existing file: trim/join/fade/re-encode → `audio_convert`; retime or transpose → `audio_stretch`',
@@ -123,6 +124,11 @@ export function apply (ctx, config = {}) {
   registerDawTools(ctx)
   registerStretchTools(ctx)
   registerSettingsRoute(ctx, config, VERSION)
+  // The cue editor is a page, not a tool: a URL the user can open to drag cues
+  // on a waveform and export a cue sheet for audio_bind / audio_daw. Registered
+  // like the settings endpoints, so a composition without a web carrier simply
+  // does not serve it.
+  registerEditorRoute(ctx, VERSION)
 
   // Optional seams: resolved through `ctx.get` so the plugin still activates in
   // a composition that does not mount them. `ctx.skills` would throw without a

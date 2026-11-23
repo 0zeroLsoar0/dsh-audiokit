@@ -5,7 +5,7 @@
  * Cue sets and stems are assembled elsewhere in this plugin (`audio_bind`,
  * `audio_stems`), but until now the result could only be played back inside the
  * page or read back through `audio_probe`. A human who wants to *edit* the work
- * needs a project file. Four formats, four audiences:
+ * needs a project file. Eight formats, five audiences:
  *
  * - CMX3600 EDL — a cut list an NLE (Resolve, Premiere, Avid) imports. One
  *   record track, cut events only: no levels, no fades, no overlapping events.
@@ -17,32 +17,52 @@
  *   the reason this module parses `.RPP` back as well as writing it.
  * - CSV — an RFC4180 cue sheet for spreadsheets and scripts.
  * - Audacity labels — the annotation track of an audio editor.
+ * - AAF (`lib/aaf.js`) and OMF (`lib/omf.js`) — the Avid/Pro Tools interchange
+ *   formats. Both are MS-CFB containers: AAF is written as a documented
+ *   structural subset (container, object graph and embedded PCM are real, the
+ *   self-describing MetaDictionary layer is not), OMF is a labelled skeleton.
+ * - OpenTimelineIO `.otio` (`lib/otio.js`) and FCP7 `xmeml` XML
+ *   (`lib/xmeml.js`) — the two formats Resolve and Premiere open today, one
+ *   JSON and sample-accurate, the other frame based and NLE-native.
  *
  * Everything here is pure and deterministic: no clock, no locale, no
  * `Math.random`, `\n` line endings only, and every number is formatted by hand
  * (never `toLocaleString`), so the same request always produces the same bytes.
  * The module reads no file and owns no state, which is why the caller supplies
  * the item duration the writer needs to place it on a timeline (the tool layer
- * measures the wav header for that).
+ * measures the wav header for that) and, for AAF, the PCM to embed.
  *
  * Text policy, because two of these formats are legacy byte formats:
  * - generated content (title, keywords, comments) is pure ASCII;
- * - user text (a cue name, a path) is preserved as UTF-8 in CSV, labels and
- *   RPP, all of which are UTF-8 formats;
+ * - user text (a cue name, a path) is preserved as UTF-8 in CSV, labels, RPP,
+ *   OTIO and xmeml, all of which are UTF-8 formats;
  * - EDL fields are forced to ASCII (`?` for anything else) and the loss is
  *   reported as a warning, since CMX3600 predates text encoding entirely.
  */
 
 import { basename } from 'node:path'
 import { dbToGain } from './dsp.js'
+import { exportAaf } from './aaf.js'
+import { exportOmf } from './omf.js'
+import { exportOtio } from './otio.js'
+import { exportXmeml } from './xmeml.js'
 
 /* --------------------------------------------------------------- constants -- */
 
-/** The four export formats, in the order the tool documents them. */
-export const EXPORT_FORMATS = Object.freeze(['edl', 'rpp', 'csv', 'labels'])
+/** The eight export formats, in the order the tool documents them. */
+export const EXPORT_FORMATS = Object.freeze(['edl', 'rpp', 'csv', 'labels', 'aaf', 'omf', 'otio', 'xmeml'])
 
 /** Extension each format is normally written with. */
-export const EXPORT_EXTENSIONS = Object.freeze({ edl: 'edl', rpp: 'rpp', csv: 'csv', labels: 'txt' })
+export const EXPORT_EXTENSIONS = Object.freeze({
+  edl: 'edl',
+  rpp: 'rpp',
+  csv: 'csv',
+  labels: 'txt',
+  aaf: 'aaf',
+  omf: 'omf',
+  otio: 'otio',
+  xmeml: 'xml'
+})
 
 /**
  * Frame rates a CMX3600 EDL can be written at.
@@ -990,30 +1010,55 @@ export function exportLabels (request = {}) {
 /* --------------------------------------------------------------- dispatch -- */
 
 /**
- * Export a project in one of the four formats.
+ * The exporter behind each format name.
+ *
+ * A table instead of a chain of ternaries: the keys have to match
+ * `EXPORT_FORMATS`, and `exportProject` resolves both the name and the extension
+ * from the same list, so a format cannot be advertised without an implementation.
+ * The FCP7 writer resolves its own frame rate (it has its own default of 25 fps
+ * and its own accepted set including 50/60/23.976), which is why the raw request
+ * is passed through untouched.
+ */
+const EXPORTERS = Object.freeze({
+  edl: exportEdl,
+  rpp: exportReaper,
+  csv: exportCsv,
+  labels: exportLabels,
+  aaf: exportAaf,
+  omf: exportOmf,
+  otio: exportOtio,
+  xmeml: exportXmeml
+})
+
+/**
+ * Export a project in one of the eight formats.
  *
  * One entry point for the tool layer, so the format name, the extension and the
  * error message stay in one place. Every format returns the same envelope plus
  * its own extras; `text` is always `\n`-terminated and `bytes` is its UTF-8
- * length on disk.
+ * length on disk — except the binary formats (`aaf`, `omf`), which return a
+ * `buffer` instead and set `binary: true`, because a container format is not a
+ * string and pretending otherwise would corrupt it.
  *
  * @param {object} request - `{ format, ... }`, where the rest is the argument
- *   object of the chosen exporter (`cues` for edl/csv/labels, `tracks` for rpp).
- * @param {'edl'|'rpp'|'csv'|'labels'} request.format - which project to write.
- * @returns {{ text: string, bytes: number, format: string, extension: string,
- *   warnings: string[], events: number, durationSeconds: number }}
+ *   object of the chosen exporter (`cues` for most, `tracks` for rpp).
+ * @param {'edl'|'rpp'|'csv'|'labels'|'aaf'|'omf'|'otio'|'xmeml'} request.format
+ * @returns {{ text?: string, buffer?: Buffer, binary: boolean, bytes: number,
+ *   format: string, extension: string, warnings: string[], events: number,
+ *   durationSeconds: number }}
  */
 export function exportProject (request = {}) {
   const requested = request.format === undefined || request.format === null ? '' : String(request.format).trim().toLowerCase()
   if (!EXPORT_FORMATS.includes(requested)) {
     fail('daw', `format must be one of ${EXPORT_FORMATS.join(', ')}, got ${describeValue(request.format)}`)
   }
-  const result = requested === 'edl'
-    ? exportEdl(request)
-    : requested === 'rpp'
-      ? exportReaper(request)
-      : requested === 'csv'
-        ? exportCsv(request)
-        : exportLabels(request)
-  return { ...result, format: requested, extension: EXPORT_EXTENSIONS[requested] }
+  const result = EXPORTERS[requested](request)
+  const binary = Buffer.isBuffer(result.buffer)
+  return {
+    ...result,
+    binary,
+    bytes: binary ? result.buffer.length : Buffer.byteLength(result.text, 'utf8'),
+    format: requested,
+    extension: EXPORT_EXTENSIONS[requested]
+  }
 }

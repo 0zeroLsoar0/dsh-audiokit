@@ -227,7 +227,7 @@ expectError('bad record start', /is not valid at/, () => exportEdl({ cues: CUES,
 expectError('record start past 24 hours', /recordStart must be less than 24 hours/, () => exportEdl({ cues: CUES, recordStart: 86400 }))
 expectError('timecode past 24 hours', /cannot express 24 hours/, () => secondsToTimecode(86400, 25))
 expectError('timeline ending exactly at 24 hours', /beyond the 24 hour limit/, () => exportEdl({ cues: [{ name: 'day', path: 'x.wav', at: 0, duration: 86400 }], recordStart: 0 }))
-expectError('unknown format', /format must be one of edl, rpp, csv, labels/, () => exportProject({ format: 'aaf', cues: CUES }))
+expectError('unknown format', /format must be one of edl, rpp, csv, labels, aaf, omf, otio, xmeml/, () => exportProject({ format: 'mxf', cues: CUES }))
 
 /* ------------------------------------------------------------------------ rpp -- */
 
@@ -390,25 +390,38 @@ check('a cue without duration warns', point.warnings.some((warning) => /no durat
 /* -------------------------------------------------------------- determinism -- */
 
 console.log('\n-- determinism and byte counts --')
+// Every format goes through `exportProject`, so this loop proves the dispatch,
+// the extension table and the byte count together. The two container formats
+// (aaf, omf) return a Buffer instead of text, so the comparison switches on
+// `binary` rather than assuming a string; aaf runs offline here (embed: false)
+// to keep the old test file from writing megabytes of PCM.
 const builders = {
-  edl: () => exportEdl({ cues: CUES, frameRate: 25 }),
-  rpp: () => exportReaper({ tracks: TRACKS, sampleRate: 44100, bpm: 120 }),
-  csv: () => exportCsv({ cues: CUES }),
-  labels: () => exportLabels({ cues: CUES })
+  edl: () => exportProject({ format: 'edl', cues: CUES, frameRate: 25 }),
+  rpp: () => exportProject({ format: 'rpp', tracks: TRACKS, sampleRate: 44100, bpm: 120 }),
+  csv: () => exportProject({ format: 'csv', cues: CUES }),
+  labels: () => exportProject({ format: 'labels', cues: CUES }),
+  aaf: () => exportProject({ format: 'aaf', cues: CUES, embed: false }),
+  omf: () => exportProject({ format: 'omf', cues: CUES }),
+  otio: () => exportProject({ format: 'otio', cues: CUES }),
+  xmeml: () => exportProject({ format: 'xmeml', cues: CUES, frameRate: 25 })
 }
+const EXTENSIONS = { labels: 'txt', xmeml: 'xml' }
 for (const format of EXPORT_FORMATS) {
   const first = builders[format]()
   const second = builders[format]()
-  const viaProject = format === 'rpp'
-    ? exportProject({ format, tracks: TRACKS, sampleRate: 44100, bpm: 120 })
-    : exportProject({ format, cues: CUES, frameRate: 25 })
-  check(`${format}: identical text across runs`, first.text === second.text)
-  check(`${format}: identical bytes across runs`, first.bytes === second.bytes)
-  check(`${format}: exportProject matches the exporter`, viaProject.text === first.text)
-  check(`${format}: format name`, viaProject.format === format, viaProject.format)
-  check(`${format}: extension`, viaProject.extension === (format === 'labels' ? 'txt' : format), viaProject.extension)
-  check(`${format}: byte count equals the utf-8 length`, first.bytes === Buffer.byteLength(first.text, 'utf8'), `${first.bytes}`)
-  console.log(`  ${format.padEnd(6)} ${String(first.text.length).padStart(5)} chars  ${String(first.bytes).padStart(5)} bytes  ${String(first.events).padStart(2)} events  ${first.durationSeconds}s`)
+  check(`${format}: format name`, first.format === format, first.format)
+  check(`${format}: extension`, first.extension === (EXTENSIONS[format] ?? format), first.extension)
+  check(`${format}: binary flag`, first.binary === (format === 'aaf' || format === 'omf'), String(first.binary))
+  if (first.binary) {
+    check(`${format}: identical bytes across runs`, Buffer.compare(first.buffer, second.buffer) === 0)
+    check(`${format}: buffer byte count`, first.bytes === first.buffer.length, `${first.bytes} vs ${first.buffer.length}`)
+    console.log(`  ${format.padEnd(6)} ${String(first.buffer.length).padStart(5)} bytes (binary)  ${String(first.events).padStart(2)} events  ${first.durationSeconds}s`)
+  } else {
+    check(`${format}: identical text across runs`, first.text === second.text)
+    check(`${format}: identical bytes across runs`, first.bytes === second.bytes)
+    check(`${format}: byte count equals the utf-8 length`, first.bytes === Buffer.byteLength(first.text, 'utf8'), `${first.bytes}`)
+    console.log(`  ${format.padEnd(6)} ${String(first.text.length).padStart(5)} chars  ${String(first.bytes).padStart(5)} bytes  ${String(first.events).padStart(2)} events  ${first.durationSeconds}s`)
+  }
 }
 
 console.log('\n-- files written to test/out/daw --')
@@ -432,7 +445,7 @@ const call = (args) => tool.execute(args, exec)
 check('audio_daw is registered', tool !== undefined && tool.name === 'audio_daw', String(tool?.name))
 check('tool is concurrency safe', tool.isConcurrencySafe === true)
 check('tool requires a format', (tool.parameters.required ?? []).includes('format'))
-check('format enum has all four', JSON.stringify(tool.parameters.properties.format.enum) === JSON.stringify(EXPORT_FORMATS))
+check('format enum matches EXPORT_FORMATS', JSON.stringify(tool.parameters.properties.format.enum) === JSON.stringify(EXPORT_FORMATS))
 check('cues schema names every field', ['name', 'path', 'at', 'duration', 'gainDb', 'fadeIn', 'fadeOut'].every((key) => tool.parameters.properties.cues.items.properties[key] !== undefined))
 check('tracks schema names every field', ['name', 'path', 'offsetSeconds', 'duration', 'gainDb', 'fadeIn', 'fadeOut'].every((key) => tool.parameters.properties.tracks.items.properties[key] !== undefined))
 
@@ -487,7 +500,7 @@ check('tool: default path has the format extension', defaulted.relativePath.ends
 
 console.log('\n-- tool: errors --')
 for (const [label, pattern, args] of [
-  ['bad format', /format must be one of edl, rpp, csv, labels/, { format: 'aaf', cues: CUES }],
+  ['bad format', /format must be one of edl, rpp, csv, labels, aaf, omf, otio, xmeml/, { format: 'mxf', cues: CUES }],
   ['cue without path', /has no path/, { format: 'edl', cues: [{ name: 'n', at: 0, duration: 1 }] }],
   ['missing cues', /needs cues/, { format: 'csv' }],
   ['missing media file', /cannot read .*nope\.wav/, { format: 'rpp', tracks: [{ path: 'nope.wav' }] }],

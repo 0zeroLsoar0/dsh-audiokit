@@ -54,10 +54,15 @@ const near = (actual, expected, tolerance = 1e-9) => Math.abs(actual - expected)
 /** Strictly increasing event times: two events at one instant are a bug. */
 const ascending = (events) => events.every((event, index) => index === 0 || event.time > events[index - 1].time)
 
-/** Measured on the pre-automation implementation; see the file header. */
+/**
+ * Measured on the pre-automation implementation; re-measured after the 0.5.10
+ * rename, because the generated banner names the product (`dsh-audio` ->
+ * `dsh-audiokit`) and that alone is +3 bytes. The two numbers below are the
+ * same code otherwise -- refreshing them keeps the regression meaningful.
+ */
 const BASELINE = {
-  allBytes: 16215,
-  allSha256: '9ea1496528af0a28dad46dfc155b3ffc7f640e52cb75fb7707f339d20cea268c',
+  allBytes: 16218,
+  allSha256: '80ad31010058b0867cd22f686f6aa7c635648ae956a8d4ff0ee8ae5faac06c01',
   impactEvents: 41,
   nodes: { impact: 26, whoosh: 14, tick: 6, chime: 22, riser: 18, zap: 18, thud: 14, scrap: 33, texture: 10 },
   defaultToolFile: 'live-1ad190b42332.js'
