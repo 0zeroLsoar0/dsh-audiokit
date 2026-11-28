@@ -86,25 +86,25 @@ function outputStem (requested) {
 export function registerReactTools (ctx) {
   ctx.tools.register({
     name: 'audio_react',
-    description: 'Render the sounds a UI makes (hover, press, success, error, typing, ...) as one palette-consistent set, and write a drop-in <out>.js that binds them to DOM events through data-sound attributes. Use this instead of audio_synth when the deliverable is interactive: the script never autoplays, decodes on the first gesture, and caps how loud a rapid repeat can stack.',
+    description: 'Render the sounds a UI makes (hover, press, success, error, typing, ...) as one palette-consistent set and write a drop-in <out>.js that binds them to DOM events through data-sound attributes. Never autoplays; decodes on the first gesture.',
     parameters: {
       type: 'object',
       properties: {
         interactions: {
           type: 'array',
           items: { type: 'string', enum: INTERACTION_CHOICES },
-          description: `Interaction ids to render. Omit or pass ["auto"] for the default set (${AUTO_INTERACTIONS.join(', ')}). Available: ${INTERACTION_IDS.join(', ')}.`
+          description: 'Interaction ids; omit or ["auto"] for the default nine (the skill lists all).'
         },
         palette: {
           type: 'string',
           enum: PALETTE_NAMES,
-          description: 'Style family shared by the whole set, so a page sounds like one product. soft=dark and rounded, crisp=bright and tight (default), organic=warm and slightly detuned, digital=thin high-passed blips, cinematic=low and spacious.'
+          description: 'Style family: soft, crisp (default), organic, digital or cinematic.'
         },
-        seed: { type: 'integer', description: 'Variation seed for the random surface (noise, partial levels). Same seed reproduces identical clip bytes; defaults to 1.' },
-        sampleRate: { type: 'integer', description: 'Render rate in Hz; defaults to 22050 because these are short blips and the script carries the clips (use 44100 or 48000 for video-grade audio).' },
-        out: { type: 'string', description: 'Output stem relative to the working directory; writes <out>.js and <out>.json. Defaults to assets/audio/react-<hash>.' },
-        inline: { type: 'boolean', description: 'Embed the clips as base64 inside the .js so the page needs no other files (defaults to true when the script fits maxBytes; otherwise the clips are written next to the script and the script fetches them).' },
-        maxBytes: { type: 'integer', description: `Inline script budget in bytes (positive); defaults to ${DEFAULT_MAX_INLINE_BYTES} (2 MB).` }
+        seed: { type: 'integer', description: 'Variation seed; same seed, same clip bytes; default 1.' },
+        sampleRate: { type: 'integer', description: 'Render rate; default 22050 (short blips carried in the script).' },
+        out: { type: 'string', description: 'Output stem; writes <out>.js and <out>.json; default assets/audio/react-<hash>.' },
+        inline: { type: 'boolean', description: 'Embed the clips in the .js as base64; default true when they fit maxBytes.' },
+        maxBytes: { type: 'integer', description: 'Inline script budget in bytes; default 2097152 (2 MB).' }
       },
       required: [],
       additionalProperties: false

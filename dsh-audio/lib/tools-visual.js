@@ -151,7 +151,7 @@ function renderSchema () {
   return {
     type: 'object',
     additionalProperties: false,
-    description: 'Inline render spec, used instead of path: render a preset first and analyse it in the same call. The same spec always renders identical samples.',
+    description: 'Inline render spec instead of path, rendered first.',
     properties: {
       preset: { type: 'string', enum: PRESET_NAMES, description: 'Preset to render before analysing.' },
       params: { type: 'object', additionalProperties: true, description: 'Preset knobs, same names as audio_synth.' },
@@ -168,18 +168,18 @@ function renderSchema () {
 export function registerVisualTools (ctx) {
   ctx.tools.register({
     name: 'audio_lipsync',
-    description: 'Analyse a voice/music file into a per-frame mouth track: for every animation frame it gives the viseme (AA, EH, EE, OH, OO, MM, FF, TH, SS, DD, none), a continuous jaw openness 0..1, the frame energy and whether the frame is voiced. Use it whenever a character talks or sings, then drive the mouth from the frames. Accepts an existing .wav (path) or renders a preset inline (render). Writes .json/.srt/.css/.ae when `out` is given; returns the first frames and the viseme counts. `includeWarnings` (default off) reports frames whose viseme was outside the whitelist.',
+    description: 'Analyse a voice file into a per-frame mouth track: viseme, jaw openness, frame energy and voiced flag, from a .wav or an inline render. Writes json/srt/css/ae. Use audio_mouth when there is only text.',
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Existing mono/stereo .wav, relative to the working directory or absolute. Omit when using render.' },
+        path: { type: 'string', description: 'Existing .wav, relative to cwd or absolute; omit when using render.' },
         render: renderSchema(),
-        fps: { type: 'integer', description: 'Animation frames per second, 12..120; must match the page or CSS track, defaults to 24.' },
-        format: { type: 'string', enum: LIPSYNC_FORMATS, description: 'json = full analysis, srt = cue sheet, css = keyframes (opacity steps + jaw scale, no @property), ae = After Effects time<TAB>shape paste. Defaults to json.' },
-        sensitivity: { type: 'number', description: 'Level scaling before classification, 0.25..4. Raise it for quiet dialogue, lower it for a mix that already peaks.' },
-        leadMs: { type: 'number', description: 'Analyse this many ms ahead of each frame so the picture leads the audio by the display latency; -200..200, defaults to 0.' },
-        includeWarnings: { type: 'boolean', description: 'Also return a warnings array (default false) for viseme labels outside the whitelist.' },
-        out: { type: 'string', description: 'Output path. Defaults to no file; when omitted the summary and first frames are still returned.' }
+        fps: { type: 'integer', description: 'Frames per second, 12..120; match the page or CSS track. Default 24.' },
+        format: { type: 'string', enum: LIPSYNC_FORMATS, description: 'json (default), srt, css or ae (After Effects paste).' },
+        sensitivity: { type: 'number', description: 'Level scaling before classification, 0.25..4; raise for quiet dialogue.' },
+        leadMs: { type: 'number', description: 'Analyse this many ms ahead so the picture leads the audio; -200..200.' },
+        includeWarnings: { type: 'boolean', description: 'Also return a warnings array; default false.' },
+        out: { type: 'string', description: 'Output path; without it the summary is still returned.' }
       },
       additionalProperties: false
     },
@@ -251,11 +251,11 @@ export function registerVisualTools (ctx) {
 
   ctx.tools.register({
     name: 'audio_beats',
-    description: 'Detect tempo, onsets and a beat grid in a music/rhythm file so animation can land on the beat. Returns bpm, confidence, the first beat times, a downbeat guess, the quarter/eighth-note grid, and a text line to plan against. Handles a steady click track, a rendered cue and a track with a silent intro (beat times stay absolute). Accepts an existing .wav (path) or renders a preset inline (render). Writes the JSON grid when `out` is given.',
+    description: 'Detect tempo, onsets and a beat grid in a music/rhythm file so animation can land on the beat. Returns bpm, confidence, beat times, a downbeat guess and the quarter/eighth grid; writes the grid as JSON when `out` is given.',
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Existing mono/stereo .wav, relative to the working directory or absolute. Omit when using render.' },
+        path: { type: 'string', description: 'Existing .wav, relative to cwd or absolute; omit when using render.' },
         render: renderSchema(),
         beatsPerBar: { type: 'integer', description: 'Metre used for bar/downbeat numbering, 1..12; defaults to 4.' },
         maxGrid: { type: 'integer', description: 'Cap on grid entries (quarter + eighth positions); defaults to 512.' },

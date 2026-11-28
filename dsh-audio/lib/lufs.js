@@ -19,12 +19,24 @@
  * derivation reproduces the coefficients printed in the standard bit for bit,
  * which is the regression anchor for the whole module.
  *
- * Reading convention: a mono file is measured as *dual mono* (its power counts
- * twice), because that is how a mono asset is played - both speakers - and how
- * a stereo file's two channels would sum. This makes a -23 dBFS 997 Hz sine
- * read -23.0 LUFS, the EBU Tech 3341 calibration point, for both a stereo file
- * and the mono renders this plugin writes. Pass `{ dualMono: false }` for the
- * strict single-channel BS.1770 value, which is 3.01 LU lower.
+ * Reading convention: a single-channel signal is measured with the standard
+ * BS.1770-4 weight of 1.0, exactly as ffmpeg's `ebur128` filter and the usual
+ * broadcast meters read a mono file, so a mono render and a stereo render of
+ * the same material can be compared with any external meter. (This module used
+ * to count a mono channel twice - "dual mono", +3.01 LU - which made every mono
+ * file read 3 LU louder than ffmpeg, and made a mono master tuned to -23 LUFS
+ * actually measure -26 LUFS in the player. That convention is still available
+ * per call as `{ dualMono: true }` for callers that have historical mono
+ * numbers to compare against.)
+ *
+ * Consequences worth knowing:
+ *   - a stereo file is unchanged: two channels at weight 1.0 each, so the EBU
+ *     Tech 3341 reference (997 Hz at -23 dBFS per channel) still reads -23.0
+ *     LUFS, and every stereo/multichannel reading is bit-for-bit what it was;
+ *   - a mono file at -20 dBFS *peak* reads -23.0 LUFS, because a sine's RMS is
+ *     3.01 dB below its peak and BS.1770 loudness is an RMS measure. A mono
+ *     sine whose RMS is -20 dBFS reads -20.0 LUFS. The target is a property of
+ *     the file's loudness, not of its peak.
  */
 
 import { clamp } from './dsp.js'
@@ -34,7 +46,9 @@ import { clamp } from './dsp.js'
 /**
  * BS.1770 gating offset. A 997 Hz sine applied to every channel at 0 dBFS
  * reads 0 LUFS; the offset cancels the +0.691 dB the K-filter has at 997 Hz.
- * The same number is the reason a -23 dBFS dual-mono sine reads -23.0 LUFS.
+ * A mono file follows the same per-channel K-weighting, so its single channel
+ * counts once (BS.1770-4); `{ dualMono: true }` restores the old playback
+ * convention that counted it twice.
  */
 const LOUDNESS_OFFSET = -0.691
 
@@ -63,8 +77,9 @@ const BLOCK_HOPS = 4
 const SHORT_TERM_HOPS = 30
 
 /**
- * A single channel is counted twice (dual mono). See the module header: this is
- * the playback convention that makes mono and stereo readings comparable.
+ * A single channel counted twice: the *optional* legacy playback convention
+ * (`{ dualMono: true }`), not the default. See the module header: the default
+ * is the BS.1770-4 per-channel weight of 1.0, which is what ffmpeg measures.
  */
 const DUAL_MONO_WEIGHT = 2
 
@@ -339,8 +354,10 @@ function samplePeakDbfs (samples) {
  * @param {number[]} [options.weights] - per-channel weight applied to the
  *   summed power, parallel to `options.channels`. BS.1770-4 uses 1.0 for L/R/C
  *   and 1.41 for each surround channel; omitted means equal weight.
- * @param {boolean} [options.dualMono=true] - count a single-channel signal
- *   twice (playback on both speakers). Set false for strict single-channel.
+ * @param {boolean} [options.dualMono=false] - count a single-channel signal
+ *   twice, the plugin's historical mono convention (+3.01 LU). Off by default:
+ *   a mono file is measured with the standard BS.1770-4 weight of 1.0, the same
+ *   number ffmpeg's `ebur128` reports. Has no effect on 2+ channel signals.
  * @returns {{ integratedLufs: number, shortTermMaxLufs: number, loudnessRangeLu: number,
  *   truePeakDbtp: number, samplePeakDbfs: number, gatedBlocks: number, durationSeconds: number,
  *   momentaryMaxLufs: number, relativeGateLufs: number, blocksMeasured: number,
@@ -377,10 +394,15 @@ export function analyzeLoudness (samples, sampleRate, options = {}) {
     weights.push(weight)
   }
   const frames = Math.min(...channelList.map((channel) => channel.length))
-  const dualMono = options.dualMono !== false
+  // BS.1770-4 weights every channel of the measure; a mono file therefore
+  // counts its one channel once. `dualMono: true` is the opt-in legacy
+  // convention that counts it twice (+3.01 LU). A 2+ channel signal is never
+  // affected by this switch, which is what keeps stereo/surround readings
+  // byte-identical to what they have always been.
+  const dualMono = options.dualMono === true
   const channelWeight = channelList.length === 1 && dualMono ? DUAL_MONO_WEIGHT : 1
-  // One weight per channel: the dual-mono convention for a single channel times
-  // the caller's BS.1770 surround weighting.
+  // One weight per channel: the optional dual-mono convention for a single
+  // channel times the caller's BS.1770 surround weighting.
   const channelWeights = weights.map((weight) => channelWeight * weight)
 
   const hopFrames = Math.max(1, Math.round(rate * HOP_SECONDS))

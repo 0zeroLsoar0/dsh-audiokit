@@ -121,19 +121,19 @@ function guardPeak (samples) {
 export function registerStretchTools (ctx) {
   ctx.tools.register({
     name: 'audio_stretch',
-    description: 'Change how long a sound lasts without changing its pitch (or shift its pitch without changing its length). Use it when the audio and the picture disagree about time: fit a 6 s cue onto a 4.3 s shot, retime a loop from 100 to 125 bpm, or nudge a voice up a couple of semitones. WSOLA time-domain stretching, so a stretch keeps pitch and a pitch shift keeps duration; formants move with pitch.',
+    description: 'Change how long a sound lasts without changing its pitch, or shift its pitch without changing its length (WSOLA). Use it when audio and picture disagree about time; formants move with a pitch shift.',
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Source .wav, relative to the working directory or absolute. Give this or render, not both. Multi-channel files are summed to mono.' },
+        path: { type: 'string', description: 'Source .wav; multichannel is summed to mono. Give this or render.' },
         render: {
           type: 'object',
           additionalProperties: true,
-          description: 'Inline render instead of a file: { preset, params, duration, seed, loop } exactly as audio_synth accepts. Give this or path, not both.'
+          description: 'Inline render { preset, params, duration, seed, loop }; give this or path.'
         },
-        factor: { type: 'number', description: `Output length divided by input length: 0.5 = half as long (twice the tempo), 2 = twice as long. Range ${STRETCH_LIMITS.minFactor}..${STRETCH_LIMITS.maxFactor}. Give exactly one of factor, targetSeconds, semitones.` },
-        targetSeconds: { type: 'number', description: 'Stretch so the result is exactly this long — e.g. fit a 6 s cue onto a 4.3 s shot. Pitch is kept.' },
-        semitones: { type: 'number', description: `Pitch shift in semitones (-${STRETCH_LIMITS.maxSemitones}..${STRETCH_LIMITS.maxSemitones}) with the duration preserved. +12 = one octave up, same length.` },
+        factor: { type: 'number', description: 'Output/input length ratio, 0.25..4; give exactly one of factor, targetSeconds, semitones.' },
+        targetSeconds: { type: 'number', description: 'Stretch to exactly this many seconds; pitch is kept.' },
+        semitones: { type: 'number', description: 'Pitch shift in semitones (-24..24) with the duration preserved.' },
         sampleRate: { type: 'integer', description: 'Sample rate for an inline render (default 44100). A path input keeps the file\'s own rate.' },
         out: { type: 'string', description: 'Output path; defaults to assets/audio/stretch-<hash>.wav.' }
       },

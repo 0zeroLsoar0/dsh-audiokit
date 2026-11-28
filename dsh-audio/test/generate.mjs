@@ -127,6 +127,7 @@ const BEHAVIORS = Object.freeze([
   'oversize-chunked',
   'http-404',
   'http-500',
+  'http-500-echo-auth',
   'silent'
 ])
 
@@ -200,6 +201,20 @@ async function handle (fake, request, response) {
   }
   if (behavior === 'http-404') return sendJson(response, 404, { error: { message: 'model not found', code: 'model_not_found' } })
   if (behavior === 'http-500') return sendJson(response, 500, { error: { message: 'internal server error' } })
+  if (behavior === 'http-500-echo-auth') {
+    // A misconfigured gateway copies the failing request back, headers included.
+    // The body is the one attacker-shaped part of a response, so this is the
+    // exact shape that used to write a live key into the error message.
+    const authorization = String(request.headers.authorization ?? '')
+    const key = authorization.replace(/^Bearer\s+/i, '')
+    return sendJson(response, 500, {
+      error: {
+        message: 'upstream gateway rejected the request',
+        request: { headers: { Authorization: authorization, 'X-Api-Key': key } },
+        token: key
+      }
+    })
+  }
   return sendBytes(response, 200, 'audio/wav', CLIP.bytes)
 }
 
@@ -521,6 +536,33 @@ async function httpErrorSection (fake) {
   check('500 keeps the status', serverError?.status === 500, String(serverError?.status))
   check('500 error is readable, not undefined',
     typeof serverError?.message === 'string' && /internal server error/.test(serverError.message), serverError?.message)
+
+  // The red-team reproduction: an endpoint that echoes the failing request back
+  // (Authorization header included) must not turn the error text into a key leak.
+  // The body is the untrusted part of a provider failure, so it is the part that
+  // has to be sanitised before it reaches a log line or the model.
+  const echoKey = 'sk-echo-leak-0123456789abcdef'
+  const echoResolved = resolveGenerateConfig({
+    generate: { baseUrl: fake.url, apiKey: echoKey, apiKeyEnv: '' }
+  })
+  fake.setBehavior('http-500-echo-auth')
+  const echoed = await caught(() => generateAudio(echoResolved, { prompt: 'echo the key', duration: 1 }))
+  console.log(`  echoed 500 -> ${echoed?.message}`)
+  check('the echoing endpoint really did receive the key',
+    fake.requests.at(-1)?.headers.authorization === `Bearer ${echoKey}`,
+    String(fake.requests.at(-1)?.headers.authorization))
+  check('an echoing 500 is still http-5xx with its status',
+    echoed?.reasonCode === 'http-5xx' && echoed?.status === 500, `${echoed?.reasonCode}/${echoed?.status}`)
+  check('the echo error keeps the host/status/reasonCode part',
+    /HTTP 500/.test(echoed?.message ?? '') && /http-5xx/.test(echoed?.message ?? ''), echoed?.message)
+  check('the echoed key never appears in the error text',
+    !(echoed?.message ?? '').includes(echoKey), echoed?.message)
+  check('no Bearer token or sk- key survives redaction',
+    !/Bearer\s+[A-Za-z0-9]/.test(echoed?.message ?? '') && !/\bsk-[A-Za-z0-9]{4,}/.test(echoed?.message ?? ''),
+    echoed?.message)
+  check('the response body is still reported, in redacted form',
+    /已隐去/.test(echoed?.message ?? ''), echoed?.message)
+  fake.setBehavior('http-500')
 }
 
 /* ---- 7. timeout ---- */
@@ -743,6 +785,17 @@ async function toolSection (fake) {
     await stat(join(cwd, 'gen/404.wav')).then(() => false, () => true), 'gen/404.wav exists')
   check('the 404 request did reach the server', fake.requests.length === before404 + 1,
     `${fake.requests.length - before404} request(s)`)
+
+  // The tool wrapper re-throws `classifyGenerateFailure(error).detail`: the
+  // redaction must already have happened inside the provider module, or the key
+  // comes back through the wrapper.
+  fake.setBehavior('http-500-echo-auth')
+  const echoToolError = await caught(() => tool.execute({ prompt: 'echo', out: 'gen/500.wav' }, exec))
+  console.log(`  tool 500 echo -> ${echoToolError?.message}`)
+  check('the tool-layer error of an echoing 500 leaks no key',
+    echoToolError?.reasonCode === 'http-5xx' && !String(echoToolError?.message ?? '').includes('tool-secret') &&
+    !/Bearer\s+[A-Za-z0-9]/.test(echoToolError?.message ?? ''),
+    echoToolError?.message)
   fake.setBehavior('wav')
 
   // An offline registry: configured endpoint but no key.

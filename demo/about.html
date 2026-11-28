@@ -60,7 +60,7 @@
   每次渲染都返回峰值、RMS、波峰因数、谱质心、起音数、循环接缝与 BS.1770 响度，
   于是 agent 能像调 CSS 一样调声音 —— 改参数、看数字、再听。</p>
   <div class="stats">
-    <div class="stat"><b>17</b><span>工具</span></div>
+    <div class="stat"><b>30</b><span>工具</span></div>
     <div class="stat"><b>38</b><span>合成音效预设</span></div>
     <div class="stat"><b>26</b><span>分层设计配方</span></div>
     <div class="stat"><b>8</b><span>作曲曲风</span></div>
@@ -82,31 +82,44 @@
   </div>
 </div>
 
-<h2><span class="num">02</span>17 个工具</h2>
+<h2><span class="num">02</span>30 个工具</h2>
 <table>
   <tr><th>工具</th><th>一句话</th></tr>
   <tr><td><code>audio_synth</code></td><td>渲染单个音效。38 个预设，参数是 0..1 的感知量（weight / hardness / metallic / space / tone …），可循环</td></tr>
+  <tr><td><code>audio_synth_graph</code></td><td>预设表写不出的声音：用 JSON 合成图描述振荡器 / 噪声 / 滤波 / 包络 / FM / 波形折叠 / 混响</td></tr>
   <tr><td><code>audio_pattern</code></td><td>一条规则铺满一段时间：等距、加速、随机撒点、上升扫频 —— 一次调用几百个事件</td></tr>
   <tr><td><code>audio_design</code></td><td>分层设计引擎，26 个配方（金属门砸、玻璃碎、远近爆炸、魔法、UI 一套、机械循环、生物、金币、远雷…）</td></tr>
+  <tr><td><code>audio_generate</code></td><td>接外部纯音频生成模型（OpenAI 兼容 / 自定义端点）；未配置时不可用，同一 prompt 每次是新 take</td></tr>
+  <tr><td><code>audio_sampler</code></td><td>用你自己的录音当乐器：变调、力度层、round-robin、循环、ADSR（插件不内置素材）</td></tr>
   <tr><td><code>audio_compose</code></td><td>作曲：8 曲风、12 调式、真和声与声部进行、段落强度曲线，返回节拍表给画面卡点</td></tr>
+  <tr><td><code>audio_midi</code></td><td>把作曲导出成 .mid 给 DAW / 记谱软件；也能读回 .mid 报速度、轨道与音符（不渲染音频）</td></tr>
   <tr><td><code>audio_tts</code></td><td>旁白：MiniMax / 任意 OpenAI 兼容端点 / <strong>免费免密钥的 Edge</strong>（318 音色、词级时间戳）</td></tr>
   <tr><td><code>audio_voices</code></td><td>音色列表（配置后是账号实时列表）</td></tr>
-  <tr><td><code>audio_sing</code></td><td>零素材唱声：共振峰合成，给音高与拼音歌词就能唱；可选接真人声库</td></tr>
   <tr><td><code>audio_lipsync</code></td><td>每帧口型轨（10 种 viseme + 连续张嘴量），可导出 json / srt / css / ae</td></tr>
+  <tr><td><code>audio_mouth</code></td><td>只给文本就生成口型轨，不需要音频；帧形状与 lipsync 一致，可驱动字幕/旁白嘴形</td></tr>
   <tr><td><code>audio_beats</code></td><td>从成品音乐测 bpm、起音、节拍网格、重拍推测</td></tr>
   <tr><td><code>audio_bind</code></td><td>生成 cue 表与页面播放器（音频时钟预调度、手势解锁、可见性暂停、单文件内联）</td></tr>
-  <tr><td><code>audio_mix</code></td><td>多轨合一，逐条增益与时间偏移</td></tr>
+  <tr><td><code>audio_react</code></td><td>一套风格统一的 UI 反馈音 + 按 <code>data-sound</code> 绑定 DOM 事件的脚本</td></tr>
+  <tr><td><code>audio_live</code></td><td>页面内实时合成脚本（零音频字节），可烘焙音高/滤波/增益/声像/发送的自动化</td></tr>
+  <tr><td><code>audio_mix</code></td><td>多轨合一（单声道），逐条增益与时间偏移</td></tr>
+  <tr><td><code>audio_bus</code></td><td>处理总线：逐轨高通/低通/钟形/搁架/压缩/侧链闪避 + 主控限制，可同时导出分轨</td></tr>
   <tr><td><code>audio_convert</code></td><td>裁剪 / 增益 / 淡入淡出 / 反转 / 拼接 / 批量归一 / 转码（8·16·24·32 位、单双声道、高保真重采样）</td></tr>
   <tr><td><code>audio_stretch</code></td><td>变速不变调、移调不变时长、精确贴合目标时长</td></tr>
+  <tr><td><code>audio_master</code></td><td>母带：三段压缩 + 中侧宽度 + 真峰值限制，自动收敛到 −14 / −16 / −23 LUFS 目标</td></tr>
   <tr><td><code>audio_loudness</code></td><td>BS.1770 LUFS、真峰值、响度范围，按目标响度写校正副本</td></tr>
   <tr><td><code>audio_probe</code></td><td>单文件度量：峰值、RMS、波峰因数、质心、起音、循环接缝、直流</td></tr>
+  <tr><td><code>audio_analyze</code></td><td>声学分析：基频与置信度、谐波、共振峰、噪声度、谱倾斜、衰减与起音形状</td></tr>
+  <tr><td><code>audio_spatial</code></td><td>空间化：把单声道放到立体声 / 双耳 / 4.0 / 5.1 / 7.1 / 一阶 Ambisonics，带方向与距离</td></tr>
+  <tr><td><code>audio_stems</code></td><td>分轨导出：每层一个 .wav + 一份等于其和的 master + manifest（时长/峰值/RMS/哈希）</td></tr>
+  <tr><td><code>audio_daw</code></td><td>把 cue/分轨导出给剪辑软件：EDL、REAPER .rpp、CSV、OTIO、FCP7 xmeml、AAF</td></tr>
+  <tr><td><code>audio_mux</code></td><td>视频桥：探测流、替换/混音/挂载音轨、抽取音频、切点列表（需要 ffmpeg）</td></tr>
   <tr><td><code>audio_check</code></td><td>交付前质量闸：削波、近静音、迟到的攻击、cue 时间轴、叠加峰值（可选语义提问）</td></tr>
   <tr><td><code>audio_regress</code></td><td>快照 + 容差比对，证明改动没把别的指标带歪</td></tr>
 </table>
 
 <h2><span class="num">03</span>三个别人不容易替代的点</h2>
 <div class="grid">
-  <div class="card"><h4>零依赖、零密钥可用</h4><p>合成、设计、作曲、唱声、口型/节拍、后期、检查都不需要联网或密钥；旁白还能选免费的 Edge。装进 profile 不需要任何 npm 安装。</p></div>
+  <div class="card"><h4>零依赖、零密钥可用</h4><p>合成、设计、作曲、口型/节拍、空间、母带、检查都不需要联网或密钥；旁白还能选免费的 Edge。装进 profile 不需要任何 npm 安装。</p></div>
   <div class="card"><h4>确定性可回归</h4><p>同一请求 → 同样字节；文件名由内容哈希决定。改一个参数，<code>audio_regress</code> 能精确告诉你哪一行指标坏了。</p></div>
   <div class="card"><h4>可测量，不需要耳朵</h4><p>响度对齐 ffmpeg（偏差 0.05 LU）、真峰值 4× 过采样、循环接缝三级度量。agent 不听也能收敛。</p></div>
 </div>
@@ -121,12 +134,14 @@ audio_design({ recipe: <span class="k">'door-slam-metal'</span> })
 <span class="c">// 16 小节 lofi 配乐（返回 beatMap 给画面卡点）</span>
 audio_compose({ genre: <span class="k">'lofi'</span>, bars: 16, key: <span class="k">'F'</span>, mode: <span class="k">'dorian'</span> })
 
-<span class="c">// 旁白（免费供应商）+ 字幕</span>
+<span class="c">// 旁白的字幕（免费供应商）</span>
 audio_tts({ text: <span class="k">'第一句。第二句。'</span>, srt: true })
 
-<span class="c">// 唱两句，再出口型轨</span>
-audio_sing({ melody: <span class="k">'C4:1 E4:1 G4:2 E4:1 D4:2'</span>, lyric: <span class="k">'wo ai ni'</span> })
-audio_lipsync({ path: <span class="k">'assets/audio/sing.wav'</span>, fps: 24, format: <span class="k">'css'</span> })
+<span class="c">// 只要口型：给文本，不需要音频</span>
+audio_mouth({ text: <span class="k">'给 HTML 动画加声音'</span>, bpm: 96, format: <span class="k">'css'</span> })
+
+<span class="c">// 或者从一段旁白 wav 反推口型轨</span>
+audio_lipsync({ path: <span class="k">'assets/audio/voice.wav'</span>, fps: 24, format: <span class="k">'css'</span> })
 
 <span class="c">// 接进页面：cue 表 + 播放器（可内联成单文件）</span>
 audio_bind({ cues: [{ name: <span class="k">'slam'</span>, at: 0.82, path: <span class="k">'assets/audio/door-slam-metal.wav'</span> }], out: <span class="k">'assets/cues'</span> })
@@ -148,8 +163,8 @@ audio_loudness({ path: <span class="k">'assets/audio/mix.wav'</span>, targetLufs
 
 <h2><span class="num">06</span>看看效果</h2>
 <div class="grid">
-  <div class="card"><h4>介绍动画（16 s）</h4><p><a href="intro/index.html">demo/intro/index.html</a><br>5 幕、8 段内联音频、单文件零请求。</p></div>
-  <div class="card"><h4>互动演示（17 s）</h4><p><a href="showcase.html">demo/showcase.html</a><br>lofi 配乐 + 唱声 + 口型 + 8 个 cue 全内联，headless Chrome 实跑通过。</p></div>
+  <div class="card"><h4>介绍动画（16 s）</h4><p><a href="intro/index.html">demo/intro/index.html</a><br>4 幕、4 段内联音频、单文件零请求。</p></div>
+  <div class="card"><h4>互动演示（38 s）</h4><p><a href="showall/index.html">demo/showall/index.html</a><br>lofi 配乐 + 口型 + 8 个 cue 全内联，headless Chrome 实跑通过。</p></div>
 </div>
 
 <h2><span class="num">07</span>安装与设置</h2>
@@ -166,7 +181,7 @@ dsh plugin --profile &lt;profile&gt; add <span class="k">"file:&lt;插件目录&
 </div>
 
 <footer>
-  <span>dsh-audio · 版本 0.5.9 · 零运行时依赖</span>
+  <span>dsh-audio · 版本 0.6.0 · 零运行时依赖</span>
   <span>MIT © 2026 Soar_L</span>
 </footer>
 

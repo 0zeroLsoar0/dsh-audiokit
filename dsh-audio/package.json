@@ -1,6 +1,6 @@
 {
   "name": "dsh-audiokit",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Sound effects for HTML animation: a deterministic synthesizer exposed as DSH tools, plus the workflow skill that makes an agent actually use it.",
   "license": "MIT",
   "author": "Soar_L",

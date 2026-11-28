@@ -7,8 +7,8 @@ import { fileURLToPath } from 'node:url'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const { decodeWav } = await import('file:///F:/Users/Administrator/Documents/deepseek-harness/default-workspace/dsh-audio-lab/plugin/lib/wav.js')
 const manifest = JSON.parse(readFileSync(join(HERE, 'manifest.json'), 'utf8'))
-const expect = { bed: 16.0, impact: 1.0, ticks: 4.0, voice: 3.0, end: 0.8 }
-const targetPeak = { bed: -6, impact: -1, ticks: -8, voice: -4, end: -3 }
+const expect = { bed: 16.0, impact: 1.0, ticks: 4.0, end: 0.8 }
+const targetPeak = { bed: -6, impact: -1, ticks: -8, end: -3 }
 
 let failures = 0
 let totalBytes = 0
@@ -37,7 +37,7 @@ for (const cue of manifest.cues) {
   if (!ok) failures += 1
   console.log(`${cue.name.padEnd(7)} sr=${sr} dur=${dur.toFixed(4)}(want ${expect[cue.name]}) peak=${peakDb.toFixed(2)}dBFS(want ${targetPeak[cue.name]}) clipped=${clipped} manifestClaim=${claimOk ? 'ok' : 'MISMATCH'} ${ok ? 'PASS' : 'FAIL'}`)
 }
-const total = 16 * manifest.sampleRate * 2 + 5 * 44
+const total = 16 * manifest.sampleRate * 2 + 4 * 44
 console.log(`sampleRate=${manifest.sampleRate} totalAudioBytes=${totalBytes} (${(totalBytes / 1024).toFixed(0)} KiB; 16 s mono16 = ${(total / 1024).toFixed(0)} KiB; budget 1229 KiB)`)
 console.log(`cue times: ${manifest.cues.map((c) => `${c.name}@${c.at}${c.loop ? ' loop' : ''}`).join(', ')}`)
 console.log(failures === 0 ? 'VERIFY: ALL PASS' : `VERIFY: ${failures} FAILURE(S)`)

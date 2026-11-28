@@ -76,7 +76,7 @@ function excerpt (value, limit) {
 function cueSchema () {
   return {
     type: 'array',
-    description: 'Timed caption spans, used instead of text: one entry per karaoke line. Text inside a line is spread across its duration; gaps between lines are closed mouth.',
+    description: 'Timed caption spans instead of text; one entry per karaoke line.',
     items: {
       type: 'object',
       additionalProperties: false,
@@ -94,20 +94,20 @@ function cueSchema () {
 export function registerMouthTools (ctx) {
   ctx.tools.register({
     name: 'audio_mouth',
-    description: 'Build a mouth track from text alone (a caption, a typewriter line, a silent comic): the same per-frame viseme/openness/energy shape audio_lipsync returns, so one page can drive both. Schedules one syllable per half beat, with a 190 ms floor so fast tempos stay legible (the slot never gets longer at a faster bpm), closes the mouth on punctuation, and writes json/srt/css/ae when `out` is given. Use it when there is no voice audio yet; use audio_lipsync when there is. `includeWarnings` (default off) returns the text notes and any viseme outside the whitelist.',
+    description: 'Build a mouth track from text alone (caption, typewriter line, silent comic) with the same per-frame viseme/openness/energy shape audio_lipsync returns. Writes json/srt/css/ae. Use audio_lipsync when voice audio exists.',
     parameters: {
       type: 'object',
       properties: {
-        text: { type: 'string', description: 'Words to mouth: pinyin ("wo ai ni") or any Latin-script caption. Chinese is accepted but mapped per character; pass pinyin for the real shapes.' },
+        text: { type: 'string', description: 'Words to mouth: pinyin or any Latin-script caption; Chinese maps per character.' },
         cues: cueSchema(),
         bpm: { type: 'number', description: 'Tempo the syllables are scheduled to, 20..300; defaults to 96. Ignored when cues are supplied.' },
-        fps: { type: 'integer', description: 'Animation frames per second, 12..120; must match the page or CSS track, defaults to 24.' },
-        durationSeconds: { type: 'number', description: 'Force the track length in seconds when using text; syllables compress to fit or the closing rest pads. Cues carry their own times instead. Defaults to the text\'s natural length.' },
-        format: { type: 'string', enum: MOUTH_FORMATS, description: 'json = full track, srt = cue sheet, css = keyframes (opacity steps + jaw scale, no @property), ae = After Effects time<TAB>shape paste. Defaults to json.' },
-        style: { type: 'string', enum: MOUTH_STYLES, description: 'Performance: neutral, excited (wider jaw, faster transitions) or tired (smaller jaw, slower transitions). Defaults to neutral.' },
-        alignment: { type: 'string', enum: MOUTH_ALIGNMENTS, description: 'bpm = syllables on the musical grid (default), even = every event gets an equal slice, cues = drive from the timed cues list.' },
-        includeWarnings: { type: 'boolean', description: 'Also return a warnings array (default false) with the text notes and viseme labels outside the whitelist.' },
-        out: { type: 'string', description: 'Output path. Defaults to no file; when omitted the summary and first frames are still returned.' }
+        fps: { type: 'integer', description: 'Frames per second, 12..120; match the page or CSS track. Default 24.' },
+        durationSeconds: { type: 'number', description: 'Force the track length when using text; default the text\'s natural length.' },
+        format: { type: 'string', enum: MOUTH_FORMATS, description: 'json (default), srt, css or ae.' },
+        style: { type: 'string', enum: MOUTH_STYLES, description: 'neutral (default), excited or tired.' },
+        alignment: { type: 'string', enum: MOUTH_ALIGNMENTS, description: 'bpm (default), even or cues.' },
+        includeWarnings: { type: 'boolean', description: 'Also return a warnings array; default false.' },
+        out: { type: 'string', description: 'Output path; without it the summary is still returned.' }
       },
       additionalProperties: false
     },

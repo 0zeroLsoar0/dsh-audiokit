@@ -167,13 +167,13 @@ function summaryLine (cwd, packaged, reconstruction, includeManifest) {
 export function registerStemsTools (ctx) {
   ctx.tools.register({
     name: 'audio_stems',
-    description: 'Export a cue set as stems: one .wav per layer, a master.wav that equals their sum, and a stems.json manifest with per-file duration, peak, RMS and sha256. Use it instead of audio_mix when a video, game or DAW pipeline needs the layers separate (mute, rebalance or process one at a time) while still being able to reconstruct the mixed cue.',
+    description: 'Export a cue set as stems: one .wav per layer, a master.wav equal to their sum, and a stems.json manifest with duration, peak, RMS and sha256. Use audio_mix when the layers only need summing.',
     parameters: {
       type: 'object',
       properties: {
         tracks: {
           type: 'array',
-          description: 'Layers in mix order, each { path | render, gainDb, offsetSeconds, name }. Offsets place each layer on the shared timeline; the master is the sum of the placed stems.',
+          description: 'Layers in mix order, each { path | render, gainDb, offsetSeconds, name }.',
           items: {
             type: 'object',
             properties: {
@@ -181,20 +181,20 @@ export function registerStemsTools (ctx) {
               render: {
                 type: 'object',
                 additionalProperties: true,
-                description: 'Inline render instead of a file: { preset, params, duration, seed, loop, sampleRate } exactly as audio_synth accepts. Give this or path, not both.'
+                description: 'Inline render { preset, params, duration, seed, loop, sampleRate }; give this or path.'
               },
-              gainDb: { type: 'number', description: 'Per-layer gain in dB (finite, -120..24; e.g. -6 quiets a layer by 6 dB). Defaults to 0.' },
+              gainDb: { type: 'number', description: 'Per-layer gain in dB (-120..24), default 0.' },
               offsetSeconds: { type: 'number', description: 'Where the layer starts on the shared timeline, in seconds (finite, 0..180). Defaults to 0.' },
-              name: { type: 'string', description: 'Stem id used for the file name (<name>.wav) and the manifest. Defaults to the file name or preset name.' }
+              name: { type: 'string', description: 'Stem id used for the file name; default the file or preset name.' }
             },
             additionalProperties: false
           }
         },
-        outDir: { type: 'string', description: 'Directory to write <stem>.wav, master.wav and stems.json into, relative to the working directory. Created if missing; defaults to assets/audio/stems-<hash>.' },
+        outDir: { type: 'string', description: 'Directory for the stem set; default assets/audio/stems-<hash>.' },
         bitDepth: { type: 'integer', enum: STEM_BIT_DEPTHS, description: '8=smallest (inline HTML), 16=CD, 24=video master (default), 32=IEEE float intermediate.' },
         channels: { type: 'integer', enum: [1, 2], description: '1=mono (default), 2=stereo dual-mono.' },
-        sampleRate: { type: 'integer', description: 'Output rate; defaults to the highest input rate. All stems are resampled to it so they stay frame-aligned.' },
-        masterPeakDbfs: { type: 'number', description: 'Peak-normalisation target for the master, in dBFS (-120..0; default -1). The same gain is applied to every stem so they still sum to the master.' },
+        sampleRate: { type: 'integer', description: 'Output rate; default the highest input rate; all stems are resampled to it.' },
+        masterPeakDbfs: { type: 'number', description: 'Master peak target in dBFS, -120..0, default -1; the same gain is applied to every stem.' },
         manifest: { type: 'boolean', description: 'Write stems.json with per-file duration, peak, RMS and sha256. Defaults to true.' }
       },
       required: ['tracks'],

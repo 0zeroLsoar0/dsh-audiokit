@@ -275,21 +275,21 @@ export function registerTtsTool (ctx, config = {}) {
 
   ctx.tools.register({
     name: 'audio_tts',
-    description: 'Render narration or dialogue to a file with MiniMax T2A (default), any OpenAI-compatible speech endpoint, or the free keyless Microsoft Edge engine. Returns the file plus sentence/word timestamps when the provider supplies them, and the parameters that actually took effect — so subtitles, lip-sync or typewriter effects can be driven from the same call. Output is .wav when the provider returns samples; the Edge engine writes a playable .mp3 when no PCM decoder is available. Text accepts inline pauses like <#1.5#> (0.01–99.99 s).',
+    description: 'Render narration or dialogue to a file through MiniMax (default), any OpenAI-compatible endpoint, or the free Edge engine. Returns the file plus timestamps when the provider supplies them, so subtitles and lip-sync can be driven from one call.',
     parameters: {
       type: 'object',
       properties: {
-        text: { type: 'string', description: 'What to say (≤8000 chars; longer scripts are split at sentence boundaries). Supports MiniMax inline pauses: <#1.5#> for a 1.5 s pause.' },
-        voice: { type: 'string', description: `Voice id. MiniMax shortlist: ${VOICE_CATALOG.map((voice) => voice.id).join(', ')}. For the Edge provider use ids from audio_voices (e.g. ${EDGE_VOICE_CATALOG[0].id}, ${EDGE_VOICE_CATALOG[8]?.id ?? 'en-US-AriaNeural'}); call audio_voices to see the active provider's list.` },
+        text: { type: 'string', description: 'What to say (鈮?000 chars); inline pauses like <#1.5#> are supported by MiniMax.' },
+        voice: { type: 'string', description: 'Voice id; lists are in the animation-sound skill, or call audio_voices.' },
         speed: { type: 'number', description: 'Speaking rate, 0.5..2.0. Defaults to 1.' },
         pitch: { type: 'number', description: 'Pitch shift in semitones, -12..12. Defaults to 0.' },
         subtitle: { type: 'boolean', description: 'Ask the provider for timestamps. Defaults to true; the result says whether any came back.' },
-        subtitleType: { type: 'string', enum: ['sentence', 'word'], description: 'Timestamp granularity to request. Word level is finer but not every model or endpoint returns it — check the result before relying on it.' },
+        subtitleType: { type: 'string', enum: ['sentence', 'word'], description: 'Timestamp granularity, sentence or word; word is not always returned.' },
         model: { type: 'string', description: 'Provider model id. Defaults to the provider setting (MiniMax speech-2.8-hd).' },
-        gapSeconds: { type: 'number', description: 'Silence inserted between chunks of a long script (finite, 0..10); defaults to 0.15. Not used on the MP3 path (chunks are joined frame-to-frame).' },
+        gapSeconds: { type: 'number', description: 'Silence between chunks of a long script, 0..10 s; default 0.15.' },
         sampleRate: { type: 'integer', description: 'Output rate for providers that accept it; the Edge engine fixes PCM at 24000.' },
-        srt: { type: 'boolean', description: 'Also write an .srt subtitle file next to the audio file when the provider returned timestamps. Defaults to false.' },
-        out: { type: 'string', description: 'Output path; defaults to assets/audio/voice-<hash>.wav (or .mp3 when only encoded audio is available).' }
+        srt: { type: 'boolean', description: 'Also write an .srt next to the audio when timestamps came back.' },
+        out: { type: 'string', description: 'Output path; default assets/audio/voice-<hash>.wav (.mp3 for Edge).' }
       },
       required: ['text'],
       additionalProperties: false
@@ -450,7 +450,7 @@ export function registerVoicesTool (ctx, config = {}) {
 
   ctx.tools.register({
     name: 'audio_voices',
-    description: 'List the voice ids available for the configured TTS provider: the live MiniMax account list, or the free Edge catalogue with ~318 voices. Falls back to a static shortlist when the endpoint cannot be reached.',
+    description: 'List the voice ids available for the configured TTS provider (the live MiniMax list or the free Edge catalogue). Reads only; produces no audio.',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     isConcurrencySafe: true,
     presentCall: () => ({ card: 'generic', title: 'List TTS voices', kind: 'other', rawInput: {} }),

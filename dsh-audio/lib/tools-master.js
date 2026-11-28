@@ -13,6 +13,12 @@
  * the chain is willing to apply, the file is written at the loudest safe level
  * and the shortfall is reported, because "it stopped 2 LU short" is a usable
  * answer and "it clipped" is not.
+ *
+ * The target is measured with the same meter `audio_loudness` reports: BS.1770-4
+ * integrated LUFS over the non-LFE channels with the standard surround weights,
+ * and a mono file at the standard single-channel weight (1.0) — the number
+ * ffmpeg's `ebur128` reads, so a mono master aimed at -23 LUFS really measures
+ * -23 LUFS on any other meter instead of -26.
  */
 
 import { readFile, stat } from 'node:fs/promises'
@@ -28,7 +34,7 @@ import {
 } from './audio.js'
 import { PRESETS } from './dsp.js'
 import { analyzeLoudness, truePeak } from './lufs.js'
-import { MASTER_MODES, masterChain, masterPresets } from './master.js'
+import { MASTER_MODES, masterChainAsync, masterPresets } from './master.js'
 import { CHANNEL_COUNTS, encodeAnyWav, fitChannels, layoutFor, loudnessChannels } from './multichannel.js'
 import { decodeWav } from './wav.js'
 
@@ -304,15 +310,15 @@ function summaryText ({ destination, info, before, after, report, presetName, bi
 export function registerMasterTools (ctx) {
   ctx.tools.register({
     name: 'audio_master',
-    description: 'Master a .wav file or an inline render to a delivery loudness target without clipping: 3-band Linkwitz-Riley compression, mid/side width with bass mono, and a lookahead true-peak limiter, with an outer search that lands on the target (-14 LUFS streaming, -16 podcast, -23 broadcast) at or below a dBTP ceiling. Writes 8/16/24-bit or 32-bit float at 1/2/4/6/8 channels, and reports before/after LUFS and true peak, per-band gain reduction and the iteration count. Multichannel input keeps its layout: the compressor detector and the limiter curve are linked across every channel, the ceiling is verified on the loudest channel with lib/lufs.js, loudness is measured on the non-LFE channels, and the stereo width stage is bypassed with a note. Use it instead of audio_loudness when a single linear gain would clip or fall short. If the target cannot be reached inside the limiting budget it says so and reports the shortfall rather than clipping.',
+    description: 'Master a .wav or inline render to a delivery loudness target without clipping: 3-band compression, mid/side width with bass mono, a true-peak limiter and an outer search that lands on the target. Reports before/after LUFS, true peak and per-band gain reduction; multichannel layouts are preserved. Mastering yields between blocks so the event loop stays live, but it still occupies the CPU while it runs.',
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Wav file to master, relative to the working directory or absolute. Give either path or render.' },
+        path: { type: 'string', description: 'Wav file to master; give either path or render.' },
         render: {
           type: 'object',
           additionalProperties: true,
-          description: 'Inline render spec to master without reading a file: rendered exactly as audio_synth renders it, then mastered. Give either path or render.',
+          description: 'Inline render spec to master; give either path or render.',
           properties: {
             preset: { type: 'string', enum: PRESET_NAMES, description: 'Sound family, same names as audio_synth.' },
             params: { type: 'object', additionalProperties: true, description: 'Perceptual knobs, same names as audio_synth.' },
@@ -323,12 +329,12 @@ export function registerMasterTools (ctx) {
           },
           required: ['preset']
         },
-        preset: { type: 'string', enum: MASTER_PRESET_NAMES, description: 'Mastering preset: streaming-safe=default -14 LUFS at -1 dBTP; streaming-loud=commercial -9 LUFS density; broadcast-23=EBU R128 -23 LUFS; podcast=-16 LUFS dialogue weight; gentle=transparent -16 LUFS at -2 dBTP. Explicit numbers below override the preset.' },
-        targetLufs: { type: 'number', description: 'Target integrated loudness in LUFS: -14 web/streaming, -16 podcast, -23 broadcast. Overrides the preset.' },
-        ceilingDbtp: { type: 'number', description: 'Maximum allowed true peak in dBTP; defaults to -1 (this is the ceiling the limiter holds). Overrides the preset.' },
+        preset: { type: 'string', enum: MASTER_PRESET_NAMES, description: 'Mastering preset: streaming-safe (default), streaming-loud, broadcast-23, podcast or gentle.' },
+        targetLufs: { type: 'number', description: 'Target integrated loudness in LUFS: -14 web, -16 podcast, -23 broadcast. Mono is measured at the standard BS.1770 single-channel weight (same as ffmpeg), not the old dual-mono +3 LU.' },
+        ceilingDbtp: { type: 'number', description: 'Max true peak in dBTP, default -1, clamped to [-20, 0].' },
         bands: {
           type: 'array',
-          description: 'Multiband compressor bands, replacing the preset bands. Band k spans the previous split to its own splitHz; the last band runs to Nyquist and its splitHz is ignored.',
+          description: 'Multiband compressor bands replacing the preset bands (fields in the skill).',
           items: {
             type: 'object',
             additionalProperties: false,
@@ -342,13 +348,13 @@ export function registerMasterTools (ctx) {
             }
           }
         },
-        width: { type: 'number', description: 'Mid/side stereo width: 0 = mono, 1 = unchanged, 1.5 = wider (max 2). Mono input ignores it; a 4/6/8-channel input bypasses the stage and says so in the report (mid/side is defined on one stereo pair). Overrides the preset.' },
-        bassMonoHz: { type: 'number', description: 'Fold side content below this frequency to the centre (mono bass), 0 disables. A stereo control: ignored for mono, bypassed for a surround input. Overrides the preset.' },
-        driveDb: { type: 'number', description: 'Gain into the multiband compressor in dB, -24..24; raise it to make the compressor work on quiet material. Overrides the preset.' },
-        maxGainReductionDb: { type: 'number', description: 'Limiting budget in dB: if the target would need more reduction than this, the chain stops and reports the shortfall; defaults to the preset value (6..14).' },
-        mode: { type: 'string', enum: MASTER_MODES, description: 'Memory/time tradeoff: memory (default) keeps only attempt measurements and re-renders the chosen attempt once; fast keeps every attempt\'s samples and skips that re-render. Output is byte-identical either way; fast costs ~350 MB for a 180 s stereo master.' },
-        bitDepth: { type: 'integer', enum: BIT_DEPTHS, description: '8=smallest (inline HTML), 16=default, 24=video master, 32=32-bit IEEE float. A 4/6/8-channel master supports 16 or 24 bits (the extensible WAV writer); 8/32-bit is refused for surround. Defaults to 16.' },
-        out: { type: 'string', description: 'Output path, relative to the working directory or absolute. Defaults to assets/audio/master-<hash>.wav.' }
+        width: { type: 'number', description: 'Mid/side width 0..2 (0 = mono, 1 = unchanged), default preset; stereo only.' },
+        bassMonoHz: { type: 'number', description: 'Fold side content below this Hz to the centre (mono bass); 0 disables.' },
+        driveDb: { type: 'number', description: 'Gain into the multiband compressor in dB, -24..24.' },
+        maxGainReductionDb: { type: 'number', description: 'Limiting budget in dB; the chain reports a shortfall instead of clipping.' },
+        mode: { type: 'string', enum: MASTER_MODES, description: 'memory (default) re-renders once; fast keeps all samples (approx 350 MB).' },
+        bitDepth: { type: 'integer', enum: BIT_DEPTHS, description: '8, 16 (default), 24 or 32-bit float; surround supports only 16 or 24.' },
+        out: { type: 'string', description: 'Output path; default assets/audio/master-<hash>.wav.' }
       },
       additionalProperties: false
     },
@@ -414,7 +420,7 @@ export function registerMasterTools (ctx) {
       const chainOptions = { ...request, mode }
       if (Number.isFinite(request.ceilingDbtp)) chainOptions.ceilingDbtp = request.ceilingDbtp - guardDb
       else if (guardDb > 0) chainOptions.ceilingDbtp = -1 - guardDb
-      const chain = masterChain(channels.length === 1 ? channels[0] : channels, sampleRate, chainOptions)
+      const chain = await masterChainAsync(channels.length === 1 ? channels[0] : channels, sampleRate, chainOptions)
       const report = chain.report
 
       // --- encode, write, and measure what actually landed on disk ----------

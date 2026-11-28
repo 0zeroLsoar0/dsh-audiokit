@@ -418,14 +418,14 @@ async function runExtractAction (cwd, args) {
 export function registerVideoTools (ctx) {
   ctx.tools.register({
     name: 'audio_mux',
-    description: 'Bridge to a video deliverable: probe an mp4/mov/mkv/webm (or any media file), mux a rendered .wav onto it without re-encoding the picture (replace the audio track, mix the new sound under the original, or attach it as a second track, with loop/offset/fades), detect the picture\'s cut times as a ready-to-paste audio_bind cue plan, and extract a video\'s audio to a wav the analysis tools can read. Requires ffmpeg and ffprobe (it explains how to install them when they are missing) and does not analyse what is in the picture — storyboards and transcripts belong to the separate dsh-video-storyboard plugin.',
+    description: 'Bridge to a video deliverable: probe a media file, mux a rendered .wav onto it without re-encoding the picture (replace/mix/attach), detect cut times as a cue plan, or extract its audio to a wav. Requires ffmpeg/ffprobe; it does not analyse the picture.',
     parameters: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
           enum: ACTIONS,
-          description: 'probe = report the file\'s streams and duration; mux = put audio onto the video; cuts = scene cut times plus an audio_bind cue plan; extract = write the media\'s audio to a wav.'
+          description: 'probe, mux, cuts or extract; the field groups below are per action.'
         },
         path: { type: 'string', description: 'probe/cuts/extract: media file (video or audio), relative to the working directory or absolute.' },
         video: { type: 'string', description: 'mux: the video to keep; its picture is stream-copied, never re-encoded.' },
@@ -434,25 +434,25 @@ export function registerVideoTools (ctx) {
             { type: 'string' },
             { type: 'object', additionalProperties: true }
           ],
-          description: 'mux: the sound to add — a .wav path, or an inline render spec { preset, params, duration, seed, loop, sampleRate } rendered first (named from its spec hash, finalized like audio_synth).'
+          description: 'mux: a .wav path or an inline render spec to add.'
         },
-        out: { type: 'string', description: 'mux: output path (its extension picks the container: .mp4, .mov, .mkv or .webm); extract: output .wav path. Defaults to assets/video/<stem>-<mode>-<hash>.<ext> and assets/audio/<stem>-audio-<hash>.wav.' },
+        out: { type: 'string', description: 'mux: output file (.mp4/.mov/.mkv/.webm); extract: output .wav.' },
         mode: {
           type: 'string',
           enum: MUX_MODES,
-          description: 'replace = swap the video\'s audio track for the new sound (default); mix = keep the original sound and mix the new one under it; attach = keep the original and add the new sound as a second audio track.'
+          description: 'replace (default), mix or attach the new audio.'
         },
-        offsetSeconds: { type: 'number', description: 'mux: when the new audio starts in the output (seconds, default 0; must be inside the timeline).' },
+        offsetSeconds: { type: 'number', description: 'mux: where the new audio starts, in seconds; default 0.' },
         fadeInSeconds: { type: 'number', description: 'mux: fade-in length starting at the offset; 0 (default) means no fade.' },
         fadeOutSeconds: { type: 'number', description: 'mux: fade-out length ending at the end of the audio timeline; 0 (default) means no fade.' },
-        loop: { type: 'boolean', description: 'mux: repeat the audio to fill the timeline instead of padding it with silence (useful for a 0.4 s cue over a 3 s shot).' },
-        mixGainDb: { type: 'number', description: 'mux (mix mode only): level trim on the new audio in dB, e.g. -6 to sit it under dialogue. Defaults to 0.' },
-        durationSeconds: { type: 'number', description: 'mux: audio timeline length; defaults to the video duration and is clamped to it. The picture itself is never shortened.' },
-        threshold: { type: 'number', description: 'cuts: scene-change threshold 0.01..0.99; lower finds more (and softer) changes. Defaults to 0.35.' },
-        minSceneSeconds: { type: 'number', description: 'cuts: two detections closer than this are treated as one cut (a flash, a dissolve). Defaults to 0.4.' },
+        loop: { type: 'boolean', description: 'mux: repeat the audio to fill the timeline instead of padding silence.' },
+        mixGainDb: { type: 'number', description: 'mix: level trim on the new audio in dB; default 0.' },
+        durationSeconds: { type: 'number', description: 'mux: audio timeline length; default the video duration.' },
+        threshold: { type: 'number', description: 'cuts: scene-change threshold 0.01..0.99, default 0.35 (lower finds more).' },
+        minSceneSeconds: { type: 'number', description: 'cuts: detections closer than this merge into one cut; default 0.4.' },
         sampleRate: { type: 'integer', description: 'extract: wav sample rate (default 48000); mux: rate of the muxed track (default 48000).' },
         channels: { type: 'integer', enum: [1, 2], description: 'extract: 1 = mono (default), 2 = keep stereo.' },
-        ffmpegPath: { type: 'string', description: 'Optional explicit ffmpeg binary. Defaults to auto-detection: the DSH bundled ffmpeg (~/.dsh/tools/ffmpeg/bin), then PATH.' }
+        ffmpegPath: { type: 'string', description: 'Optional ffmpeg binary path; defaults to the bundled one, then PATH.' }
       },
       required: ['action'],
       additionalProperties: false

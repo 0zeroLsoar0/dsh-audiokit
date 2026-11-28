@@ -131,7 +131,7 @@ function renderSchema () {
   return {
     type: 'object',
     additionalProperties: false,
-    description: 'Inline render spec, used instead of path: render a preset first and analyse it in the same call. The same spec always renders identical samples.',
+    description: 'Inline render spec instead of path, rendered first.',
     properties: {
       preset: { type: 'string', enum: PRESET_NAMES, description: 'Preset to render before analysing.' },
       params: { type: 'object', additionalProperties: true, description: 'Preset knobs, same names as audio_synth.' },
@@ -176,24 +176,24 @@ function comparisonText (labelA, labelB, comparison) {
 export function registerAnalyzeTools (ctx) {
   ctx.tools.register({
     name: 'audio_analyze',
-    description: 'Report what is inside a sound rather than only how loud it is: fundamental and confidence, partials with their dB levels and inharmonicity, spectral tilt and centroid, how noisy it is, formant peaks, RT60 decay and onset shape. Use it to judge whether a synthesised sound reads as what it is meant to be (a metal door slam, a wooden knock, a voice), and with compareWith to prove that a change kept the same character. Accepts an existing .wav (path) or renders a preset inline (render).',
+    description: 'Report what is inside a sound rather than only how loud it is: fundamental, partials, spectral tilt/centroid, noisiness, formants, RT60 and onset shape. With compareWith it returns a metric-by-metric comparison, so a change can be proven to keep the character.',
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Existing mono/stereo .wav, relative to the working directory or absolute. Omit when using render.' },
+        path: { type: 'string', description: 'Existing .wav, relative to cwd or absolute; omit when using render.' },
         render: renderSchema(),
         f0Range: {
           type: 'array',
           items: { type: 'number' },
           minItems: 2,
           maxItems: 2,
-          description: 'Search range for the fundamental in Hz ([min, max], clamped to 40..2000; defaults to [40, 2000]). Narrow it — e.g. [70, 400] — to stop a bright sound being read an octave high, or to find the low body of a hit.'
+          description: 'Fundamental search range in Hz, clamped to 40..2000; default [40, 2000].'
         },
-        maxHarmonics: { type: 'integer', description: 'How many partials to list, 1..64; defaults to 8. The report is bounded by this, so a 40-partial sawtooth does not flood the answer.' },
+        maxHarmonics: { type: 'integer', description: 'Partials to list, 1..64; default 8.' },
         compareWith: {
           type: 'object',
           additionalProperties: false,
-          description: 'A second sound to compare against. When present the tool returns the comparison table (pass/fail per metric, tolerance, and the metrics that changed) instead of the prose report. Also accepts a plain path string.',
+          description: 'Second sound (a path string or an object); returns a metric-by-metric comparison table.',
           properties: {
             path: { type: 'string', description: 'Existing .wav to compare against, relative to the working directory or absolute.' },
             render: renderSchema()
@@ -202,7 +202,7 @@ export function registerAnalyzeTools (ctx) {
         tolerances: {
           type: 'object',
           additionalProperties: true,
-          description: 'Override comparison tolerances, keyed by metric ("f0.hz", "centroidHz", "flatness", "noisiness", "decay.rt60Seconds", "onset.attackMs", "bands", "formants.hz", "formants.count", "inharmonicity", "spectralTiltDbPerOctave"). A number is an absolute tolerance in the metric unit; { relative: 0.01 } / { absolute: 0.2 } says which kind explicitly.'
+          description: 'Per-metric tolerance overrides (a number, or { relative } / { absolute }); keys in skill.'
         },
         out: { type: 'string', description: 'Write the JSON report here (defaults to no file; the report is still returned inline).' }
       },

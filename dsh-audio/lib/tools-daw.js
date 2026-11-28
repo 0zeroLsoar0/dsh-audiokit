@@ -703,28 +703,28 @@ function dawLine (format, result, entries) {
 export function registerDawTools (ctx) {
   ctx.tools.register({
     name: 'audio_daw',
-    description: 'Export a cue set or a stem set as a project a real editor can open: a CMX3600 EDL cut list, a REAPER .rpp project (the only format that keeps gain and fades natively), an RFC4180 CSV cue sheet, Audacity labels, an OpenTimelineIO .otio document or an FCP7 xmeml XML sequence (both of which Resolve and Premiere import), an AAF (MS-CFB container with a real object graph and embedded PCM, but no MetaDictionary — Pro Tools still refuses it), or an OMF skeleton (explicitly not importable). Use it when the work has to leave the plugin and be edited by a human instead of being played back inside the page.',
+    description: 'Export a cue set or stem set as a project a real editor can open: CMX3600 EDL, REAPER .rpp, CSV, Audacity labels, OpenTimelineIO, FCP7 xmeml, an AAF subset or an OMF skeleton. Use it when the work has to leave the plugin; per-format fidelity is tabled in the animation-sound skill.',
     parameters: {
       type: 'object',
       properties: {
         format: {
           type: 'string',
           enum: EXPORT_FORMATS,
-          description: 'edl=CMX3600 cut list for an NLE (one record track, cuts only: no gain, no fades, no overlaps); rpp=REAPER project, one track per stem with position, length, gain and fades (the least lossy); csv=spreadsheet/script cue sheet with every field; labels=Audacity label track; aaf=AAF structural subset: valid CFB container, AAF class ids and property encodings, mob/slot timeline and embedded PCM, but no MetaDictionary so AAF SDK apps refuse it; omf=OMF skeleton (container + manifest only, NOT importable); otio=OpenTimelineIO JSON, sample accurate, one audio track per lane (Resolve/Nuke/premiere adapter); xmeml=Final Cut Pro 7 XML, frame accurate, Premiere and Resolve import it directly.'
+          description: 'edl, rpp, csv, labels, aaf, omf, otio or xmeml (fidelity per format in the skill).'
         },
         cues: {
           type: 'array',
-          description: 'The cue set to export (every format except rpp, which also takes tracks): one entry per sound event on the timeline.',
+          description: 'Cue entries to export (every format except rpp, which takes tracks).',
           items: {
             type: 'object',
             properties: {
               name: { type: 'string', description: 'Label of the cue; defaults to the file stem.' },
-              path: { type: 'string', description: 'Source .wav path, relative to the working directory or absolute. Required by edl, rpp and aaf; optional for csv, labels, otio, xmeml and omf.' },
+              path: { type: 'string', description: 'Source .wav path; required by edl, rpp and aaf.' },
               at: { type: 'number', description: 'Start on the animation timeline in seconds, >= 0.' },
-              duration: { type: 'number', description: 'Length in seconds, > 0. Required by edl; rpp and aaf measure the wav when it is missing.' },
-              gainDb: { type: 'number', description: 'Level trim in dB, -120..24. Carried by rpp, csv, xmeml (Audio Levels filter) and OTIO clip metadata; EDL and AAF have no level field here.' },
-              fadeIn: { type: 'number', description: 'Fade-in seconds, >= 0. Carried by rpp and csv; reported (not applied) by otio and xmeml.' },
-              fadeOut: { type: 'number', description: 'Fade-out seconds, >= 0. Carried by rpp and csv; reported (not applied) by otio and xmeml.' }
+              duration: { type: 'number', description: 'Length in seconds; required by edl (rpp/aaf measure the wav).' },
+              gainDb: { type: 'number', description: 'Level trim -120..24; carried by rpp, csv, xmeml and OTIO only.' },
+              fadeIn: { type: 'number', description: 'Fade-in seconds; rpp/csv carry it, otio/xmeml only report it.' },
+              fadeOut: { type: 'number', description: 'Fade-out seconds; rpp/csv carry it, otio/xmeml only report it.' }
             },
             required: ['at'],
             additionalProperties: false
@@ -732,7 +732,7 @@ export function registerDawTools (ctx) {
         },
         tracks: {
           type: 'array',
-          description: 'rpp only: the stem set to place, one REAPER track per entry (order is preserved). Takes precedence over cues.',
+          description: 'rpp only: stem entries to place, one REAPER track each; wins over cues.',
           items: {
             type: 'object',
             properties: {
@@ -748,12 +748,12 @@ export function registerDawTools (ctx) {
             additionalProperties: false
           }
         },
-        out: { type: 'string', description: 'Output path, relative to the working directory. Defaults to assets/audio/<format>-<hash>.<ext>.' },
-        frameRate: { type: 'number', description: 'edl and xmeml only: 24 (edl default), 25 (xmeml default), 30, 50, 60 or 29.97 (drop-frame). EDL maps 23.976 to 24 with a warning; xmeml accepts 23.976 and 29.97 as NTSC.' },
+        out: { type: 'string', description: 'Output path; default assets/audio/<format>-<hash>.<ext>.' },
+        frameRate: { type: 'number', description: 'edl and xmeml only: 24, 25, 30, 50, 60 or 29.97.' },
         bpm: { type: 'number', description: 'rpp only: project tempo 20..300; defaults to 120.' },
-        sampleRate: { type: 'integer', description: 'rpp: project sample rate 8000..96000, defaults to 44100. aaf: project edit rate (timeline positions in samples), defaults to the first embedded clip. otio/xmeml: declared media sample rate, defaults to 48000.' },
-        embed: { type: 'boolean', description: 'aaf only: embed the PCM in the file (default true). Pass false to write an offline timeline that only describes the clips.' },
-        title: { type: 'string', description: 'aaf/otio/xmeml/omf only: timeline name written into the project (default "dsh-audiokit timeline").' }
+        sampleRate: { type: 'integer', description: 'Project/edit/media rate for rpp, aaf, otio and xmeml; per-format defaults are in the skill.' },
+        embed: { type: 'boolean', description: 'aaf only: embed the PCM (default true); false writes an offline timeline.' },
+        title: { type: 'string', description: 'aaf/otio/xmeml/omf only: timeline name; default "dsh-audiokit timeline".' }
       },
       required: ['format'],
       additionalProperties: false

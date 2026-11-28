@@ -52,6 +52,7 @@
 
 import { resampleHiFi } from './convert.js'
 import { CHANNEL_COUNTS, conversionKind, fitChannels, layoutFor, linkStemGain } from './multichannel.js'
+import { YIELD_EVERY_FRAMES, driveAsync, driveSync } from './yield.js'
 
 /* --------------------------------------------------------------- limits -- */
 
@@ -155,66 +156,115 @@ function isChannelArray (value) {
   return Array.isArray(value) && value.length > 0 && value.every(isSampleBuffer)
 }
 
-function peakOf (samples) {
-  let peak = 0
-  for (let index = 0; index < samples.length; index += 1) {
+function peakRange (samples, from, to, state) {
+  let peak = state[0]
+  for (let index = from; index < to; index += 1) {
     const magnitude = Math.abs(samples[index])
     if (magnitude > peak) peak = magnitude
   }
-  return peak
+  state[0] = peak
 }
 
-function rmsOf (samples) {
-  if (samples.length === 0) return 0
-  let sum = 0
-  for (let index = 0; index < samples.length; index += 1) sum += samples[index] * samples[index]
-  return Math.sqrt(sum / samples.length)
+/** Peak magnitude of a buffer, in cooperatively-yielded blocks. */
+function* peakOfGen (samples) {
+  const state = new Float64Array(1)
+  for (let from = 0; from < samples.length; from += YIELD_EVERY_FRAMES) {
+    peakRange(samples, from, Math.min(samples.length, from + YIELD_EVERY_FRAMES), state)
+    yield
+  }
+  return state[0]
 }
 
-function dcOffsetOf (samples) {
-  if (samples.length === 0) return 0
-  let sum = 0
-  for (let index = 0; index < samples.length; index += 1) sum += samples[index]
-  return sum / samples.length
+
+function rmsRange (samples, from, to, state) {
+  let sum = state[0]
+  for (let index = from; index < to; index += 1) sum += samples[index] * samples[index]
+  state[0] = sum
 }
+
+/** RMS of a buffer, in cooperatively-yielded blocks (same sum, same order). */
+function* rmsOfGen (samples) {
+  if (samples.length === 0) return 0
+  const state = new Float64Array(1)
+  for (let from = 0; from < samples.length; from += YIELD_EVERY_FRAMES) {
+    rmsRange(samples, from, Math.min(samples.length, from + YIELD_EVERY_FRAMES), state)
+    yield
+  }
+  return Math.sqrt(state[0] / samples.length)
+}
+
+
 
 /** Loudest sample of any channel: what a file peak is for a multichannel bus. */
-function peakOfChannels (channels) {
+function* peakOfChannelsGen (channels) {
   let peak = 0
   for (const channel of channels) {
-    const channelPeak = peakOf(channel)
+    const channelPeak = yield* peakOfGen(channel)
     if (channelPeak > peak) peak = channelPeak
   }
   return peak
 }
 
+function peakOfChannels (channels) {
+  return driveSync(peakOfChannelsGen(channels))
+}
+
+function rmsChannelsRange (samples, from, to, state) {
+  let sum = state[0]
+  for (let index = from; index < to; index += 1) sum += samples[index] * samples[index]
+  state[0] = sum
+}
+
 /**
- * RMS averaged over every sample of every channel.
+ * RMS averaged over every sample of every channel, in yielded blocks.
  *
  * Dividing by frames x channels rather than by frames means a dual-mono signal
  * reads the same level as the mono signal it came from: the layout must not
  * change the number a report prints. (An energy *sum* would read +3 dB for two
  * identical channels, which is a property of the fold, not of the cue.)
+ *
+ * The channels are still accumulated one after another, in channel order: the
+ * sum is not re-associated by the block split.
  */
-function rmsOfChannels (channels) {
-  let sum = 0
+function* rmsOfChannelsGen (channels) {
+  const state = new Float64Array(1)
   let count = 0
   for (const channel of channels) {
-    for (let index = 0; index < channel.length; index += 1) sum += channel[index] * channel[index]
+    for (let from = 0; from < channel.length; from += YIELD_EVERY_FRAMES) {
+      rmsChannelsRange(channel, from, Math.min(channel.length, from + YIELD_EVERY_FRAMES), state)
+      yield
+    }
     count += channel.length
   }
-  return count > 0 ? Math.sqrt(sum / count) : 0
+  return count > 0 ? Math.sqrt(state[0] / count) : 0
+}
+
+function rmsOfChannels (channels) {
+  return driveSync(rmsOfChannelsGen(channels))
+}
+
+function dcChannelsRange (samples, from, to, state) {
+  let sum = state[0]
+  for (let index = from; index < to; index += 1) sum += samples[index]
+  state[0] = sum
 }
 
 /** Mean DC across every channel; zero for a clean file of any width. */
-function dcOffsetOfChannels (channels) {
-  let sum = 0
+function* dcOffsetOfChannelsGen (channels) {
+  const state = new Float64Array(1)
   let count = 0
   for (const channel of channels) {
-    for (let index = 0; index < channel.length; index += 1) sum += channel[index]
+    for (let from = 0; from < channel.length; from += YIELD_EVERY_FRAMES) {
+      dcChannelsRange(channel, from, Math.min(channel.length, from + YIELD_EVERY_FRAMES), state)
+      yield
+    }
     count += channel.length
   }
-  return count > 0 ? sum / count : 0
+  return count > 0 ? state[0] / count : 0
+}
+
+function dcOffsetOfChannels (channels) {
+  return driveSync(dcOffsetOfChannelsGen(channels))
 }
 
 /** One-pole coefficient for a settle time, or 1 (instant) for 0 ms. */
@@ -738,8 +788,26 @@ export function duck (track, sidechain, options = {}) {
   }))
 }
 
+/** One block of the constant-power pan / mid-side width matrix. */
+function panRange (samples, left, right, leftGain, rightGain, widen, width, from, to) {
+  for (let index = from; index < to; index += 1) {
+    const value = samples[index]
+    const leftValue = value * leftGain
+    const rightValue = value * rightGain
+    if (!widen) {
+      left[index] = leftValue
+      right[index] = rightValue
+      continue
+    }
+    const mid = (leftValue + rightValue) / 2
+    const side = (leftValue - rightValue) / 2 * width
+    left[index] = mid + side
+    right[index] = mid - side
+  }
+}
+
 /**
- * Constant-power pan to a stereo pair.
+ * Constant-power pan to a stereo pair, in cooperatively-yielded blocks.
  *
  * Centre is unity in *both* channels, so an unpanned track is bit-identical to
  * the mono track duplicated and a bus of unpanned tracks sums exactly like
@@ -761,6 +829,17 @@ export function duck (track, sidechain, options = {}) {
  * @returns {{ channels: Float32Array[], sampleRate: number, report: object }}
  */
 export function pan (track, options = {}) {
+  return driveSync(panGen(track, options))
+}
+
+/**
+ * Generator form of `pan`: the matrix yields between blocks and the report's
+ * meters yield inside their own loops.
+ * @param {{ samples: Float32Array, sampleRate: number }|Float32Array} track - mono source.
+ * @param {{ pan?: number, width?: number, sampleRate?: number }} [options] - pan and width.
+ * @returns {Generator<unknown, { channels: Float32Array[], sampleRate: number, report: object }, unknown>}
+ */
+export function* panGen (track, options = {}) {
   const caller = 'pan'
   const { channels, sampleRate } = readTrackChannels(track, options, caller)
   if (channels.length > 1) {
@@ -780,23 +859,16 @@ export function pan (track, options = {}) {
   const left = new Float32Array(frames)
   const right = new Float32Array(frames)
   const widen = width !== 1
-  for (let index = 0; index < frames; index += 1) {
-    const value = samples[index]
-    const leftValue = value * leftGain
-    const rightValue = value * rightGain
-    if (!widen) {
-      left[index] = leftValue
-      right[index] = rightValue
-      continue
-    }
-    const mid = (leftValue + rightValue) / 2
-    const side = (leftValue - rightValue) / 2 * width
-    left[index] = mid + side
-    right[index] = mid - side
+  for (let from = 0; from < frames; from += YIELD_EVERY_FRAMES) {
+    panRange(samples, left, right, leftGain, rightGain, widen, width, from, Math.min(frames, from + YIELD_EVERY_FRAMES))
+    yield
   }
 
-  const leftRms = rmsOf(left)
-  const rightRms = rmsOf(right)
+  const leftRms = yield* rmsOfGen(left)
+  const rightRms = yield* rmsOfGen(right)
+  const inputPeak = yield* peakOfGen(samples)
+  const leftPeak = yield* peakOfGen(left)
+  const rightPeak = yield* peakOfGen(right)
   return stereoResult([left, right], sampleRate, {
     type: 'pan',
     sampleRate,
@@ -806,9 +878,9 @@ export function pan (track, options = {}) {
     width: roundTo(width, 3),
     leftGainDb: toDb(leftGain),
     rightGainDb: toDb(rightGain),
-    inputPeakDbfs: toDb(peakOf(samples)),
-    leftPeakDbfs: toDb(peakOf(left)),
-    rightPeakDbfs: toDb(peakOf(right)),
+    inputPeakDbfs: toDb(inputPeak),
+    leftPeakDbfs: toDb(leftPeak),
+    rightPeakDbfs: toDb(rightPeak),
     leftRmsDbfs: toDb(leftRms),
     rightRmsDbfs: toDb(rightRms),
     // One side being silent is a hard pan, not an infinite ratio to print.
@@ -1029,16 +1101,24 @@ function readChannels (caller, requested) {
   return value
 }
 
-/** The soft limiter `dsp.softLimit` applies, repeated here to keep the module import-free. */
-function softLimit (samples) {
-  const knee = BUS_LIMITS.limiterKnee
-  for (let index = 0; index < samples.length; index += 1) {
+/** One block of the soft limiter (see `softLimit`). */
+function softLimitRange (samples, knee, from, to) {
+  for (let index = from; index < to; index += 1) {
     const value = samples[index]
     const magnitude = Math.abs(value)
     if (magnitude > knee) {
       const over = (magnitude - knee) / (1 - knee)
       samples[index] = Math.sign(value) * (knee + (1 - knee) * Math.tanh(over))
     }
+  }
+}
+
+/** The soft limiter `dsp.softLimit` applies, repeated here to keep the module import-free. */
+function* softLimit (samples) {
+  const knee = BUS_LIMITS.limiterKnee
+  for (let from = 0; from < samples.length; from += YIELD_EVERY_FRAMES) {
+    softLimitRange(samples, knee, from, Math.min(samples.length, from + YIELD_EVERY_FRAMES))
+    yield
   }
   return samples
 }
@@ -1051,9 +1131,13 @@ function softLimit (samples) {
  * fold `measure` sees when a tool probes a stereo file, so a bus report and a
  * later `audio_probe` of the same file talk about the same signal.
  */
-function averageChannels (left, right) {
+function* averageChannels (left, right) {
   const out = new Float32Array(left.length)
-  for (let index = 0; index < left.length; index += 1) out[index] = (left[index] + right[index]) / 2
+  for (let from = 0; from < left.length; from += YIELD_EVERY_FRAMES) {
+    const to = Math.min(left.length, from + YIELD_EVERY_FRAMES)
+    for (let index = from; index < to; index += 1) out[index] = (left[index] + right[index]) / 2
+    yield
+  }
   return out
 }
 
@@ -1068,31 +1152,54 @@ function uniqueId (base, used) {
   return id
 }
 
+/** One block of the per-track gain stage. */
+function trackGainRange (source, out, gain, from, to) {
+  for (let index = from; index < to; index += 1) out[index] = source[index] * gain
+}
+
 /** Resolve one track request into a processed layer (one or more channels) plus its meters. */
-function renderOneTrack (spec, sampleRate, caller) {
-  const sourceChannels = spec.channels.map((channel) => resampleChannel(channel, spec.sampleRate, sampleRate))
+function* renderOneTrackGen (spec, sampleRate, caller) {
+  const sourceChannels = []
+  for (const channel of spec.channels) {
+    sourceChannels.push(resampleChannel(channel, spec.sampleRate, sampleRate))
+    // Rate conversion is one pass in an untouched module (`lib/convert.js`); the
+    // cooperation point is between channels rather than inside the resampler.
+    yield
+  }
   const gain = dbToGain(spec.gainDb)
   // Gain lands before the chain so a compressor sees the level the caller set,
   // which is the behaviour a fader feeding an insert chain has. One gain for
   // every channel: a per-channel gain would move the image before the chain
   // even ran.
-  const driven = sourceChannels.map((channel) => {
+  const driven = []
+  for (const channel of sourceChannels) {
     const out = new Float32Array(channel.length)
-    for (let index = 0; index < channel.length; index += 1) out[index] = channel[index] * gain
-    return out
-  })
+    for (let from = 0; from < channel.length; from += YIELD_EVERY_FRAMES) {
+      trackGainRange(channel, out, gain, from, Math.min(channel.length, from + YIELD_EVERY_FRAMES))
+      yield
+    }
+    driven.push(out)
+  }
 
-  const chain = spec.chain.map((entry) => {
+  const chain = []
+  for (const entry of spec.chain) {
     if (entry !== null && typeof entry === 'object' && entry.type === 'duck' && entry.sidechain !== undefined && entry.sidechain !== null) {
       const side = readTrackChannels(entry.sidechain, { sampleRate }, `${caller} tracks[i] duck sidechain`)
-      return {
-        ...entry,
-        sidechain: { channels: side.channels.map((channel) => resampleChannel(channel, side.sampleRate, sampleRate)), sampleRate }
+      const sideChannels = []
+      for (const channel of side.channels) {
+        sideChannels.push(resampleChannel(channel, side.sampleRate, sampleRate))
+        yield
       }
+      chain.push({ ...entry, sidechain: { channels: sideChannels, sampleRate } })
+    } else {
+      chain.push(entry)
     }
-    return entry
-  })
+  }
+  // One processor is a whole-track pass with its own detector state; the bus
+  // yields between chain entries (and `processTrack` is a no-op for an empty
+  // chain, which is the common case).
   const processed = processTrack({ channels: driven, sampleRate }, chain)
+  yield
   if (processed.report.stereo) {
     throw new Error(`${caller}: a track chain must not end in pan; set the track's own pan/width instead`)
   }
@@ -1109,10 +1216,10 @@ function renderOneTrack (spec, sampleRate, caller) {
     pan: spec.pan,
     width: spec.width,
     report: processed.report,
-    peakInDbfs: toDb(peakOfChannels(sourceChannels)),
-    rmsInDbfs: toDb(rmsOfChannels(sourceChannels)),
-    peakOutDbfs: toDb(peakOfChannels(outputChannels)),
-    rmsOutDbfs: toDb(rmsOfChannels(outputChannels))
+    peakInDbfs: toDb(yield* peakOfChannelsGen(sourceChannels)),
+    rmsInDbfs: toDb(yield* rmsOfChannelsGen(sourceChannels)),
+    peakOutDbfs: toDb(yield* peakOfChannelsGen(outputChannels)),
+    rmsOutDbfs: toDb(yield* rmsOfChannelsGen(outputChannels))
   }
 }
 
@@ -1133,20 +1240,49 @@ function renderOneTrack (spec, sampleRate, caller) {
  * @param {number} sampleRate - Hz.
  * @returns {Float32Array[]} exactly `channels` buffers.
  */
-function fitLayerToBus (layer, channels, sampleRate) {
+function* fitLayerToBus (layer, channels, sampleRate) {
   if (layer.channels.length === 1) {
     if (channels <= 2) {
-      const panned = pan({ samples: layer.channels[0], sampleRate }, { pan: layer.pan, width: layer.width })
-      return channels === 2 ? panned.channels : [averageChannels(panned.channels[0], panned.channels[1])]
+      const panned = yield* panGen({ samples: layer.channels[0], sampleRate }, { pan: layer.pan, width: layer.width })
+      return channels === 2 ? panned.channels : [yield* averageChannels(panned.channels[0], panned.channels[1])]
     }
     const front = layer.pan === 0
       ? layer.channels
-      : pan({ samples: layer.channels[0], sampleRate }, { pan: layer.pan, width: layer.width }).channels
+      : (yield* panGen({ samples: layer.channels[0], sampleRate }, { pan: layer.pan, width: layer.width })).channels
+    // `fitChannels` is one pass in `lib/multichannel.js`, which this change does
+    // not own; it is atomic, and the business of this module is to yield around
+    // the passes it does own.
     return fitChannels(front, channels)
   }
   // A pan/width knob on a multichannel layer was rejected while the request was
   // validated, so the layer arrives here as a layout and is only re-laid-out.
   return fitChannels(layer.channels, channels)
+}
+
+/** One block of the layer-summing loop. */
+function sumLayerRange (bus, source, startFrame, from, to) {
+  for (let index = from; index < to; index += 1) bus[index] += source[index - startFrame]
+}
+
+/** One block of the linked master fader. */
+function masterGainRange (buses, masterGain, from, to) {
+  for (const bus of buses) for (let index = from; index < to; index += 1) bus[index] *= masterGain
+}
+
+/** One block of the clipping / RMS meter (one channel, shared accumulators). */
+function masterMeterRange (channel, from, to, state) {
+  let clipping = state[0]
+  let sumSquares = state[1]
+  let sampleCount = state[2]
+  for (let index = from; index < to; index += 1) {
+    const value = channel[index]
+    if (Math.abs(value) >= 0.999) clipping += 1
+    sumSquares += value * value
+    sampleCount += 1
+  }
+  state[0] = clipping
+  state[1] = sumSquares
+  state[2] = sampleCount
 }
 
 /**
@@ -1187,6 +1323,40 @@ function fitLayerToBus (layer, channels, sampleRate) {
  *   master's `samples` is the mono fold of the real channels.
  */
 export function renderBus (tracks, options = {}) {
+  return driveSync(renderBusGen(tracks, options))
+}
+
+/**
+ * Render a bus without holding the event loop for the whole render.
+ *
+ * Same generator, same arithmetic, same bytes as `renderBus`; every block
+ * boundary also waits for a `setImmediate`.
+ * @param {Array<object>} tracks - per layer, see `renderBus`.
+ * @param {object} [options] - bus options, see `renderBus`.
+ * @returns {Promise<{ sampleRate: number, channels: number, frames: number,
+ *   durationSeconds: number, stems: object[], master: object, meter: object }>}
+ */
+export function renderBusAsync (tracks, options = {}) {
+  return driveAsync(renderBusGen(tracks, options))
+}
+
+/**
+ * Cooperatively-yielded form of `renderBus`.
+ *
+ * Same validation, same arithmetic, same bytes as `renderBus`: every pass this
+ * module owns (the per-track gain and meter loops, `pan`, the layer sum, the soft
+ * limiter, the master fader and the final meters) yields between blocks, so a
+ * multi-second bus render leaves the host event loop able to run timers and I/O.
+ * What stays atomic is what this module does not own: `fitChannels` from
+ * `lib/multichannel.js` and the per-processor chain (`processTrack`), whose
+ * detectors are whole-track state machines; the bus yields on both sides of
+ * them. The tool layer calls this one.
+ * @param {Array<object>} tracks - per layer, see `renderBus`.
+ * @param {object} [options] - bus options, see `renderBus`.
+ * @returns {Generator<unknown, { sampleRate: number, channels: number, frames: number,
+ *   durationSeconds: number, stems: object[], master: object, meter: object }, unknown>}
+ */
+export function* renderBusGen (tracks, options = {}) {
   const caller = 'renderBus'
   if (!Array.isArray(tracks) || tracks.length === 0) {
     throw new Error(`${caller}: tracks must be a non-empty array of { samples | channels, sampleRate, gainDb?, offsetSeconds?, pan?, chain? }`)
@@ -1248,7 +1418,13 @@ export function renderBus (tracks, options = {}) {
     }
   })
 
-  const layers = specs.map((spec) => renderOneTrack(spec, sampleRate, caller))
+  const layers = []
+  for (const spec of specs) {
+    layers.push(yield* renderOneTrackGen(spec, sampleRate, caller))
+    // One track's processing is the outer unit of work; a track with no chain
+    // offers no other cooperation point before the next one starts.
+    yield
+  }
   const longest = layers.reduce((max, layer) => Math.max(max, layer.startFrame + layer.channels[0].length), 0)
   const frames = Math.max(1, longest)
   const maximumFrames = BUS_LIMITS.maxSeconds * sampleRate
@@ -1266,37 +1442,43 @@ export function renderBus (tracks, options = {}) {
   // summed in, so a bus and a mix of the same inputs agree at the bit level.
   const buses = Array.from({ length: channels }, () => new Float32Array(frames))
   for (const layer of layers) {
-    const fitted = fitLayerToBus(layer, channels, sampleRate)
+    const fitted = yield* fitLayerToBus(layer, channels, sampleRate)
     layer.fit = { from: layer.channelCount, to: channels, kind: conversionKind(layer.channelCount, channels) }
     const sourceFrames = fitted[0].length
     const limit = Math.min(frames, layer.startFrame + sourceFrames)
     for (let channel = 0; channel < channels; channel += 1) {
       const bus = buses[channel]
       const source = fitted[channel]
-      for (let index = layer.startFrame; index < limit; index += 1) bus[index] += source[index - layer.startFrame]
+      for (let from = layer.startFrame; from < limit; from += YIELD_EVERY_FRAMES) {
+        const to = Math.min(limit, from + YIELD_EVERY_FRAMES)
+        sumLayerRange(bus, source, layer.startFrame, from, to)
+        yield
+      }
     }
   }
 
   // One linked fader for every channel of the master: a per-channel gain here
   // would tilt the image, and the drive knob is a level into the limiter, not a
-  // balance control.
+  // balance control. `linkStemGain` is one pass in `lib/multichannel.js`; the bus
+  // yields around it.
+  yield
   linkStemGain(buses, masterOptions.drive)
 
   let limiterEngaged = false
   let preLimitPeak = 0
   for (const bus of buses) {
-    const peak = peakOf(bus)
+    const peak = yield* peakOfGen(bus)
     if (peak > preLimitPeak) preLimitPeak = peak
   }
   if (masterOptions.limiter) {
     if (preLimitPeak > BUS_LIMITS.limiterKnee) limiterEngaged = true
-    for (const bus of buses) softLimit(bus)
+    for (const bus of buses) yield* softLimit(bus)
   }
   let limiterReductionDb = 0
   if (limiterEngaged && preLimitPeak > 0) {
     let postLimitPeak = 0
     for (const bus of buses) {
-      const peak = peakOf(bus)
+      const peak = yield* peakOfGen(bus)
       if (peak > postLimitPeak) postLimitPeak = peak
     }
     limiterReductionDb = roundTo(linearToDb(postLimitPeak) - linearToDb(preLimitPeak), 2)
@@ -1306,16 +1488,21 @@ export function renderBus (tracks, options = {}) {
   if (masterOptions.peakDbfs !== null) {
     let peak = 0
     for (const bus of buses) {
-      const busPeak = peakOf(bus)
+      const busPeak = yield* peakOfGen(bus)
       if (busPeak > peak) peak = busPeak
     }
     if (peak > 0) {
       masterGain = dbToGain(masterOptions.peakDbfs) / peak
-      for (const bus of buses) for (let index = 0; index < frames; index += 1) bus[index] *= masterGain
+      for (let from = 0; from < frames; from += YIELD_EVERY_FRAMES) {
+        const to = Math.min(frames, from + YIELD_EVERY_FRAMES)
+        masterGainRange(buses, masterGain, from, to)
+        yield
+      }
     }
   }
 
   // The encoded files own their buffers; the caller may mutate them freely.
+  yield
   const channelSamples = buses.map((bus) => bus.slice())
   // The mono fold is a real downmix, not an average of the first pair: it drops
   // LFE and folds the centre and surrounds at their standard gains, so a probe
@@ -1324,25 +1511,25 @@ export function renderBus (tracks, options = {}) {
   const monoFold = channels === 1 ? channelSamples[0].slice() : fitChannels(channelSamples, 1)[0]
   const layout = layoutFor(channels)
 
-  let clipping = 0
-  let sumSquares = 0
-  let sampleCount = 0
   let masterPeak = 0
   const channelPeaksDbfs = []
+  const meterState = new Float64Array(3)
   for (const channel of channelSamples) {
-    const channelPeak = peakOf(channel)
+    const channelPeak = yield* peakOfGen(channel)
     if (channelPeak > masterPeak) masterPeak = channelPeak
     channelPeaksDbfs.push(toDb(channelPeak))
-    for (let index = 0; index < channel.length; index += 1) {
-      const value = channel[index]
-      if (Math.abs(value) >= 0.999) clipping += 1
-      sumSquares += value * value
-      sampleCount += 1
+    for (let from = 0; from < channel.length; from += YIELD_EVERY_FRAMES) {
+      const to = Math.min(channel.length, from + YIELD_EVERY_FRAMES)
+      masterMeterRange(channel, from, to, meterState)
+      yield
     }
   }
+  const clipping = meterState[0]
+  const sumSquares = meterState[1]
+  const sampleCount = meterState[2]
   const masterRms = sampleCount > 0 ? Math.sqrt(sumSquares / sampleCount) : 0
-  const monoPeak = peakOf(monoFold)
-  const monoRms = rmsOf(monoFold)
+  const monoPeak = yield* peakOfGen(monoFold)
+  const monoRms = yield* rmsOfGen(monoFold)
   const crestOf = (peak, rms) => (peak > 0 ? roundTo(linearToDb(peak) - linearToDb(rms), 2) : 0)
   const masterMetrics = {
     sampleRate,

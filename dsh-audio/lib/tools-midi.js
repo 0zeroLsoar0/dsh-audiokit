@@ -272,13 +272,13 @@ async function readMidi (cwd, args) {
 export function registerMidiTools (ctx) {
   ctx.tools.register({
     name: 'audio_midi',
-    description: 'Export a composed score to a Standard MIDI File (.mid) a DAW or notation app can open, or read an existing .mid and report its tempo, tracks, note counts and ranges. Use it when the deliverable must be editable music rather than rendered audio, or when the user brings music in. export accepts a score object (the audio_compose result) or a genre to compose in one call; parse reads a .mid and returns a bounded JSON summary.',
+    description: 'Export a score (the audio_compose shape, or a genre composed in one call) to a Standard MIDI File a DAW can open, or parse an existing .mid and report tempo, tracks, note counts and ranges.',
     parameters: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['export', 'parse'], description: 'export=score or genre in, .mid out. parse=.mid in, JSON summary only (no audio is rendered).' },
-        score: { type: 'object', additionalProperties: true, description: 'The score to export, in the audio_compose shape (bpm, beatsPerBar, bars, tracks[].notes[]). Use this to export music already composed in the conversation instead of composing again.' },
-        genre: { type: 'string', enum: GENRE_NAMES, description: 'Export by composing in one call: the same eight genres as audio_compose. Ignored when score is given.' },
+        score: { type: 'object', additionalProperties: true, description: 'The score to export, in the audio_compose shape (bpm, beatsPerBar, bars, tracks[].notes[]).' },
+        genre: { type: 'string', enum: GENRE_NAMES, description: 'Export by composing in one call (same genres as audio_compose).' },
         bpm: { type: 'number', description: 'Export only: the file tempo (defaults to the genre tempo).' },
         bars: { type: 'integer', description: 'Export only: length in bars; defaults to 16.' },
         key: { type: 'string', enum: KEY_NAMES, description: 'Export only: tonic note name; defaults to the genre key.' },

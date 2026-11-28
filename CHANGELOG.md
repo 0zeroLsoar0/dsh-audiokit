@@ -11,6 +11,72 @@
 - **U 盘上的版本目录只增不删。** 需要更新同一版本时覆盖同名文件，不要删目录。
 - 旧版本的唯一权威来源是 git tag；U 盘只是副本。
 
+## 0.6.1 — 2026-11-28
+
+`package.json` 已 bump 到 0.6.1。0.6.0 之后这一轮把「做得出声音」补成「做完能验收、能交接」：工具 30 → **34**，
+交付验收接上平台响度规格，长渲染不再堵事件循环，工具 schema 的上下文税再降约四分之一。
+
+### 新增工具（30 → 34）
+
+- **`audio_cues`**：音频反推 cue。从现成 `.wav` 检测冲击点与段落边界，返回 `{ at, strength, kind }`，
+  可直接喂 `audio_bind`；`sensitivity` / `minGapSeconds` / `maxCues` 控制密度、合并与上限，结果可复现。
+- **`audio_audit`**：旁白 / 字幕 / 口型三方只读对账。给旁白 wav、字幕 srt、口型轨（`audio_lipsync` 的
+  json/srt）里任意几项，报字幕漂移与漏句、口型覆盖与单帧抖动；不改任何输入文件。
+- **`audio_batch`**：一组 wav 一次跑完 `check` / `loudness` / `normalize` / `master`，逐条报错不中断。
+  `normalize` / `master` 只写副本（`outDir`，默认 `out/batch`），不改原文件；工作进程数按 CPU 自动定（上限 4）。
+- **`audio_handoff`**：交接简报。`lib/interop.js` 只读检测同类插件（`dsh-any-audio`），把不属于本插件的活
+  写成「目标插件 / 能力 / 逐条请求」的简报；不调用对方、不联网。
+
+### 验收层：`audio_check` 接平台规格
+
+- `target` 平台交付规格：`youtube` / `tiktok`（−14 LUFS）、`podcast`（−16）、`broadcast`（−23）、
+  `cinema`（−27 LUFS，真峰值 −2 dBTP）；也可用 `loudnessTarget` 自定义。只判定并报告差距，不改音频。
+- 验证层补齐：真峰值、相位 / 单声道兼容性，以及 `cues[].expectAt` / `targets[]` 报出的 cue 同步偏差。
+- 没有可判定文件时给 `issues` 而不是报绿——把「没测到」和「不合规」分开。
+
+### 修复
+
+- **mono LUFS 口径**：单声道按 BS.1770-4 单声道计权（一个声道只计一次），与 ffmpeg `ebur128`、Youlean 对齐；
+  旧的 dual-mono（mono 按两个声道 ×2，+3.01 LU）保留为显式 `dualMono: true`。
+- **`audio_loudness` 校正副本**：1/2/4/6/8 声道都能写，保持原声道布局与 16/24 位深。
+- **`audio_generate` 错误脱敏**：上游错误文本里的 Bearer / `sk-` / `key=…` 以及配置的密钥本身，返回前抹成
+  `[已隐去]`，错误信息不再把 key 带进对话或日志。
+- **`audio_probe` / `audio_loudness`**：非有限采样（NaN / Infinity）明确报告，不再静默算成 0 或 NaN 读数。
+- **编辑器目录排序**：`/dsh-audio/editor` 的目录/文件列表改用 code-unit 排序（与插件其余部分一致），
+  不再受机器 collation 影响（`localeCompare` 会把 `_` 排在 `Z` 前面）。
+- **`wav-encode` 注释**：旧注释称 `wav.js` 的 dither 用 `Math.random`、不能保证两次同字节；实际是固定种子
+  dither 与削波（回归哈希依赖它），已改正并写明「改写入器是格式变更，不是修 bug」。
+- **`audio_daw` AAF 产品标识**：写进 Identification 的 product version 随包版本更新为 0.6.1。
+
+### 性能
+
+- **协作式让出事件循环**：`renderScore` / `masterChain` / `renderBus` 的循环改写成生成器，工具层改用
+  `renderScoreAsync` / `masterChainAsync` / `renderBusAsync`，每 N 帧 `await` 一次把事件循环还给宿主。
+  同步 API 不变（`composeScore`/`renderScore` 仍是同步函数），两条驱动路径输出逐字节一致
+  （`test/yield.mjs` 用 SHA-256 断言），异步路径开销测试上限 15%。
+- 三个工具的描述补一句：yield 只保证事件循环活着，渲染期间**仍占 CPU**，不要把它当并行。
+
+### 上下文税
+
+- 工具描述压缩：模型可见 schema **98,442 B → 74,884 B（−24%）**，覆盖 34 个工具；
+  长 DSL、id 目录、逐格式保真表、逐参数理由移进 `animation-sound` skill（按需加载）。
+  `test/schema-budget.mjs` 以 77,000 B 为上限（约 3% 余量）守住，防止描述再长回手册。
+
+### 测试
+
+- 57 → **63 个测试文件全绿**（`node tools/test-all.mjs`，0 failed）：新增 `cues` / `audit` / `batch` /
+  `interop` / `verify` / `yield` 六个。
+- CI 六条腿：`ubuntu-latest` / `windows-latest` × node 20 / 22 / 24。
+- **只放宽计时断言，不动正确性断言**（CI 2-vCPU 并行时宿主负载抖动会误报，红队报过同类）：
+  `test/master.mjs` 60 s 立体声母带 2000 → 4000 ms；`test/compose.mjs` 16 小节单次渲染（ambient 最差）
+  700 → 900 ms；`test/perf.mjs` 稳态门 600 → 900 ms；`test/creatures.mjs` 3 s 生物渲染 400 → 600 ms。
+
+### 文档
+
+- 仓库根 README 工具表更新为 34 个；插件 README 工具表同步 34，FAQ 补 mono LUFS 口径与校正副本声道说明。
+- `docs/RELEASE.md` 数字刷新（63 个测试文件、node 24 实测），版本 / tarball / tag 引用改 0.6.1。
+- `docs/SCHEMA_DIET.zh.md` 标注当前口径（34 工具 / 74,884 B / 77,000 B 上限），历史 0.5.10 基线保留并注明。
+
 ## 0.6.0 — 2026-11-28
 
 `package.json` 已 bump 到 0.6.0；以下改动已在仓库，等发版指令再打 tag。

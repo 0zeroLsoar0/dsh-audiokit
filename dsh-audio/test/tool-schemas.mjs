@@ -1,5 +1,5 @@
 /**
- * Tool-layer coverage for the whole 30-tool surface: JSON-schema shape for every
+ * Tool-layer coverage for the whole 34-tool surface: JSON-schema shape for every
  * tool, plus cheap invalid-argument rejection for every tool that has arguments.
  *
  * `tools-test.mjs` drives seven tools end to end (real renders, chunk stitching,
@@ -41,8 +41,8 @@ import { RECIPES } from '../lib/design.js'
  * demanding equality, because that file is extended on its own schedule.
  */
 const EXPECTED = [
-  'audio_analyze', 'audio_beats', 'audio_bind', 'audio_bus', 'audio_check',
-  'audio_compose', 'audio_convert', 'audio_daw', 'audio_design', 'audio_generate',
+  'audio_analyze', 'audio_audit', 'audio_batch', 'audio_beats', 'audio_bind', 'audio_bus', 'audio_check',
+  'audio_compose', 'audio_convert', 'audio_cues', 'audio_daw', 'audio_design', 'audio_generate', 'audio_handoff',
   'audio_lipsync', 'audio_live', 'audio_loudness', 'audio_master', 'audio_midi',
   'audio_mix', 'audio_mouth', 'audio_mux', 'audio_pattern', 'audio_probe',
   'audio_react', 'audio_regress', 'audio_sampler', 'audio_spatial',
@@ -159,6 +159,9 @@ const BAD_CALLS = [
   ['audio_convert', 'unknown op', { inputs: ['missing.wav'], op: 'bogus', out: 'reject/convert.wav' }, /op/],
   ['audio_convert', 'unknown bit depth', { inputs: ['missing.wav'], op: 'convert', bitDepth: 12, out: 'reject/convert-8.wav' }, /bitDepth/],
 
+  ['audio_cues', 'missing required path', {}],
+  ['audio_cues', 'missing file', { path: 'missing.wav', out: 'reject/cues.json' }, /missing\.wav/],
+
   ['audio_loudness', 'no source', {}],
   ['audio_loudness', 'unknown render preset', { render: { preset: 'nope' }, out: 'reject/loud.wav' }, /preset/],
 
@@ -187,8 +190,18 @@ const BAD_CALLS = [
   ['audio_generate', 'missing required prompt', {}],
   ['audio_generate', 'duration out of range', { prompt: 'rain', duration: 9999, out: 'reject/gen.wav' }, /duration/],
 
+  ['audio_handoff', 'missing required prompt', {}],
+  ['audio_handoff', 'duration out of range', { prompt: 'door slam', durationSeconds: 9999 }, /durationSeconds|duration/],
+
   ['audio_analyze', 'no source', {}],
   ['audio_analyze', 'missing source file', { path: 'missing.wav' }, /missing\.wav/],
+
+  ['audio_audit', 'missing required audio', {}],
+  ['audio_audit', 'negative drift tolerance', { audio: 'missing.wav', maxDriftMs: -1 }, /maxDriftMs/],
+
+  ['audio_batch', 'neither files nor cues', {}],
+  ['audio_batch', 'unknown action', { files: ['missing.wav'], action: 'bogus' }, /action/],
+  ['audio_batch', 'concurrency over the cap', { files: ['missing.wav'], concurrency: 99 }, /concurrency/],
 
   ['audio_bus', 'missing required tracks', {}],
   ['audio_bus', 'empty tracks', { tracks: [], out: 'reject/bus.wav' }, /tracks/],

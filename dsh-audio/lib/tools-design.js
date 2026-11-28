@@ -12,16 +12,10 @@ import { stat } from 'node:fs/promises'
 import { relative } from 'node:path'
 import { defaultOutputPath, hashSpec, measure, resolvePath, toWavBytes, writeFileAtomic } from './audio.js'
 import { PRESETS } from './dsp.js'
-import { RECIPES, designSound, recipeCatalog } from './design.js'
+import { RECIPES, designSound } from './design.js'
 
 const PRESET_NAMES = Object.keys(PRESETS)
 const RECIPE_IDS = Object.keys(RECIPES)
-const CATALOG = recipeCatalog()
-
-/** One line per recipe, used inside the tool description so the model can pick by name. */
-const RECIPE_HELP = CATALOG
-  .map((entry) => `${entry.id}${entry.loop ? ' (loop)' : ''}: ${entry.description}`)
-  .join('\n')
 
 function displayPath (cwd, path) {
   const rel = relative(cwd, path)
@@ -72,18 +66,18 @@ function layerLine (layers) {
 export function registerDesignTools (ctx) {
   ctx.tools.register({
     name: 'audio_design',
-    description: 'Render a complete, layered sound design in one call instead of stacking presets by hand: the layers share one seed, one envelope, one reverb and one key, which is what makes them read as one object rather than four noises. Give `recipe` for the built-in vocabulary (door slams, glass, explosions, sci-fi, magic, water, footsteps, UI, machinery, creatures, alarms) or `layers` for a hand-built stack. Deterministic: the same recipe, seed, variant and intensity always produce identical bytes, so a file can be cached and referenced by path. Returns the path plus measurements and the layer breakdown so the result can be judged without listening.',
+    description: 'Render a complete layered sound design in one call: give `recipe` for a tuned multi-layer design or `layers` for a hand-built stack, sharing one seed, envelope, reverb and key. Deterministic, and returns the layer breakdown.',
     parameters: {
       type: 'object',
       properties: {
         recipe: {
           type: 'string',
           enum: RECIPE_IDS,
-          description: `Named design. Layer plan, envelope, reverb and length are already tuned; adjust with intensity/variant rather than rebuilding it.\n${RECIPE_HELP}`
+          description: 'Named design recipe with layers, envelope, reverb and length already tuned (one line per recipe in the animation-sound skill). Creature recipes: insect-swarm, hoofbeats, wing-flap, creature-breath, creature-hiss, bird-chirp, bird-flock, whale-song, wolf-howl, frog-croak, rodent-squeak, bat-echolocation.'
         },
         layers: {
           type: 'array',
-          description: 'Explicit layer stack, used instead of `recipe`: each layer is one preset placed in the same timeline. Sum them yourself only when no recipe fits.',
+          description: 'Explicit layer stack instead of `recipe`; each layer is one preset on the design timeline.',
           items: {
             type: 'object',
             additionalProperties: false,
@@ -111,12 +105,12 @@ export function registerDesignTools (ctx) {
           }
         },
         seed: { type: 'integer', description: 'Variation seed. Same seed reproduces the same take; 1 by default.' },
-        variant: { type: 'integer', description: 'A different performance of the same design (0 by default): same layers and same noise, retuned a few cents and rebalanced a dB, so it is an alternative take and not a different sound. Use `seed` when you want a different random surface (different grains and noise) instead.' },
-        intensity: { type: 'number', description: '0..1, default 1. Scales the layer drive and the brightness together: 1 is the design as authored, below 1 is a gentler, darker, quieter version for background cues.' },
+        variant: { type: 'integer', description: 'Alternative take of the same design; use seed for a different random surface.' },
+        intensity: { type: 'number', description: '0..1 (default 1): below 1 is gentler, darker and quieter.' },
         duration: { type: 'number', description: 'Override the design length in seconds; longer pads the tail, shorter trims it.' },
-        sampleRate: { type: 'integer', description: 'Defaults to 44100. Use 22050 when file size matters (inline HTML), 48000 for video-grade output.' },
+        sampleRate: { type: 'integer', description: 'Sample rate; default 44100 (22050 for inline, 48000 for video).' },
         loop: { type: 'boolean', description: 'Render a seamless loop. Recipe loops (ids ending in -loop) already default to true.' },
-        out: { type: 'string', description: 'Output path, relative to the working directory. Defaults to assets/audio/<recipe>-<hash>.wav.' }
+        out: { type: 'string', description: 'Output path; default assets/audio/<recipe>-<hash>.wav.' }
       },
       additionalProperties: false
     },

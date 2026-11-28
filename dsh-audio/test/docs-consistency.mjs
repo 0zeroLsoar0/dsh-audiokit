@@ -692,6 +692,41 @@ for (const doc of docs) {
   }
 }
 
+/* ---- (f): prose claims that once named the wrong thing ---- */
+
+// `audio_convert` accepts every layout its `channels` enum lists; the README row
+// used to advertise "单双声道" while the tool wrote 1/2/4/6/8 channels. The enum is
+// the truth here, so the row is checked against it rather than a copied list.
+{
+  const convertRow = docs[0].lines.find((line) => /^\|\s*`audio_convert`\s*\|/.test(line))
+  const channelEnum = toolByName.get('audio_convert')?.parameters?.properties?.channels?.enum ?? []
+  if (convertRow === undefined) {
+    fail('README.md', null, 'the audio_convert row is missing from the tool table')
+  } else if (channelEnum.length === 0) {
+    fail('lib/tools-convert.js', null, 'audio_convert has no channels enum to check the README claim against')
+  } else if (!convertRow.includes(`${channelEnum.join('/')} 声道`)) {
+    fail('README.md', lineAtIndex(docs[0], docs[0].text.indexOf(convertRow)),
+      `audio_convert claims ${channelEnum.join('/')} channels in code, but the README row does not (${convertRow.trim()})`)
+  }
+}
+
+// A doc that names the wrong result key sends a caller to a field that does not
+// exist: `audio_master` has no `report` key — the chain report is nested under
+// `chain`, and that is where `mode` / `modeNote` / `warnings` live.
+{
+  const detail = await readText('docs/DETAIL.zh.md')
+  for (const stale of ['`report.mode`', '`report.modeNote`', '`report.warnings`']) {
+    if (detail.includes(stale)) {
+      fail('docs/DETAIL.zh.md', null, `${stale} is not an audio_master result key; the chain report is under \`chain\``)
+    }
+  }
+  for (const key of ['`chain.mode`', '`chain.modeNote`', '`chain.warnings`']) {
+    if (!detail.includes(key)) {
+      fail('docs/DETAIL.zh.md', null, `${key} is not documented although audio_master returns it`)
+    }
+  }
+}
+
 /* ---- report ---- */
 
 const pad = (value, width) => String(value).padEnd(width)

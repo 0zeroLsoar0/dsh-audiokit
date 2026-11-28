@@ -24,9 +24,11 @@
  * not about a mono downmix). The stereo width stage is bypassed for a surround
  * layout and says so, because a mid/side matrix is defined on one stereo pair.
  * Loudness is measured on the non-LFE channels with the BS.1770-4 surround
- * weights (Ls/Rs at +1.5 dB), exactly as `audio_loudness` measures it;
- * `multichannel.loudnessChannels` is the shared decision and the report states
- * the count used.
+ * weights (Ls/Rs at +1.5 dB), exactly as `audio_loudness` measures it, and a
+ * mono input counts its single channel once (the standard weight, the number
+ * ffmpeg reports) — so a mono master's target is the file's measured loudness,
+ * not a dual-mono number 3 LU away from it. `multichannel.loudnessChannels` is
+ * the shared decision and the report states the count used.
  *
  * Everything is pure and deterministic: the same samples, rate and options
  * produce identical output. No randomness, no state that survives a call — the
@@ -37,6 +39,7 @@
 import { clamp, dbToGain } from './dsp.js'
 import { analyzeLoudness, truePeak } from './lufs.js'
 import { CHANNEL_COUNTS, layoutFor, linkStemGain, loudnessChannels } from './multichannel.js'
+import { YIELD_EVERY_FRAMES, driveAsync, driveSync } from './yield.js'
 
 /* ---------------------------------------------------------------- constants -- */
 
@@ -216,13 +219,33 @@ function asChannelList (samples) {
   return list
 }
 
-/** Copy a channel, replacing non-finite samples with silence. */
-function copyChannel (source) {
-  const out = new Float32Array(source.length)
-  for (let i = 0; i < source.length; i += 1) {
+/** One block of a defensive channel copy (see `copyChannel`). */
+function copyChannelRange (source, out, from, to) {
+  for (let i = from; i < to; i += 1) {
     const value = source[i]
     out[i] = Number.isFinite(value) ? value : 0
   }
+}
+
+/** Copy a channel, replacing non-finite samples with silence, in yielded blocks. */
+function* copyChannelGen (source) {
+  const out = new Float32Array(source.length)
+  for (let from = 0; from < source.length; from += YIELD_EVERY_FRAMES) {
+    copyChannelRange(source, out, from, Math.min(source.length, from + YIELD_EVERY_FRAMES))
+    yield
+  }
+  return out
+}
+
+/** Copy a channel, replacing non-finite samples with silence. */
+function copyChannel (source) {
+  return driveSync(copyChannelGen(source))
+}
+
+/** Copy a channel list defensively, in yielded blocks. */
+function* copyChannels (list) {
+  const out = []
+  for (const channel of list) out.push(yield* copyChannelGen(channel))
   return out
 }
 
@@ -247,9 +270,19 @@ function restoreShape (channels, mono) {
   return mono ? channels[0] : channels
 }
 
-function scaleChannels (channels, gain) {
+function scaleChannelsRange (channels, gain, from, to) {
   for (const channel of channels) {
-    for (let i = 0; i < channel.length; i += 1) channel[i] *= gain
+    for (let i = from; i < to; i += 1) channel[i] *= gain
+  }
+}
+
+/** Scale every channel by one gain, in yielded blocks. */
+function* scaleChannels (channels, gain) {
+  const frames = channels[0].length
+  for (let from = 0; from < frames; from += YIELD_EVERY_FRAMES) {
+    const to = Math.min(frames, from + YIELD_EVERY_FRAMES)
+    scaleChannelsRange(channels, gain, from, to)
+    yield
   }
 }
 
@@ -293,16 +326,29 @@ function measuredTruePeak (channels, rate) {
   return { dbtp, channel, byChannel }
 }
 
+/** Peak of one block of one channel (accumulated into `state[0]`). */
+function channelPeakRange (channel, from, to, state) {
+  let peak = state[0]
+  for (let index = from; index < to; index += 1) {
+    const magnitude = Math.abs(channel[index])
+    if (magnitude > peak) peak = magnitude
+  }
+  state[0] = peak
+}
+
 /** Per-channel sample peak in dBFS, floored at -120 like the meter does. */
-function samplePeaksDbfs (channels) {
-  return channels.map((channel) => {
-    let peak = 0
-    for (let index = 0; index < channel.length; index += 1) {
-      const magnitude = Math.abs(channel[index])
-      if (magnitude > peak) peak = magnitude
+function* samplePeaksDbfs (channels) {
+  const peaks = []
+  for (const channel of channels) {
+    const state = new Float64Array(1)
+    for (let from = 0; from < channel.length; from += YIELD_EVERY_FRAMES) {
+      const to = Math.min(channel.length, from + YIELD_EVERY_FRAMES)
+      channelPeakRange(channel, from, to, state)
+      yield
     }
-    return round2(peak > 0 ? 20 * Math.log10(peak) : -120)
-  })
+    peaks.push(round2(state[0] > 0 ? 20 * Math.log10(state[0]) : -120))
+  }
+  return peaks
 }
 
 /* ------------------------------------------------------------------ biquads -- */
@@ -336,20 +382,22 @@ function butterworthCoefficients (rate, hz, highPass) {
   }
 }
 
-/** Run one channel through an LR4 low- or high-pass at `hz`. */
-function lr4Pass (channel, rate, hz, highPass) {
-  const { b0, b1, b2, a1, a2 } = butterworthCoefficients(rate, hz, highPass)
-  const frames = channel.length
-  const out = new Float32Array(frames)
-  let x1 = 0
-  let x2 = 0
-  let y1 = 0
-  let y2 = 0
-  let u1 = 0
-  let u2 = 0
-  let v1 = 0
-  let v2 = 0
-  for (let i = 0; i < frames; i += 1) {
+/** One block of a single LR4 section pair (see `lr4Pass`). */
+function lr4Range (channel, out, coeffs, from, to, state) {
+  const b0 = coeffs.b0
+  const b1 = coeffs.b1
+  const b2 = coeffs.b2
+  const a1 = coeffs.a1
+  const a2 = coeffs.a2
+  let x1 = state[0]
+  let x2 = state[1]
+  let y1 = state[2]
+  let y2 = state[3]
+  let u1 = state[4]
+  let u2 = state[5]
+  let v1 = state[6]
+  let v2 = state[7]
+  for (let i = from; i < to; i += 1) {
     const input = channel[i]
     const first = b0 * input + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
     x2 = x1
@@ -362,6 +410,26 @@ function lr4Pass (channel, rate, hz, highPass) {
     v2 = v1
     v1 = second
     out[i] = second
+  }
+  state[0] = x1
+  state[1] = x2
+  state[2] = y1
+  state[3] = y2
+  state[4] = u1
+  state[5] = u2
+  state[6] = v1
+  state[7] = v2
+}
+
+/** Run one channel through an LR4 low- or high-pass at `hz`, in yielded blocks. */
+function* lr4Pass (channel, rate, hz, highPass) {
+  const coeffs = butterworthCoefficients(rate, hz, highPass)
+  const frames = channel.length
+  const out = new Float32Array(frames)
+  const state = new Float64Array(8)
+  for (let from = 0; from < frames; from += YIELD_EVERY_FRAMES) {
+    lr4Range(channel, out, coeffs, from, Math.min(frames, from + YIELD_EVERY_FRAMES), state)
+    yield
   }
   return out
 }
@@ -377,11 +445,8 @@ function lr4Pass (channel, rate, hz, highPass) {
  * (four biquad sections per split per channel), so a three-band split costs two
  * passes over the file rather than eight.
  */
-function splitPair (channels, rate, hz) {
-  const lowPass = butterworthCoefficients(rate, hz, false)
-  const highPass = butterworthCoefficients(rate, hz, true)
-  // Hoisted into scalars: this loop runs once per sample of the whole file and
-  // a property load per coefficient would double the work it does.
+/** One block of one channel through the two LR4 sections of a split. */
+function lr4PairRange (channel, low, high, lowPass, highPass, from, to, state) {
   const lb0 = lowPass.b0
   const lb1 = lowPass.b1
   const lb2 = lowPass.b2
@@ -392,6 +457,68 @@ function splitPair (channels, rate, hz) {
   const hb2 = highPass.b2
   const ha1 = highPass.a1
   const ha2 = highPass.a2
+  let lx1 = state[0]
+  let lx2 = state[1]
+  let ly1 = state[2]
+  let ly2 = state[3]
+  let lu1 = state[4]
+  let lu2 = state[5]
+  let lv1 = state[6]
+  let lv2 = state[7]
+  let hx1 = state[8]
+  let hx2 = state[9]
+  let hy1 = state[10]
+  let hy2 = state[11]
+  let hu1 = state[12]
+  let hu2 = state[13]
+  let hv1 = state[14]
+  let hv2 = state[15]
+  for (let i = from; i < to; i += 1) {
+    const input = channel[i]
+    const lowFirst = lb0 * input + lb1 * lx1 + lb2 * lx2 - la1 * ly1 - la2 * ly2
+    lx2 = lx1
+    lx1 = input
+    ly2 = ly1
+    ly1 = lowFirst
+    const lowSecond = lb0 * lowFirst + lb1 * lu1 + lb2 * lu2 - la1 * lv1 - la2 * lv2
+    lu2 = lu1
+    lu1 = lowFirst
+    lv2 = lv1
+    lv1 = lowSecond
+    low[i] = lowSecond
+    const highFirst = hb0 * input + hb1 * hx1 + hb2 * hx2 - ha1 * hy1 - ha2 * hy2
+    hx2 = hx1
+    hx1 = input
+    hy2 = hy1
+    hy1 = highFirst
+    const highSecond = hb0 * highFirst + hb1 * hu1 + hb2 * hu2 - ha1 * hv1 - ha2 * hv2
+    hu2 = hu1
+    hu1 = highFirst
+    hv2 = hv1
+    hv1 = highSecond
+    high[i] = highSecond
+  }
+  state[0] = lx1
+  state[1] = lx2
+  state[2] = ly1
+  state[3] = ly2
+  state[4] = lu1
+  state[5] = lu2
+  state[6] = lv1
+  state[7] = lv2
+  state[8] = hx1
+  state[9] = hx2
+  state[10] = hy1
+  state[11] = hy2
+  state[12] = hu1
+  state[13] = hu2
+  state[14] = hv1
+  state[15] = hv2
+}
+
+function* splitPair (channels, rate, hz) {
+  const lowPass = butterworthCoefficients(rate, hz, false)
+  const highPass = butterworthCoefficients(rate, hz, true)
   const lows = []
   const highs = []
   for (const channel of channels) {
@@ -399,46 +526,10 @@ function splitPair (channels, rate, hz) {
     const low = new Float32Array(frames)
     const high = new Float32Array(frames)
     // Low-pass state, then high-pass state, both cascaded twice (LR4).
-    let lx1 = 0
-    let lx2 = 0
-    let ly1 = 0
-    let ly2 = 0
-    let lu1 = 0
-    let lu2 = 0
-    let lv1 = 0
-    let lv2 = 0
-    let hx1 = 0
-    let hx2 = 0
-    let hy1 = 0
-    let hy2 = 0
-    let hu1 = 0
-    let hu2 = 0
-    let hv1 = 0
-    let hv2 = 0
-    for (let i = 0; i < frames; i += 1) {
-      const input = channel[i]
-      const lowFirst = lb0 * input + lb1 * lx1 + lb2 * lx2 - la1 * ly1 - la2 * ly2
-      lx2 = lx1
-      lx1 = input
-      ly2 = ly1
-      ly1 = lowFirst
-      const lowSecond = lb0 * lowFirst + lb1 * lu1 + lb2 * lu2 - la1 * lv1 - la2 * lv2
-      lu2 = lu1
-      lu1 = lowFirst
-      lv2 = lv1
-      lv1 = lowSecond
-      low[i] = lowSecond
-      const highFirst = hb0 * input + hb1 * hx1 + hb2 * hx2 - ha1 * hy1 - ha2 * hy2
-      hx2 = hx1
-      hx1 = input
-      hy2 = hy1
-      hy1 = highFirst
-      const highSecond = hb0 * highFirst + hb1 * hu1 + hb2 * hu2 - ha1 * hv1 - ha2 * hv2
-      hu2 = hu1
-      hu1 = highFirst
-      hv2 = hv1
-      hv1 = highSecond
-      high[i] = highSecond
+    const state = new Float64Array(16)
+    for (let from = 0; from < frames; from += YIELD_EVERY_FRAMES) {
+      lr4PairRange(channel, low, high, lowPass, highPass, from, Math.min(frames, from + YIELD_EVERY_FRAMES), state)
+      yield
     }
     lows.push(low)
     highs.push(high)
@@ -446,12 +537,12 @@ function splitPair (channels, rate, hz) {
   return { low: lows, high: highs }
 }
 
-function splitIntoBands (channels, rate, splits) {
+function* splitIntoBands (channels, rate, splits) {
   const bands = []
   let highPath = channels
   let lo = 0
   for (const splitHz of splits) {
-    const pair = splitPair(highPath, rate, splitHz)
+    const pair = yield* splitPair(highPath, rate, splitHz)
     bands.push({ lo, hi: splitHz, channels: pair.low })
     highPath = pair.high
     lo = splitHz
@@ -563,15 +654,17 @@ function interpolationKernel (taps) {
  * The 8-tap convolution is unrolled because this is the one loop in the module
  * that touches every sample of every channel; the phases are visited one at a
  * time so each pass over the channel is a straight, prefetch-friendly read.
+ *
+ * Yields between blocks. Max-accumulation into the envelope is order-independent
+ * (and exact), so splitting this pass cannot change a single envelope value.
  */
-function peakEnvelope (channels) {
+function* peakEnvelope (channels) {
   const frames = channels[0].length
   const envelope = new Float32Array(frames)
-  for (const channel of channels) {
-    for (let i = 0; i < frames; i += 1) {
-      const magnitude = channel[i] < 0 ? -channel[i] : channel[i]
-      if (magnitude > envelope[i]) envelope[i] = magnitude
-    }
+  for (let from = 0; from < frames; from += YIELD_EVERY_FRAMES) {
+    const to = Math.min(frames, from + YIELD_EVERY_FRAMES)
+    envelopePeakRange(channels, envelope, from, to)
+    yield
   }
   const { phases } = interpolationKernel(DETECTION_TAPS)
   const first = DETECTION_TAPS / 2 - 1
@@ -580,26 +673,50 @@ function peakEnvelope (channels) {
   for (const channel of channels) {
     for (let phase = 1; phase < TRUE_PEAK_OVERSAMPLE; phase += 1) {
       const kernel = phases[phase]
-      const k0 = kernel[0]
-      const k1 = kernel[1]
-      const k2 = kernel[2]
-      const k3 = kernel[3]
-      const k4 = kernel[4]
-      const k5 = kernel[5]
-      const k6 = kernel[6]
-      const k7 = kernel[7]
-      let base = 0
-      for (let i = first; i <= last; i += 1) {
-        const accumulator = channel[base] * k0 + channel[base + 1] * k1 + channel[base + 2] * k2 +
-          channel[base + 3] * k3 + channel[base + 4] * k4 + channel[base + 5] * k5 +
-          channel[base + 6] * k6 + channel[base + 7] * k7
-        const magnitude = accumulator < 0 ? -accumulator : accumulator
-        if (magnitude > envelope[i]) envelope[i] = magnitude
-        base += 1
+      for (let from = first; from <= last; from += YIELD_EVERY_FRAMES) {
+        const to = Math.min(last + 1, from + YIELD_EVERY_FRAMES)
+        envelopeInterpRange(channel, envelope, kernel, first, from, to)
+        yield
       }
     }
   }
   return envelope
+}
+
+/** One block of the sample-magnitude envelope: every channel's worst sample wins. */
+function envelopePeakRange (channels, envelope, from, to) {
+  for (const channel of channels) {
+    for (let i = from; i < to; i += 1) {
+      const magnitude = channel[i] < 0 ? -channel[i] : channel[i]
+      if (magnitude > envelope[i]) envelope[i] = magnitude
+    }
+  }
+}
+
+/**
+ * One block of one interpolation phase over one channel.
+ *
+ * `from` is an absolute sample position; the 8-tap window for position `i` starts
+ * at `i - first`, exactly like the single-pass loop's running `base` counter.
+ */
+function envelopeInterpRange (channel, envelope, kernel, first, from, to) {
+  const k0 = kernel[0]
+  const k1 = kernel[1]
+  const k2 = kernel[2]
+  const k3 = kernel[3]
+  const k4 = kernel[4]
+  const k5 = kernel[5]
+  const k6 = kernel[6]
+  const k7 = kernel[7]
+  let base = from - first
+  for (let i = from; i < to; i += 1) {
+    const accumulator = channel[base] * k0 + channel[base + 1] * k1 + channel[base + 2] * k2 +
+      channel[base + 3] * k3 + channel[base + 4] * k4 + channel[base + 5] * k5 +
+      channel[base + 6] * k6 + channel[base + 7] * k7
+    const magnitude = accumulator < 0 ? -accumulator : accumulator
+    if (magnitude > envelope[i]) envelope[i] = magnitude
+    base += 1
+  }
 }
 
 /* ----------------------------------------------------------------- limiter -- */
@@ -611,6 +728,31 @@ function resolveLimiterOptions (options = {}) {
     lookaheadMs: numberOr(options.lookaheadMs, 5, 'lookaheadMs', 0.5, 20),
     releaseMs: numberOr(options.releaseMs, 120, 'releaseMs', 20, 1000)
   }
+}
+
+
+/** One block of the backward lookahead ramp, in descending sample order. */
+function requiredGainRange (envelope, gain, ceiling, inputGain, slope, from, to, state) {
+  let next = state[0]
+  for (let n = to - 1; n >= from; n -= 1) {
+    const peak = envelope[n] * inputGain
+    const required = peak > ceiling ? ceiling / peak : 1
+    const limited = required < next + slope ? required : next + slope
+    gain[n] = limited
+    next = limited
+  }
+  state[0] = next
+}
+
+/** One block of the release smoothing, in ascending sample order. */
+function releaseGainRange (gain, releaseCoefficient, from, to, state) {
+  let smoothed = state[0]
+  for (let n = from; n < to; n += 1) {
+    const target = gain[n]
+    smoothed = target < smoothed ? target : smoothed + (target - smoothed) * releaseCoefficient
+    gain[n] = smoothed
+  }
+  state[0] = smoothed
 }
 
 /**
@@ -634,55 +776,104 @@ function resolveLimiterOptions (options = {}) {
  * `inputGainDb` folds the chain's static gain into the required-gain
  * computation. Because scaling is linear it scales the envelope exactly, which
  * lets the outer loop re-plan the curve without re-running detection.
+ *
+ * Both passes are order-dependent, so they are split into blocks *in their own
+ * direction* (descending for the lookahead ramp, ascending for the release) with
+ * the loop-carried value in a one-double state: the values written are exactly
+ * those of an unsplit pass.
  */
-function limiterGainCurve (envelope, rate, options) {
+function* limiterGainCurveGen (envelope, rate, options) {
   const ceiling = dbToGain(options.ceilingDbtp - DETECTION_GUARD_DB)
   const inputGain = dbToGain(options.inputGainDb ?? 0)
   const frames = envelope.length
   const lookahead = Math.max(1, Math.round(options.lookaheadMs * 0.001 * rate))
   const slope = 1 / lookahead
   const gain = new Float32Array(frames)
-  let next = 1
-  for (let n = frames - 1; n >= 0; n -= 1) {
-    const peak = envelope[n] * inputGain
-    const required = peak > ceiling ? ceiling / peak : 1
-    const limited = required < next + slope ? required : next + slope
-    gain[n] = limited
-    next = limited
+  const rampState = new Float64Array(1)
+  rampState[0] = 1
+  for (let to = frames; to > 0; to -= YIELD_EVERY_FRAMES) {
+    const from = Math.max(0, to - YIELD_EVERY_FRAMES)
+    requiredGainRange(envelope, gain, ceiling, inputGain, slope, from, to, rampState)
+    yield
   }
   const releaseCoefficient = 1 - Math.exp(-1 / Math.max(1, options.releaseMs * 0.001 * rate))
-  let smoothed = 1
-  for (let n = 0; n < frames; n += 1) {
-    const target = gain[n]
-    smoothed = target < smoothed ? target : smoothed + (target - smoothed) * releaseCoefficient
-    gain[n] = smoothed
+  const releaseState = new Float64Array(1)
+  releaseState[0] = 1
+  for (let from = 0; from < frames; from += YIELD_EVERY_FRAMES) {
+    const to = Math.min(frames, from + YIELD_EVERY_FRAMES)
+    releaseGainRange(gain, releaseCoefficient, from, to, releaseState)
+    yield
   }
   return gain
 }
 
-function applyGainCurve (channels, curve, inputGain = 1) {
+/** One block of the mono gain-curve application. */
+function gainCurveMonoRange (source, out, curve, inputGain, from, to) {
+  for (let i = from; i < to; i += 1) out[i] = source[i] * curve[i] * inputGain
+}
+
+/** One block of the linked multichannel gain-curve application. */
+function gainCurveChannelsRange (channels, output, curve, inputGain, from, to) {
+  for (let i = from; i < to; i += 1) {
+    const gain = curve[i] * inputGain
+    for (let channel = 0; channel < channels.length; channel += 1) output[channel][i] = channels[channel][i] * gain
+  }
+}
+
+/** Apply one linked gain curve to a channel list, in yielded blocks. */
+function* applyGainCurve (channels, curve, inputGain = 1) {
   const frames = curve.length
   if (channels.length === 1) {
     const source = channels[0]
     const out = new Float32Array(frames)
-    for (let i = 0; i < frames; i += 1) out[i] = source[i] * curve[i] * inputGain
+    for (let from = 0; from < frames; from += YIELD_EVERY_FRAMES) {
+      const to = Math.min(frames, from + YIELD_EVERY_FRAMES)
+      gainCurveMonoRange(source, out, curve, inputGain, from, to)
+      yield
+    }
     return [out]
   }
   // One gain curve for every channel: the limiter lowers a multichannel image
   // without deforming it, because all channels are scaled by the same number at
   // every instant.
   const output = channels.map(() => new Float32Array(frames))
-  for (let i = 0; i < frames; i += 1) {
-    const gain = curve[i] * inputGain
-    for (let channel = 0; channel < channels.length; channel += 1) output[channel][i] = channels[channel][i] * gain
+  for (let from = 0; from < frames; from += YIELD_EVERY_FRAMES) {
+    const to = Math.min(frames, from + YIELD_EVERY_FRAMES)
+    gainCurveChannelsRange(channels, output, curve, inputGain, from, to)
+    yield
   }
   return output
 }
 
-function maxGainReductionDb (curve) {
-  let minimum = 1
-  for (let i = 0; i < curve.length; i += 1) if (curve[i] < minimum) minimum = curve[i]
-  return minimum > 0 ? -20 * Math.log10(minimum) : 120
+/** Minimum of one block of the curve, accumulated into `state[0]`. */
+function curveMinimumRange (curve, from, to, state) {
+  let minimum = state[0]
+  for (let i = from; i < to; i += 1) if (curve[i] < minimum) minimum = curve[i]
+  state[0] = minimum
+}
+
+function* maxGainReductionDb (curve) {
+  const state = new Float64Array(1)
+  state[0] = 1
+  for (let from = 0; from < curve.length; from += YIELD_EVERY_FRAMES) {
+    const to = Math.min(curve.length, from + YIELD_EVERY_FRAMES)
+    curveMinimumRange(curve, from, to, state)
+    yield
+  }
+  return state[0] > 0 ? -20 * Math.log10(state[0]) : 120
+}
+
+/** Sum/count of one block of the stride-16 mean-reduction sample. */
+function meanReductionRange (curve, stride, from, to, state) {
+  let sum = state[0]
+  let count = state[1]
+  for (let i = from; i < to; i += stride) {
+    const value = curve[i]
+    if (value < 1) sum += -20 * Math.log10(value)
+    count += 1
+  }
+  state[0] = sum
+  state[1] = count
 }
 
 /**
@@ -693,25 +884,23 @@ function maxGainReductionDb (curve) {
  * static gain buys, which is what lets the chain plan the next move before
  * spending a measurement on it.
  */
-function meanGainReductionDb (curve) {
+function* meanGainReductionDb (curve) {
   const stride = 16
-  let sum = 0
-  let count = 0
-  for (let i = 0; i < curve.length; i += stride) {
-    const value = curve[i]
-    if (value < 1) sum += -20 * Math.log10(value)
-    count += 1
+  const state = new Float64Array(2)
+  for (let from = 0; from < curve.length; from += YIELD_EVERY_FRAMES) {
+    const to = Math.min(curve.length, from + YIELD_EVERY_FRAMES)
+    meanReductionRange(curve, stride, from, to, state)
+    yield
   }
-  return count > 0 ? sum / count : 0
+  return state[1] > 0 ? state[0] / state[1] : 0
 }
 
 /** One limiting pass; no metering, so the chain can call it per iteration. */
-function limitOnce (channels, rate, envelope, options, inputGainDb) {
-  const curve = limiterGainCurve(envelope, rate, { ...options, inputGainDb })
-  return {
-    samples: applyGainCurve(channels, curve, dbToGain(inputGainDb)),
-    gainReductionDb: maxGainReductionDb(curve)
-  }
+function* limitOnce (channels, rate, envelope, options, inputGainDb) {
+  const curve = yield* limiterGainCurveGen(envelope, rate, { ...options, inputGainDb })
+  const samples = yield* applyGainCurve(channels, curve, dbToGain(inputGainDb))
+  const gainReductionDb = yield* maxGainReductionDb(curve)
+  return { samples, gainReductionDb }
 }
 
 /* --------------------------------------------------------- multiband comp -- */
@@ -727,21 +916,21 @@ function limitOnce (channels, rate, envelope, options, inputGainDb) {
  * mastering attack time, and it removes a transcendental call and a branch per
  * sample from the hot loop.
  */
-function compressBand (channels, rate, spec, kneeDb) {
-  const frames = channels[0].length
+/** One block of `compressBand`, aligned to the control-block grid. */
+function compressBandRange (channels, coeffs, from, to, state) {
   const channelCount = channels.length
-  const slope = spec.ratio > 1 ? 1 - 1 / spec.ratio : 0
-  const makeupGain = dbToGain(spec.makeupDb)
-  const blockSeconds = COMPRESSOR_CONTROL_SAMPLES / rate
-  const attackCoefficient = 1 - Math.exp(-blockSeconds / Math.max(1e-4, spec.attackMs * 0.001))
-  const releaseCoefficient = 1 - Math.exp(-blockSeconds / Math.max(1e-4, spec.releaseMs * 0.001))
-  const halfKnee = kneeDb / 2
-  const thresholdDb = spec.thresholdDb
-  let envelope = 0
-  let maxGainReduction = 0
-  let previousGain = makeupGain
-  for (let start = 0; start < frames; start += COMPRESSOR_CONTROL_SAMPLES) {
-    const end = start + COMPRESSOR_CONTROL_SAMPLES < frames ? start + COMPRESSOR_CONTROL_SAMPLES : frames
+  const slope = coeffs.slope
+  const makeupGain = coeffs.makeupGain
+  const attackCoefficient = coeffs.attackCoefficient
+  const releaseCoefficient = coeffs.releaseCoefficient
+  const halfKnee = coeffs.halfKnee
+  const kneeDb = coeffs.kneeDb
+  const thresholdDb = coeffs.thresholdDb
+  let envelope = state[0]
+  let maxGainReduction = state[1]
+  let previousGain = state[2]
+  for (let start = from; start < to; start += COMPRESSOR_CONTROL_SAMPLES) {
+    const end = start + COMPRESSOR_CONTROL_SAMPLES < to ? start + COMPRESSOR_CONTROL_SAMPLES : to
     // Block peak power across *every* channel drives one linked detector, and
     // the resulting gain is written to every channel. A per-channel detector
     // would compress a hard-panned hit only where it lands and pump the surround
@@ -772,7 +961,46 @@ function compressBand (channels, rate, spec, kneeDb) {
       for (let channel = 0; channel < channelCount; channel += 1) channels[channel][i] *= previousGain
     }
   }
-  return maxGainReduction
+  state[0] = envelope
+  state[1] = maxGainReduction
+  state[2] = previousGain
+}
+
+/**
+ * RMS compressor for one band, stereo-linked, in cooperatively-yielded blocks.
+ *
+ * The detector is a one-pole RMS follower across the loudest channel, so a hard
+ * left-panned hit ducks both channels (an unlinked detector moves the stereo
+ * image). Detector and gain law run once per control block of
+ * `COMPRESSOR_CONTROL_SAMPLES` samples and the gain is interpolated inside the
+ * block: at 48 kHz that is a 0.17 ms attack resolution, far finer than any
+ * mastering attack time, and it removes a transcendental call and a branch per
+ * sample from the hot loop.
+ *
+ * The cooperation interval is a whole number of control blocks, so a block
+ * boundary never falls inside one: the detector sees exactly the same control
+ * grid an unsplit pass would.
+ * @returns {Generator<unknown, number, unknown>} the maximum gain reduction, dB.
+ */
+function* compressBand (channels, rate, spec, kneeDb) {
+  const frames = channels[0].length
+  const coeffs = {
+    slope: spec.ratio > 1 ? 1 - 1 / spec.ratio : 0,
+    makeupGain: dbToGain(spec.makeupDb),
+    attackCoefficient: 1 - Math.exp(-(COMPRESSOR_CONTROL_SAMPLES / rate) / Math.max(1e-4, spec.attackMs * 0.001)),
+    releaseCoefficient: 1 - Math.exp(-(COMPRESSOR_CONTROL_SAMPLES / rate) / Math.max(1e-4, spec.releaseMs * 0.001)),
+    halfKnee: kneeDb / 2,
+    kneeDb,
+    thresholdDb: spec.thresholdDb
+  }
+  const state = new Float64Array(3)
+  state[2] = coeffs.makeupGain
+  for (let from = 0; from < frames; from += YIELD_EVERY_FRAMES) {
+    const to = Math.min(frames, from + YIELD_EVERY_FRAMES)
+    compressBandRange(channels, coeffs, from, to, state)
+    yield
+  }
+  return state[1]
 }
 
 /* --------------------------------------------------------------- presets -- */
@@ -815,6 +1043,43 @@ const DEFAULT_BANDS = [
  *   hi: number, gainReductionDb: number }[] } }}
  */
 export function multibandCompressor (samples, sampleRate, options = {}) {
+  return driveSync(multibandCompressorGen(samples, sampleRate, options))
+}
+
+/** One block of the band-sum: copy the first band, then add the others in order. */
+function sumBandsRange (sum, sample, from, to, first) {
+  if (first) {
+    for (let i = from; i < to; i += 1) sum[i] = sample[i]
+    return
+  }
+  for (let i = from; i < to; i += 1) sum[i] += sample[i]
+}
+
+/**
+ * Split the signal into bands and compress each one independently (Linkwitz-Riley
+ * 4th-order crossovers, cascaded tree), then sum them back.
+ *
+ * The report is the number an agent needs to judge the result: per band, the
+ * maximum gain reduction in dB. A band's reduction says whether the compressor
+ * touched that part of the spectrum at all, which is the difference between
+ * "the low end is being controlled" and "the whole mix is just quieter".
+ *
+ * Generator form: every pass over the samples (the crossover tree, the per-band
+ * compressor, the band sum) yields between blocks, so the chain can stay
+ * interruptible end to end. `multibandCompressor` drains it synchronously.
+ *
+ * @param {Float32Array|Float32Array[]} samples - mono buffer or one per channel.
+ * @param {number} sampleRate - Hz.
+ * @param {object} [options] - band list and knee.
+ * @param {object[]} [options.bands] - per band `{ splitHz, ratio, thresholdDb,
+ *   attackMs, releaseMs, makeupDb }`; `splitHz` is the crossover at the band's
+ *   top and is ignored on the last band.
+ * @param {number} [options.kneeDb=6] - soft-knee width in dB.
+ * @returns {Generator<unknown, { samples: Float32Array|Float32Array[], report: {
+ *   crossover: string, kneeDb: number, bandCount: number,
+ *   bands: { name: string, lo: number, hi: number, gainReductionDb: number }[] } }, unknown>}
+ */
+export function* multibandCompressorGen (samples, sampleRate, options = {}) {
   const rate = validateRate(sampleRate)
   const mono = !Array.isArray(samples)
   const list = asChannelList(samples)
@@ -825,18 +1090,22 @@ export function multibandCompressor (samples, sampleRate, options = {}) {
   const splits = bands.slice(0, -1).map((band) => band.hi)
   // With no split the "bands" list is the input itself, which compression would
   // then modify in place; copy it so the caller's samples stay untouched.
-  const working = splits.length === 0 ? list.map(copyChannel) : sanitiseChannels(list)
-  const split = splitIntoBands(working, rate, splits)
+  const working = splits.length === 0
+    ? yield* copyChannels(list)
+    : sanitiseChannels(list)
+  const split = yield* splitIntoBands(working, rate, splits)
 
-  const reports = split.map((band, index) => {
-    const gainReductionDb = compressBand(band.channels, rate, bands[index], kneeDb)
-    return {
+  const reports = []
+  for (let index = 0; index < split.length; index += 1) {
+    const band = split[index]
+    const gainReductionDb = yield* compressBand(band.channels, rate, bands[index], kneeDb)
+    reports.push({
       name: bands[index].name,
       lo: Math.round(band.lo),
       hi: Math.round(band.hi),
       gainReductionDb: round2(gainReductionDb)
-    }
-  })
+    })
+  }
 
   // Fuse the band sum into one destination write per sample: summing band by
   // band would stream the destination three times for a three-band split.
@@ -844,11 +1113,13 @@ export function multibandCompressor (samples, sampleRate, options = {}) {
   const mixed = []
   for (let channel = 0; channel < list.length; channel += 1) {
     const sum = new Float32Array(frames)
-    const firstBand = bandChannels[0][channel]
-    for (let i = 0; i < frames; i += 1) sum[i] = firstBand[i]
-    for (let band = 1; band < bandChannels.length; band += 1) {
+    for (let band = 0; band < bandChannels.length; band += 1) {
       const source = bandChannels[band][channel]
-      for (let i = 0; i < frames; i += 1) sum[i] += source[i]
+      for (let from = 0; from < frames; from += YIELD_EVERY_FRAMES) {
+        const to = Math.min(frames, from + YIELD_EVERY_FRAMES)
+        sumBandsRange(sum, source, from, to, band === 0)
+        yield
+      }
     }
     mixed.push(sum)
   }
@@ -935,6 +1206,56 @@ export function transientShaper (samples, sampleRate, options = {}) {
   }
 }
 
+/** One block of the L/R -> mid/side matrix, accumulating the side energy. */
+function midSideRange (input, mid, side, from, to, state) {
+  let sideSquaresBefore = state[0]
+  for (let i = from; i < to; i += 1) {
+    const leftSample = input[0][i]
+    const rightSample = input[1][i]
+    mid[i] = (leftSample + rightSample) * 0.5
+    side[i] = (leftSample - rightSample) * 0.5
+    sideSquaresBefore += side[i] * side[i]
+  }
+  state[0] = sideSquaresBefore
+}
+
+/** One block of the width matrix and the mono-safety measurements. */
+function widthRange (input, mid, shaped, left, right, width, from, to, state) {
+  let maxMonoError = state[0]
+  let monoScale = state[1]
+  let sideSquaresAfter = state[2]
+  let crossLeft = state[3]
+  let crossRight = state[4]
+  let energyLeft = state[5]
+  let energyRight = state[6]
+  for (let i = from; i < to; i += 1) {
+    const scaled = shaped[i] * width
+    const outLeft = mid[i] + scaled
+    const outRight = mid[i] - scaled
+    left[i] = outLeft
+    right[i] = outRight
+    const sideAfter = (outLeft - outRight) * 0.5
+    sideSquaresAfter += sideAfter * sideAfter
+    const sampleLeft = input[0][i]
+    const sampleRight = input[1][i]
+    const monoOriginal = Math.abs(sampleLeft + sampleRight)
+    if (monoOriginal > monoScale) monoScale = monoOriginal
+    const monoError = Math.abs(outLeft + outRight - sampleLeft - sampleRight)
+    if (monoError > maxMonoError) maxMonoError = monoError
+    crossLeft += sampleLeft * outLeft
+    crossRight += sampleRight * outRight
+    energyLeft += sampleLeft * sampleLeft
+    energyRight += sampleRight * sampleRight
+  }
+  state[0] = maxMonoError
+  state[1] = monoScale
+  state[2] = sideSquaresAfter
+  state[3] = crossLeft
+  state[4] = crossRight
+  state[5] = energyLeft
+  state[6] = energyRight
+}
+
 /**
  * Mid/side stereo width with optional bass mono-folding.
  *
@@ -954,6 +1275,8 @@ export function transientShaper (samples, sampleRate, options = {}) {
  * stereo pair, and which pair of a surround layout it should touch is not a
  * decision a preset gets to make. The report says the stage was bypassed.
  *
+ * Synchronous wrapper around `stereoWidthGen` (see that generator for the
+ * cooperation points).
  * @param {Float32Array|Float32Array[]} samples - mono buffer or one per channel.
  * @param {number} sampleRate - Hz.
  * @param {object} [options] - `{ width, bassMonoHz }`; width 0 = mono, 1 =
@@ -964,6 +1287,17 @@ export function transientShaper (samples, sampleRate, options = {}) {
  *   polarityPreserved: boolean, monoSafe: boolean } }}
  */
 export function stereoWidth (samples, sampleRate, options = {}) {
+  return driveSync(stereoWidthGen(samples, sampleRate, options))
+}
+
+/**
+ * Generator form of the width stage: the matrix passes yield between blocks.
+ * @param {Float32Array|Float32Array[]} samples - mono buffer or one per channel.
+ * @param {number} sampleRate - Hz.
+ * @param {object} [options] - `{ width, bassMonoHz }`.
+ * @returns {Generator<unknown, { samples: Float32Array|Float32Array[], report: object }, unknown>}
+ */
+export function* stereoWidthGen (samples, sampleRate, options = {}) {
   const rate = validateRate(sampleRate)
   const mono = !Array.isArray(samples)
   const list = asChannelList(samples)
@@ -1012,14 +1346,13 @@ export function stereoWidth (samples, sampleRate, options = {}) {
   const frames = input[0].length
   const mid = new Float32Array(frames)
   const side = new Float32Array(frames)
-  let sideSquaresBefore = 0
-  for (let i = 0; i < frames; i += 1) {
-    const leftSample = input[0][i]
-    const rightSample = input[1][i]
-    mid[i] = (leftSample + rightSample) * 0.5
-    side[i] = (leftSample - rightSample) * 0.5
-    sideSquaresBefore += side[i] * side[i]
+  const matrixState = new Float64Array(1)
+  for (let from = 0; from < frames; from += YIELD_EVERY_FRAMES) {
+    const to = Math.min(frames, from + YIELD_EVERY_FRAMES)
+    midSideRange(input, mid, side, from, to, matrixState)
+    yield
   }
+  const sideSquaresBefore = matrixState[0]
 
   let shaped = side
   if (bassMonoHz > 0) {
@@ -1028,37 +1361,24 @@ export function stereoWidth (samples, sampleRate, options = {}) {
     // a low-pass from the side would not do this — an LR4 low-pass shifted in
     // phase leaves a residual that can be *louder* than the original side at the
     // corner, which is the opposite of mono bass.
-    shaped = lr4Pass(side, rate, bassMonoHz, true)
+    shaped = yield* lr4Pass(side, rate, bassMonoHz, true)
   }
 
   const left = new Float32Array(frames)
   const right = new Float32Array(frames)
-  let maxMonoError = 0
-  let monoScale = 0
-  let sideSquaresAfter = 0
-  let crossLeft = 0
-  let crossRight = 0
-  let energyLeft = 0
-  let energyRight = 0
-  for (let i = 0; i < frames; i += 1) {
-    const scaled = shaped[i] * width
-    const outLeft = mid[i] + scaled
-    const outRight = mid[i] - scaled
-    left[i] = outLeft
-    right[i] = outRight
-    const sideAfter = (outLeft - outRight) * 0.5
-    sideSquaresAfter += sideAfter * sideAfter
-    const sampleLeft = input[0][i]
-    const sampleRight = input[1][i]
-    const monoOriginal = Math.abs(sampleLeft + sampleRight)
-    if (monoOriginal > monoScale) monoScale = monoOriginal
-    const monoError = Math.abs(outLeft + outRight - sampleLeft - sampleRight)
-    if (monoError > maxMonoError) maxMonoError = monoError
-    crossLeft += sampleLeft * outLeft
-    crossRight += sampleRight * outRight
-    energyLeft += sampleLeft * sampleLeft
-    energyRight += sampleRight * sampleRight
+  const widthState = new Float64Array(7)
+  for (let from = 0; from < frames; from += YIELD_EVERY_FRAMES) {
+    const to = Math.min(frames, from + YIELD_EVERY_FRAMES)
+    widthRange(input, mid, shaped, left, right, width, from, to, widthState)
+    yield
   }
+  const maxMonoError = widthState[0]
+  const monoScale = widthState[1]
+  const sideSquaresAfter = widthState[2]
+  const crossLeft = widthState[3]
+  const crossRight = widthState[4]
+  const energyLeft = widthState[5]
+  const energyRight = widthState[6]
   const monoSumPreserved = maxMonoError <= Math.max(1e-5, monoScale * 1e-5)
   const denominator = Math.sqrt(energyLeft * energyRight)
   const polarityPreserved = denominator > 0 ? (crossLeft >= 0 && crossRight >= 0) : true
@@ -1086,7 +1406,7 @@ export function stereoWidth (samples, sampleRate, options = {}) {
  * Lookahead true-peak limiter.
  *
  * Detection is 4x oversampled (see `peakEnvelope`), the gain curve is the
- * slope-limited lookahead ramp described on `limiterGainCurve`, and the result
+ * slope-limited lookahead ramp described on `limiterGainCurveGen`, and the result
  * is then *measured* with `lib/lufs.js`'s `truePeak` — the same meter the rest
  * of the plugin reports. If the measurement is above the ceiling (an 8-tap
  * detector can under-read near-Nyquist content by a fraction of a dB), the
@@ -1108,14 +1428,26 @@ export function stereoWidth (samples, sampleRate, options = {}) {
  *   overshootDb: number } }}
  */
 export function truePeakLimiter (samples, sampleRate, options = {}) {
+  return driveSync(truePeakLimiterGen(samples, sampleRate, options))
+}
+
+/**
+ * Generator form of the lookahead true-peak limiter: detection, the gain curve,
+ * the gain application and the trim all yield between blocks.
+ * @param {Float32Array|Float32Array[]} samples - mono buffer or one per channel.
+ * @param {number} sampleRate - Hz.
+ * @param {object} [options] - `{ ceilingDbtp, lookaheadMs, releaseMs }`.
+ * @returns {Generator<unknown, { samples: Float32Array|Float32Array[], report: object }, unknown>}
+ */
+export function* truePeakLimiterGen (samples, sampleRate, options = {}) {
   const rate = validateRate(sampleRate)
   const mono = !Array.isArray(samples)
   const list = asChannelList(samples)
   const settings = resolveLimiterOptions(options)
   const input = sanitiseChannels(list)
   const truePeakBefore = measuredTruePeak(input, rate)
-  const envelope = peakEnvelope(input)
-  const pass = limitOnce(input, rate, envelope, settings, 0)
+  const envelope = yield* peakEnvelope(input)
+  const pass = yield* limitOnce(input, rate, envelope, settings, 0)
   const output = pass.samples
 
   let trimDb = 0
@@ -1128,7 +1460,7 @@ export function truePeakLimiter (samples, sampleRate, options = {}) {
     if (!Number.isFinite(truePeakAfter.dbtp) || truePeakAfter.dbtp <= settings.ceilingDbtp) break
     const correction = settings.ceilingDbtp - TRIM_MARGIN_DB - truePeakAfter.dbtp
     trimDb += correction
-    scaleChannels(output, dbToGain(correction))
+    yield* scaleChannels(output, dbToGain(correction))
     truePeakAfter = measuredTruePeak(output, rate)
   }
 
@@ -1232,14 +1564,14 @@ function resolveChainOptions (options, rate) {
  * pass, no measurement), which is why the chain can afford it before every
  * iteration.
  */
-function settleGainUnderCap (envelope, rate, settings, gainDb) {
+function* settleGainUnderCap (envelope, rate, settings, gainDb) {
   let gain = gainDb
-  let curve = limiterGainCurve(envelope, rate, { ...settings, inputGainDb: gain })
-  let reduction = maxGainReductionDb(curve)
+  let curve = yield* limiterGainCurveGen(envelope, rate, { ...settings, inputGainDb: gain })
+  let reduction = yield* maxGainReductionDb(curve)
   for (let attempt = 0; attempt < 8 && reduction > settings.maxGainReductionDb + 0.01; attempt += 1) {
     gain = Math.max(GAIN_LIMITS_DB[0], gain - (reduction - settings.maxGainReductionDb) - 0.15)
-    curve = limiterGainCurve(envelope, rate, { ...settings, inputGainDb: gain })
-    reduction = maxGainReductionDb(curve)
+    curve = yield* limiterGainCurveGen(envelope, rate, { ...settings, inputGainDb: gain })
+    reduction = yield* maxGainReductionDb(curve)
   }
   return {
     curve,
@@ -1286,14 +1618,24 @@ function selectAttempt (attempts, targetLufs) {
  * measured attempt that follows confirms it, or the chain falls back to the
  * measured secant.
  */
-function predictGainForTarget (envelope, rate, settings, lufsBefore, residual) {
-  const stride = 8
-  const decimated = new Float32Array(Math.ceil(envelope.length / stride))
-  for (let i = 0, block = 0; i < envelope.length; i += stride, block += 1) {
+/** Peak of one decimated block of the envelope (see `predictGainForTarget`). */
+function decimateEnvelopeRange (envelope, decimated, stride, from, to) {
+  let block = from / stride
+  for (let i = from; i < to; i += stride, block += 1) {
     let peak = 0
     const end = Math.min(i + stride, envelope.length)
     for (let j = i; j < end; j += 1) if (envelope[j] > peak) peak = envelope[j]
     decimated[block] = peak
+  }
+}
+
+function* predictGainForTarget (envelope, rate, settings, lufsBefore, residual) {
+  const stride = 8
+  const decimated = new Float32Array(Math.ceil(envelope.length / stride))
+  for (let from = 0; from < envelope.length; from += YIELD_EVERY_FRAMES) {
+    const to = Math.min(envelope.length, from + YIELD_EVERY_FRAMES)
+    decimateEnvelopeRange(envelope, decimated, stride, from, to)
+    yield
   }
   // The lookahead is a sample count and the release is a per-sample coefficient,
   // so both time constants must be scaled by the decimation stride for the
@@ -1305,8 +1647,8 @@ function predictGainForTarget (envelope, rate, settings, lufsBefore, residual) {
   }
   let gain = clamp(settings.targetLufs - lufsBefore - residual, GAIN_LIMITS_DB[0], GAIN_LIMITS_DB[1])
   for (let attempt = 0; attempt < 12; attempt += 1) {
-    const settled = settleGainUnderCap(decimated, rate, decimatedSettings, gain)
-    const loss = (meanGainReductionDb(settled.curve) + settled.gainReductionDb) / 2
+    const settled = yield* settleGainUnderCap(decimated, rate, decimatedSettings, gain)
+    const loss = ((yield* meanGainReductionDb(settled.curve)) + settled.gainReductionDb) / 2
     const predicted = lufsBefore + settled.gainDb - loss + residual
     const error = settings.targetLufs - predicted
     if (Math.abs(error) <= 0.02) return settled.gainDb
@@ -1363,6 +1705,44 @@ function predictGainForTarget (envelope, rate, settings, lufsBefore, residual) {
  *   achievable: boolean, shortfallLu: number, limitedBy: string } }}
  */
 export function masterChain (samples, sampleRate, options = {}) {
+  return driveSync(masterChainGen(samples, sampleRate, options))
+}
+
+/**
+ * Master without holding the event loop for the whole chain.
+ *
+ * Same generator, same arithmetic, same bytes as `masterChain`; every block
+ * boundary also waits for a `setImmediate`. One gap remains, honestly: the
+ * loudness meter (`lib/lufs.js`, not owned by this change) is a single atomic
+ * pass, so the longest uninterruptible stretch is one metering pass per
+ * iteration.
+ * @param {Float32Array|Float32Array[]} samples - mono buffer or one per channel.
+ * @param {number} sampleRate - Hz.
+ * @param {object} [options] - see `masterChain`.
+ * @returns {Promise<{ samples: Float32Array|Float32Array[], report: object }>}
+ */
+export function masterChainAsync (samples, sampleRate, options = {}) {
+  return driveAsync(masterChainGen(samples, sampleRate, options))
+}
+
+/**
+ * Cooperatively-yielded form of `masterChain`.
+ *
+ * Every pass over the samples that this module owns yields between blocks
+ * (`copyChannels`, the multiband compressor, the width stage, the peak envelope,
+ * the limiter curve, the gain application and every meter loop). The loudness
+ * measurement itself is `lib/lufs.js`'s `analyzeLoudness`, which is one atomic
+ * pass in a module this change does not own: `audio_master` therefore still has
+ * a per-iteration gap the length of one loudness measurement, and says so.
+ *
+ * The arithmetic is the synchronous chain's: the same calls in the same order,
+ * with only `await` points inserted between blocks.
+ * @param {Float32Array|Float32Array[]} samples - mono buffer or one per channel.
+ * @param {number} sampleRate - Hz.
+ * @param {object} [options] - see `masterChain`.
+ * @returns {Generator<unknown, { samples: Float32Array|Float32Array[], report: object }, unknown>}
+ */
+export function* masterChainGen (samples, sampleRate, options = {}) {
   const rate = validateRate(sampleRate)
   const mono = !Array.isArray(samples)
   const list = asChannelList(samples)
@@ -1376,7 +1756,7 @@ export function masterChain (samples, sampleRate, options = {}) {
     telemetry.rerenderedPasses = 0
     telemetry.retainedBytes = 0
   }
-  const source = list.map(copyChannel)
+  const source = yield* copyChannels(list)
   const before = analyseChannels(source, rate)
   const lufsBefore = before.integratedLufs
   const loudness = loudnessChannels(source)
@@ -1397,8 +1777,9 @@ export function masterChain (samples, sampleRate, options = {}) {
 
   // --- fixed front of the chain: drive, compression, width ------------------
   linkStemGain(source, settings.driveDb)
-  const compression = multibandCompressor(source, rate, { bands: settings.bands, kneeDb: settings.kneeDb })
-  const width = stereoWidth(compression.samples, rate, { width: settings.width, bassMonoHz: settings.bassMonoHz })
+  const compression = yield* multibandCompressorGen(source, rate, { bands: settings.bands, kneeDb: settings.kneeDb })
+  yield
+  const width = yield* stereoWidthGen(compression.samples, rate, { width: settings.width, bassMonoHz: settings.bassMonoHz })
   const preMastered = asChannelList(width.samples)
   const compressorGainReductionDb = compression.report.bands.reduce(
     (maximum, band) => (band.gainReductionDb > maximum ? band.gainReductionDb : maximum), 0)
@@ -1457,7 +1838,7 @@ export function masterChain (samples, sampleRate, options = {}) {
     }
   }
 
-  const envelope = peakEnvelope(preMastered)
+  const envelope = yield* peakEnvelope(preMastered)
   const boundedBefore = clamp(settings.targetLufs - lufsBefore, GAIN_LIMITS_DB[0], GAIN_LIMITS_DB[1])
   let gainDb = boundedBefore
   const attempts = []
@@ -1468,10 +1849,14 @@ export function masterChain (samples, sampleRate, options = {}) {
     // what lets the chosen iteration be re-rendered bit-identically at the end
     // instead of every iteration's samples being kept alive.
     const plannedGainDb = gainDb
-    const settled = settleGainUnderCap(envelope, rate, settings, plannedGainDb)
+    const settled = yield* settleGainUnderCap(envelope, rate, settings, plannedGainDb)
     gainDb = settled.gainDb
-    const limited = applyGainCurve(preMastered, settled.curve, dbToGain(gainDb))
+    const limited = yield* applyGainCurve(preMastered, settled.curve, dbToGain(gainDb))
     noteTelemetry(telemetry, 'limiterApplies')
+    // Loudness is measured by `lib/lufs.js` in one indivisible pass; the chain
+    // yields on both sides of it rather than trying to split a meter it does not
+    // own.
+    yield
     const analysis = analyseChannels(limited, rate)
     // `analyzeLoudness` already measured the true peak of every channel it used,
     // and for mono/stereo that is every channel — measuring it a second time in
@@ -1486,12 +1871,12 @@ export function masterChain (samples, sampleRate, options = {}) {
     let trimDb = 0
     if (Number.isFinite(peakDbtp) && peakDbtp > settings.ceilingDbtp) {
       trimDb = settings.ceilingDbtp - TRIM_MARGIN_DB - peakDbtp
-      scaleChannels(limited, dbToGain(trimDb))
+      yield* scaleChannels(limited, dbToGain(trimDb))
     }
     const lufsAfter = analysis.integratedLufs + trimDb
     const truePeakAfter = Number.isFinite(peakDbtp) ? peakDbtp + trimDb : Number.NEGATIVE_INFINITY
     const error = settings.targetLufs - lufsAfter
-    const meanReductionDb = meanGainReductionDb(settled.curve)
+    const meanReductionDb = yield* meanGainReductionDb(settled.curve)
     const attempt = {
       plannedGainDb,
       gainDb,
@@ -1501,7 +1886,7 @@ export function masterChain (samples, sampleRate, options = {}) {
       truePeakByChannel: peakMeasured === null
         ? (source.length === 1 ? [truePeakAfter] : null)
         : peakMeasured.byChannel.map((value) => value + trimDb),
-      channelPeaksDbfs: samplePeaksDbfs(limited),
+      channelPeaksDbfs: yield* samplePeaksDbfs(limited),
       trimDb,
       gainReductionDb: settled.gainReductionDb,
       atCap: settled.atCap
@@ -1539,7 +1924,7 @@ export function masterChain (samples, sampleRate, options = {}) {
       // real attempt the chain has: the model itself is not assumed exact.
       const modelLoss = (meanReductionDb + settled.gainReductionDb) / 2
       const residual = lufsAfter - (lufsBefore + gainDb - modelLoss)
-      nextGain = predictGainForTarget(envelope, rate, settings, lufsBefore, residual)
+      nextGain = yield* predictGainForTarget(envelope, rate, settings, lufsBefore, residual)
     } else {
       const previous = attempts[attempts.length - 2]
       const gainDelta = gainDb - previous.gainDb
@@ -1573,11 +1958,11 @@ export function masterChain (samples, sampleRate, options = {}) {
     // same trim the pass that produced `chosen`'s measurements computed: the
     // samples are bit-identical to keeping each iteration's output, at one
     // output's worth of memory instead of `iterations` copies.
-    const settledChosen = settleGainUnderCap(envelope, rate, settings, chosen.plannedGainDb)
-    output = applyGainCurve(preMastered, settledChosen.curve, dbToGain(settledChosen.gainDb))
+    const settledChosen = yield* settleGainUnderCap(envelope, rate, settings, chosen.plannedGainDb)
+    output = yield* applyGainCurve(preMastered, settledChosen.curve, dbToGain(settledChosen.gainDb))
     noteTelemetry(telemetry, 'limiterApplies')
     noteTelemetry(telemetry, 'rerenderedPasses')
-    if (chosen.trimDb !== 0) scaleChannels(output, dbToGain(chosen.trimDb))
+    if (chosen.trimDb !== 0) yield* scaleChannels(output, dbToGain(chosen.trimDb))
   }
 
   // Cost of the mode that ran. `memory` holds one output, so it needs no

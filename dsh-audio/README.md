@@ -85,6 +85,8 @@ audio_check({ paths: ['assets/audio/slam.wav'], cues: [{ at: 0.82, src: 'assets/
 
 ## 工具
 
+共 34 个工具，按用途排：
+
 | 工具 | 作用 |
 |---|---|
 | `audio_synth` | 渲染单个音效（38 个预设，感知参数 0..1，可循环） |
@@ -100,6 +102,7 @@ audio_check({ paths: ['assets/audio/slam.wav'], cues: [{ at: 0.82, src: 'assets/
 | `audio_lipsync` | 每帧口型轨（json / srt / css / ae） |
 | `audio_mouth` | 文本驱动的口型轨：没有音频也能按拼音吐出嘴形 |
 | `audio_beats` | 测 bpm、起音、节拍网格、重拍推测 |
+| `audio_cues` | 反过来：从现成音频里测冲击点与段落边界，输出动画 cue 时间表 |
 | `audio_bind` | 生成 cue 表与页面播放器（可内联成单文件） |
 | `audio_mux` | 视频联动：探测媒体、把音频混流进 mp4/mov/mkv/webm、检测镜头切点、抽出音轨 |
 | `audio_react` | 交互音效：16 种 UI 事件 + 5 个音色家族，产出零胶水绑定脚本 |
@@ -107,16 +110,19 @@ audio_check({ paths: ['assets/audio/slam.wav'], cues: [{ at: 0.82, src: 'assets/
 | `audio_analyze` | 频谱分析：基频、谐波、共振峰、噪声度、衰减时间、频段平衡，可做容差比对 |
 | `audio_stems` | 分轨导出：每层一个 wav + master，`sum(stems) == master` |
 | `audio_daw` | 工程导出：CMX3600 EDL / Reaper .rpp / CSV cue 表 / Audacity labels / OpenTimelineIO .otio / FCP7 xmeml（后两者 Resolve、Premiere 可导入）/ AAF 结构子集 / OMF 骨架（见 docs/INTEROP.zh.md） |
+| `audio_handoff` | 交接简报：把乐器库/声库/素材授权这类不属于本插件的活，写成目标插件 + 能力 + 逐轨请求的 JSON（只写文件，不调用对方） |
 | `audio_mix` | 多轨合一，逐条增益与时间偏移 |
 | `audio_bus` | 混音总线：高通/低通/搁架/钟形、压缩、侧链闪避、声像与宽度 |
 | `audio_spatial` | 空间音频：立体声/双耳/quad/5.1/7.1/一阶 Ambisonics，自带多声道 WAV |
-| `audio_convert` | 裁剪/增益/淡入淡出/反转/拼接/批量归一/转码（8/16/24/32 位，单双声道） |
+| `audio_convert` | 裁剪/增益/淡入淡出/反转/拼接/批量归一/转码（8/16/24/32 位，1/2/4/6/8 声道） |
 | `audio_stretch` | 变速不变调、移调不变时长、精确贴合目标时长 |
-| `audio_loudness` | BS.1770 LUFS、真峰值、响度范围，按目标响度写校正副本 |
+| `audio_loudness` | BS.1770 LUFS、真峰值、响度范围；按目标响度写校正副本（1/2/4/6/8 声道，保持布局与 16/24 位深） |
 | `audio_master` | 母带链：多段压缩、瞬态整形、立体声宽度与低频单声道、真峰值限制，迭代到目标响度 |
 | `audio_probe` | 度量单文件：峰值、RMS、波峰因数、质心、起音数、循环接缝、直流 |
 | `audio_check` | 交付前质量闸：cue 时间轴、叠加峰值、削波/静音，外加本地声学自检（不依赖外部模型） |
+| `audio_audit` | 三方对账（只读）：旁白 wav ↔ 字幕 srt ↔ 口型轨，报字幕漂移、漏句、口型开合错位；不改任何输入文件 |
 | `audio_regress` | 快照 + 容差比对，证明改动没把别的指标带歪 |
+| `audio_batch` | 一组文件一次跑完：check / loudness / normalize / master 四选一，逐条报错不中断；产出副本，不覆盖原文件 |
 
 ### 预设
 
@@ -208,12 +214,15 @@ check:
 
 **它能唱歌吗？**
 不能，而且这是有意的。插件曾经内置一个零素材的共振峰合成"唱腔"，但合成出来的人声不可辨识，
-0.6.0 已把它（连同采样声库那条路）整体移除。需要演唱时：用 `audio_tts` 朗读 + 后期，
+这一路已经整体移除（连同采样声库那条路）。需要演唱时：用 `audio_tts` 朗读 + 后期，
 或交给专门的人声 TTS / AnyAudio 插件，或用你自己有授权的录音素材（`audio_sampler` 可以把它做成乐器）。
 插件本身不采集、不模仿、不内置任何他人的作品或声线。
 
 **响度按什么标准？**
 ITU-R BS.1770-4 / EBU R128。网页与短视频一般 −14 LUFS，播客 −16，广播 −23；真峰值留 −1 dBTP。
+单声道文件按 BS.1770-4 的**单声道计权**（一个声道只计一次），所以读数和 ffmpeg `ebur128`、Youlean 一致；
+旧版本那套 dual-mono（mono 按两个声道 ×2，+3.01 LU）保留为显式选项 `dualMono: true`。立体声/环绕不受影响。
+`audio_loudness` 的校正副本对 1/2/4/6/8 声道都能写，保持原声道布局与 16/24 位深。
 
 **8 位音频会不会太差？**
 适合短促音效和内联进单文件 HTML（体积能小一半以上）；长垫音会有明显底噪，用 16 位。

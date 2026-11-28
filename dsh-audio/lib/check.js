@@ -14,6 +14,14 @@
  * Every channel is measured, never a mono fold: a clipped channel averaged with
  * a silent one would stop reporting clipping, and an out-of-phase stereo pair
  * would average to digital silence.
+ *
+ * On top of the three layers above, this file wires in the delivery-verification
+ * layer from `lib/verify.js`: platform loudness compliance (`target` /
+ * `loudnessTarget`), phase and mono compatibility, and cue-vs-picture sync.
+ * Those are pure judgements over samples and planned times — they report the gap
+ * and never rewrite the file — and their blocks (`compliance`, `phase`, `sync`)
+ * are optional additions: without the new arguments the result is byte-for-byte
+ * the same shape it always was.
  */
 
 import { relative } from 'node:path'
@@ -28,10 +36,24 @@ import {
 import { describeAudio } from './providers.js'
 import { selfCheck } from './selfcheck.js'
 import { SEMANTIC_DISABLED_TEXT, semanticCheckEnabled } from './settings-route.js'
+import {
+  LOUDNESS_TARGET_IDS,
+  resolveLoudnessTarget,
+  verifyCueSync,
+  verifyLoudness,
+  verifyPhase
+} from './verify.js'
 
 const SILENT_PEAK_DB = -40
 const LATE_ATTACK_SECONDS = 0.15
 const CLIP_SUM_PEAK = 1.0
+
+/**
+ * How many per-file lines the human text repeats for the verification blocks
+ * (compliance, phase). The JSON keeps every entry; the text stays readable
+ * when a caller checks a whole cue set at once.
+ */
+const REPORT_LINE_LIMIT = 8
 
 /**
  * Self-check failures that the file-level technical checks already report, so a
@@ -154,29 +176,54 @@ export function registerCheckTool (ctx, config = {}) {
 
   ctx.tools.register({
     name: 'audio_check',
-    description: '交付前质量闸：削波/静音/时间轴/叠加峰值，外加本地声学自检（不依赖外部模型）。Quality gate before delivery: clipping, near-silence, late attacks, DC offset, duration mismatches, cue files that do not exist, and a summed peak that tells you whether the cues will clip when they play together — plus a deterministic local self-check (non-finite samples, signal level, crest factor / spectral centroid / onset shape against the preset or recipe named in `spec`, loop seam). The local check always runs and needs no key; `question` additionally asks an audio-understanding model and is skipped unless the semantic check is enabled in Settings (off by default) with a model configured.',
+    description: 'Quality gate before delivery: clipping, near-silence, late attacks, DC offset, duration mismatches, missing cue files and the summed peak, plus a keyless local acoustic self-check against the `spec` family. Optional `target`/`loudnessTarget` judges a platform delivery spec (LUFS, true peak) and reports the gap; `cues[].expectAt`/`targets` reports cue sync drift, and stereo or surround also gets a phase/mono report. `question` asks an audio-understanding model and needs the semantic check enabled and configured.',
     parameters: {
       type: 'object',
       properties: {
         paths: { type: 'array', items: { type: 'string' }, description: 'Audio files to check, relative to the working directory or absolute.' },
         cues: {
           type: 'array',
-          description: 'Optional timeline to validate: each entry names a file and the second it should fire, which catches a cue that points at a silent or missing file.',
+          description: 'Optional timeline: file plus the second it fires; `expectAt`/`targets` add sync drift.',
           items: {
             type: 'object',
             additionalProperties: false,
             properties: {
               at: { type: 'number', description: 'Start time in seconds.' },
-              src: { type: 'string', description: 'Audio file path.' }
+              src: { type: 'string', description: 'Audio file path.' },
+              name: { type: 'string', description: 'Optional cue name used in the report and in sync messages.' },
+              expectAt: { type: 'number', description: 'Second this cue was planned for; the sync block reports `at - expectAt` as late or early.' }
             },
             required: ['at', 'src']
           }
         },
         expectDuration: { type: 'number', description: 'Expected duration for a single file (used by paths).' },
+        target: {
+          type: 'string',
+          enum: LOUDNESS_TARGET_IDS,
+          description: 'Platform delivery spec; judges LUFS and true peak against its published target and reports the gap.'
+        },
+        loudnessTarget: {
+          type: 'object',
+          additionalProperties: false,
+          description: 'Custom delivery target instead of `target`: { targetLufs, ceilingDbtp, toleranceLu, label }.',
+          properties: {
+            targetLufs: { type: 'number', description: 'Desired integrated loudness in LUFS (between -60 and 0).' },
+            ceilingDbtp: { type: 'number', description: 'Maximum true peak in dBTP (between -20 and 0); defaults to -1.' },
+            toleranceLu: { type: 'number', description: 'Accepted distance from the loudness target in LU (in (0, 6], default 1).' },
+            label: { type: 'string', description: 'Name shown in the report; defaults to the numbers it was given.' }
+          },
+          required: ['targetLufs']
+        },
+        targets: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Target second per cue, parallel to `cues`; a per-cue `expectAt` wins.'
+        },
+        toleranceSeconds: { type: 'number', description: 'How far a cue may sit from its target second before it is reported; default 0.05 s.' },
         spec: {
           type: 'object',
           additionalProperties: false,
-          description: 'Optional render spec these files were made with, so the local self-check compares the sound against that family\'s expected shape (crest factor, spectral centroid, onset count, default length). Without it only the generic checks run.',
+          description: 'Render spec the files were made with; adds family-shape comparison to the local check.',
           properties: {
             preset: { type: 'string', description: 'Preset id used by audio_synth, e.g. impact, texture.' },
             recipe: { type: 'string', description: 'Design recipe id used by audio_design, e.g. door-slam-metal, ui-success.' },
@@ -185,7 +232,7 @@ export function registerCheckTool (ctx, config = {}) {
             loop: { type: 'boolean', description: 'True when the file was rendered as a seamless loop; adds the loop-seam check.' }
           }
         },
-        question: { type: 'string', description: 'Optional: also ask an audio-understanding model about the sound, e.g. "does this match a heavy metal door slamming in a large hall?". Only runs when config.check.enabled is true and a model is configured; without it the local self-check still returns a verdict.' },
+        question: { type: 'string', description: 'Also ask an audio-understanding model; needs the semantic check enabled and configured.' },
         audio: { type: 'string', description: 'Which file to send with `question`; defaults to the first path or cue source.' }
       },
       additionalProperties: false
@@ -210,6 +257,58 @@ export function registerCheckTool (ctx, config = {}) {
       }
       const checkSpec = args.spec ?? undefined
 
+      // The delivery target and the cue targets are validated before any file is
+      // read: a typo in `target` must fail fast instead of after decoding a
+      // three-minute file, and a `targets` array that does not line up with
+      // `cues` would silently shift every deviation by one entry.
+      if (args.target !== undefined && args.loudnessTarget !== undefined) {
+        throw new Error('audio_check: target 和 loudnessTarget 只能给一个（target 用平台名，loudnessTarget 用自定义数值）')
+      }
+      const loudnessRequest = args.target !== undefined ? args.target : args.loudnessTarget
+      const loudnessSpec = loudnessRequest === undefined ? null : resolveLoudnessTarget(loudnessRequest)
+      if (args.toleranceSeconds !== undefined &&
+        (typeof args.toleranceSeconds !== 'number' || !Number.isFinite(args.toleranceSeconds) || args.toleranceSeconds <= 0 || args.toleranceSeconds > 2)) {
+        throw new Error(`audio_check: toleranceSeconds 必须是 (0, 2] 之间的数字，收到 ${describeValue(args.toleranceSeconds)}`)
+      }
+      if (args.targets !== undefined && !Array.isArray(args.targets)) {
+        throw new Error(`audio_check: targets 必须是数字数组（与 cues 一一对应的目标时间），收到 ${describeValue(args.targets)}`)
+      }
+      const cueTargets = args.targets ?? []
+      if (args.targets !== undefined) {
+        // An explicit `targets` array is a promise about every cue: an empty or
+        // short one is a caller bug, not "no targets" (that is `undefined`).
+        if (cues.length === 0) throw new Error('audio_check: targets 用来对齐 cues 的目标时间，但这次没有 cues')
+        if (cueTargets.length !== cues.length) {
+          throw new Error(`audio_check: targets 必须和 cues 一一对应（${cueTargets.length} 个目标 / ${cues.length} 条 cue）`)
+        }
+        for (let index = 0; index < cueTargets.length; index += 1) {
+          const targetAt = cueTargets[index]
+          if (typeof targetAt !== 'number' || !Number.isFinite(targetAt) || targetAt < 0) {
+            throw new Error(`audio_check: targets[${index}] 不是合法的目标时间（${describeValue(targetAt)}）`)
+          }
+        }
+      }
+
+      // Cues are validated before any file is read (the cue sources included): a
+      // cue with no `src` used to be skipped silently — which made a 0-file "ok"
+      // verdict possible — and a null entry crashed with a raw TypeError. Doing
+      // it first also means a typo in `expectAt` fails before a three-minute
+      // render is decoded.
+      for (let index = 0; index < cues.length; index += 1) {
+        const cue = cues[index]
+        if (cue === null || typeof cue !== 'object') {
+          throw new Error(`audio_check: cues[${index}] 必须是 { at, src } 对象，收到 ${describeValue(cue)}`)
+        }
+        if (resolvePath(cwd, cue.src) === undefined) {
+          const name = typeof cue.name === 'string' && cue.name.trim() !== '' ? `（cue "${cue.name}"）` : ''
+          throw new Error(`audio_check: cues[${index}] 缺少可用的 src 路径${name}`)
+        }
+        if (cue.expectAt !== undefined && cue.expectAt !== null &&
+          (typeof cue.expectAt !== 'number' || !Number.isFinite(cue.expectAt) || cue.expectAt < 0)) {
+          throw new Error(`audio_check: cues[${index}].expectAt 不是合法的目标时间（${describeValue(cue.expectAt)}）`)
+        }
+      }
+
       for (let index = 0; index < paths.length; index += 1) {
         const path = resolvePath(cwd, paths[index])
         if (path === undefined) {
@@ -225,25 +324,16 @@ export function registerCheckTool (ctx, config = {}) {
         }
       }
 
-      // Cues are validated before any of them is read: a cue with no `src` used
-      // to be skipped silently (which made a 0-file "ok" verdict possible) and a
-      // null entry crashed with a raw TypeError.
-      for (let index = 0; index < cues.length; index += 1) {
-        const cue = cues[index]
-        if (cue === null || typeof cue !== 'object') {
-          throw new Error(`audio_check: cues[${index}] 必须是 { at, src } 对象，收到 ${describeValue(cue)}`)
-        }
-        if (resolvePath(cwd, cue.src) === undefined) {
-          const name = typeof cue.name === 'string' && cue.name.trim() !== '' ? `（cue "${cue.name}"）` : ''
-          throw new Error(`audio_check: cues[${index}] 缺少可用的 src 路径${name}`)
-        }
-      }
-
       let summedPeak = 0
       let timelineEnd = 0
+      // Cue sync entries, recorded while the timeline is built: a cue whose file
+      // cannot be read still has a planned second, and the planned-vs-actual
+      // pair is exactly what the deviation report is about.
+      const syncEntries = []
       if (cues.length > 0) {
         const placed = []
-        for (const cue of cues) {
+        for (let cueIndex = 0; cueIndex < cues.length; cueIndex += 1) {
+          const cue = cues[cueIndex]
           const path = resolvePath(cwd, cue.src)
           if (path === undefined) continue
           const at = Number(cue.at)
@@ -251,6 +341,18 @@ export function registerCheckTool (ctx, config = {}) {
             issues.push({ level: 'error', target: displayPath(cwd, path), message: `at=${cue.at} 不是合法时间` })
             continue
           }
+          const expectedAt = cue.expectAt !== undefined && cue.expectAt !== null
+            ? Number(cue.expectAt)
+            : (cueTargets.length > 0 ? cueTargets[cueIndex] : null)
+          const syncEntry = {
+            index: cueIndex,
+            name: typeof cue.name === 'string' && cue.name.trim() !== '' ? cue.name.trim() : null,
+            src: displayPath(cwd, path),
+            at,
+            expectAt: expectedAt,
+            durationSeconds: null
+          }
+          syncEntries.push(syncEntry)
           try {
             if (!stash.has(path)) stash.set(path, await readChannels(path))
             const decoded = stash.get(path)
@@ -264,6 +366,7 @@ export function registerCheckTool (ctx, config = {}) {
             // sees every channel.
             const mono = decoded.channels.length === 1 ? decoded.channels[0] : averageChannels(decoded.channels)
             placed.push({ at, mono, sampleRate: decoded.sampleRate })
+            syncEntry.durationSeconds = mono.length / decoded.sampleRate
             timelineEnd = Math.max(timelineEnd, at + mono.length / decoded.sampleRate)
           } catch (error) {
             issues.push({ level: 'error', target: displayPath(cwd, path), message: `cue 在 ${at.toFixed(2)}s，但文件读不出来：${error.message}` })
@@ -338,6 +441,96 @@ export function registerCheckTool (ctx, config = {}) {
         issues.push({ level: 'warn', target: 'selfcheck', message: '本地自检没有可分析的文件' })
       }
 
+      // --- delivery verification (lib/verify.js) -----------------------------
+      // Three optional blocks. Each one only reports: nothing here rewrites a
+      // file, because a gate that quietly normalises what it was asked to
+      // inspect cannot be used as a gate.
+
+      // 1. platform loudness compliance, only when the caller named a target.
+      let complianceBlock = null
+      if (loudnessSpec !== null) {
+        const reports = []
+        for (const file of files) {
+          try {
+            const report = verifyLoudness(file.channels, file.sampleRate, loudnessSpec)
+            reports.push({ path: file.path, label: file.label, ...report })
+            const failed = report.checks.filter((check) => !check.ok)
+            if (failed.length > 0) {
+              issues.push({
+                level: failed.some((check) => check.level === 'error') ? 'error' : 'warn',
+                target: file.label,
+                message: failed.map((check) => check.detail).join('；')
+              })
+            }
+          } catch (error) {
+            // A judgement that cannot run is a warning, not a failure of the
+            // audio: an unusual channel count or a sample rate the meter
+            // refuses must not fail an otherwise clean file.
+            issues.push({ level: 'warn', target: file.label, message: `响度合规判定失败：${error.message}` })
+          }
+        }
+        const offTarget = reports.filter((report) => !report.ok).length
+        complianceBlock = {
+          ok: reports.length > 0 && offTarget === 0,
+          target: { ...loudnessSpec },
+          files: reports,
+          summary: reports.length === 0
+            ? `${loudnessSpec.label} ${loudnessSpec.targetLufs} LUFS / ≤ ${loudnessSpec.ceilingDbtp} dBTP：没有可判定的文件（见 issues）`
+            : `${loudnessSpec.label} ${loudnessSpec.targetLufs} LUFS / ≤ ${loudnessSpec.ceilingDbtp} dBTP：${reports.length} 个文件，${offTarget === 0 ? '全部合规' : `${offTarget} 个不合规`}`
+        }
+      }
+
+      // 2. phase and mono compatibility of every multichannel file.
+      const phaseReports = []
+      for (const file of files) {
+        let report
+        try {
+          report = verifyPhase(file.channels)
+        } catch (error) {
+          issues.push({ level: 'warn', target: file.label, message: `相位判定失败：${error.message}` })
+          continue
+        }
+        if (report === null) continue
+        phaseReports.push({ path: file.path, label: file.label, ...report })
+        for (const check of report.checks) {
+          if (check.ok) continue
+          issues.push({ level: check.level, target: file.label, message: check.detail })
+        }
+      }
+      const phaseBlock = phaseReports.length === 0
+        ? null
+        : {
+            ok: phaseReports.every((report) => report.ok),
+            files: phaseReports,
+            worst: (() => {
+              let worst = phaseReports[0]
+              for (const report of phaseReports) {
+                if (report.antiphase !== worst.antiphase) { if (report.antiphase) worst = report; continue }
+                if (report.monoLossDb > worst.monoLossDb) worst = report
+              }
+              return { label: worst.label, pair: worst.pair, correlation: worst.correlation, antiphase: worst.antiphase, monoLossDb: worst.monoLossDb }
+            })(),
+            summary: `${phaseReports.length} 个多声道文件：${phaseReports.every((report) => report.ok) ? '全部正常' : `${phaseReports.filter((report) => !report.ok).length} 个异常`}`
+          }
+
+      // 3. cue-vs-picture sync / timeline consistency.
+      let syncBlock = null
+      if (syncEntries.length > 0) {
+        try {
+          const report = verifyCueSync(syncEntries, {
+            toleranceSeconds: args.toleranceSeconds,
+            expectDuration: args.expectDuration
+          })
+          syncBlock = report
+          for (const check of report.checks) {
+            if (check.ok) continue
+            issues.push({ level: check.level, target: 'sync', message: check.detail })
+          }
+        } catch (error) {
+          issues.push({ level: 'warn', target: 'sync', message: `cue 时间轴判定失败：${error.message}` })
+        }
+      }
+
       let verdict = 'ok'
       if (issues.some((issue) => issue.level === 'error')) verdict = 'fail'
       else if (issues.some((issue) => issue.level === 'warn')) verdict = 'warn'
@@ -408,6 +601,30 @@ export function registerCheckTool (ctx, config = {}) {
         if (file.selfCheck !== null) lines.push(`    ${file.selfCheck.summary}`)
       }
       if (cues.length > 0) lines.push(`  叠加峰值 ${summedPeak > 0 ? (20 * Math.log10(summedPeak)).toFixed(1) : '-inf'} dBFS`)
+      if (complianceBlock !== null) {
+        lines.push(`  响度合规 · ${complianceBlock.summary}`)
+        for (const report of complianceBlock.files.slice(0, REPORT_LINE_LIMIT)) {
+          lines.push(`    ${report.label}: ${report.summary}`)
+        }
+        if (complianceBlock.files.length > REPORT_LINE_LIMIT) lines.push(`    …另有 ${complianceBlock.files.length - REPORT_LINE_LIMIT} 个文件，见 JSON`)
+      }
+      if (phaseBlock !== null) {
+        const worst = phaseBlock.worst
+        const correlation = worst.correlation === null ? 'n/a' : worst.correlation.toFixed(2)
+        lines.push(`  相位与单声道兼容 · ${phaseBlock.summary}（最差 ${worst.label}：${worst.pair} 相关性 ${correlation}、折叠损失 ${worst.monoLossDb} dB${worst.antiphase ? '、反相' : ''}）`)
+        for (const report of phaseBlock.files.slice(0, REPORT_LINE_LIMIT)) {
+          if (report.ok) continue
+          lines.push(`    ${report.label}: ${report.summary}`)
+        }
+      }
+      if (syncBlock !== null) {
+        lines.push(`  ${syncBlock.summary}`)
+        for (const entry of syncBlock.cues) {
+          if (entry.level === 'ok') continue
+          const name = entry.name === null ? '' : ` "${entry.name}"`
+          lines.push(`    cue #${entry.index + 1}${name}: 在 ${entry.at}s，目标 ${entry.expectAt}s，偏差 ${entry.deviationSeconds > 0 ? '+' : ''}${entry.deviationSeconds}s（${entry.level === 'error' ? '超过容差 4 倍' : '超出容差'}）`)
+        }
+      }
       for (const issue of issues) lines.push(`  ${issue.level.toUpperCase()} ${issue.target}: ${issue.message}`)
       if (opinion !== null) lines.push(`  听感：${opinion}`)
       else if (semanticDisabled) lines.push(`  听感：${SEMANTIC_DISABLED_TEXT}，已跳过（本地自检已给出结论）`)
@@ -427,6 +644,9 @@ export function registerCheckTool (ctx, config = {}) {
             : { ok: file.selfCheck.ok, family: file.selfCheck.family, summary: file.selfCheck.summary }
         })),
         selfCheck: selfCheckBlock,
+        compliance: complianceBlock,
+        phase: phaseBlock,
+        sync: syncBlock,
         summedPeakDbfs: summedPeak > 0 ? Number((20 * Math.log10(summedPeak)).toFixed(2)) : null,
         opinion,
         opinionSkipped,

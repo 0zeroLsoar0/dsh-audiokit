@@ -126,32 +126,32 @@ function outputStem (requested) {
 export function registerBindTools (ctx) {
   ctx.tools.register({
     name: 'audio_bind',
-    description: 'Turn rendered wav files plus cue times into a cue sheet player for an HTML animation. Writes <out>.json and <out>.js; with inline:true the wavs are embedded as base64 so the page is one self-contained file with no network requests. Returns the written paths, page weight and a sample-level drift budget.',
+    description: 'Turn wav files plus cue times into a cue-sheet player for an HTML animation: writes <out>.json and <out>.js with gesture unlock, pre-scheduling and loop guards. `inline` embeds the wavs as base64 for a single-file page.',
     parameters: {
       type: 'object',
       properties: {
         cues: {
           type: 'array',
-          description: 'One entry per sound event: the wav path (relative to the working directory) and the second it should fire. Times are on the animation timeline, not the wav timeline.',
+          description: 'One entry per sound event: the wav path and the second it fires.',
           items: {
             type: 'object',
             additionalProperties: false,
             properties: {
-              name: { type: 'string', description: 'Cue name used by dshAudio.play(name); defaults to cue-1, cue-2, ...' },
+              name: { type: 'string', description: 'Cue name used by dshAudio.play(name); default cue-1, cue-2, ...' },
               at: { type: 'number', description: 'Start time in seconds from the beginning of the animation.' },
               path: { type: 'string', description: 'Wav file path, relative to the working directory or absolute.' },
               gainDb: { type: 'number', description: 'Level trim in dB applied in the page; defaults to 0.' },
               fadeIn: { type: 'number', description: 'Fade-in seconds; use it for ambience beds, not for hits. Defaults to 0.' },
               fadeOut: { type: 'number', description: 'Fade-out seconds; default 0.' },
-              loop: { type: 'boolean', description: 'Loop until the end of the timeline. A loop started on demand with dshAudio.play() has no timeline end to play to, so it sounds one 4 s phrase and stops; it never loops forever. Loops cannot be double-started.' }
+              loop: { type: 'boolean', description: 'Loop until the end of the timeline; loops cannot be double-started.' }
             },
             required: ['at', 'path']
           }
         },
-        out: { type: 'string', description: 'Output stem, relative to the working directory; writes <out>.json and <out>.js. Defaults to assets/audio/cues-<hash>.' },
+        out: { type: 'string', description: 'Output stem; writes <out>.json and <out>.js; default assets/audio/cues-<hash>.' },
         duration: { type: 'number', description: 'Timeline length in seconds; defaults to the end of the last cue, including its wav.' },
         inline: { type: 'boolean', description: 'Embed the wavs as base64 data URIs so the HTML has zero network requests. Defaults to false.' },
-        maxBytes: { type: 'integer', description: `Inline page-weight budget in bytes (positive); defaults to ${DEFAULT_MAX_INLINE_BYTES} (2 MB).` },
+        maxBytes: { type: 'integer', description: 'Inline page-weight budget in bytes; default 2097152 (2 MB).' },
         basePath: { type: 'string', description: 'Prefix for relative cue sources when not inlining, e.g. "assets/audio/".' },
         sampleRate: { type: 'integer', description: 'Device sample rate used for the drift budget; defaults to 48000.' }
       },
@@ -273,7 +273,7 @@ export function registerBindTools (ctx) {
 
   ctx.tools.register({
     name: 'audio_regress',
-    description: 'Snapshot a set of sound specs (same shape as audio_synth) as a baseline JSON, then compare a later render against it. Returns a PASS/FAIL table with one row per metric, so a change to a sound can be proven not to break the mix — or the exact metric and spec that broke can be named.',
+    description: 'Snapshot a set of sound specs as a baseline, then compare a later render against it and get a PASS/FAIL row per metric. Use it to prove a sound change did not break the mix.',
     parameters: {
       type: 'object',
       properties: {
@@ -295,13 +295,13 @@ export function registerBindTools (ctx) {
             required: ['name', 'preset']
           }
         },
-        baselinePath: { type: 'string', description: `Baseline JSON path, relative to the working directory. Defaults to ${DEFAULT_BASELINE}.` },
-        label: { type: 'string', description: 'Snapshot-only note stored as createdAtNote (there are no timestamps, so runs stay byte-identical).' },
+        baselinePath: { type: 'string', description: 'Baseline JSON path; default assets/audio/regress-baseline.json.' },
+        label: { type: 'string', description: 'Snapshot-only note stored as createdAtNote.' },
         sampleRate: { type: 'integer', description: 'Render rate for the snapshot; defaults to 44100.' },
         tolerances: {
           type: 'object',
           additionalProperties: false,
-          description: 'Optional overrides. Defaults: peak ±0.5 dB, rms ±1 dB, crest ±1.5 dB, centroid ±8 %, duration ±10 ms, onsets exact, bytes exact.',
+          description: 'Metric tolerance overrides (defaults: peak 卤0.5 dB, rms 卤1 dB, crest 卤1.5 dB, centroid 8 %).',
           properties: {
             peakDbfs: { type: 'number' },
             rmsDbfs: { type: 'number' },

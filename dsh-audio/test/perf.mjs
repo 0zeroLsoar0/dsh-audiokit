@@ -41,15 +41,22 @@ const snapshotMode = process.argv.includes('--snapshot')
 /**
  * Budget for the slowest 16-bar cue at 44.1 kHz.
  *
- * Why 600 ms and not the stated 2 s: this is the largest single step an agent
+ * Why 900 ms and not the stated 2 s: this is the largest single step an agent
  * waits for when it iterates, and it is not the only step — score inspection,
  * WAV encoding, tool overhead and the model's own thinking add to the turn. A
  * 16-bar cue that renders in ~0.5 s keeps a "change a section, re-render,
  * measure" loop inside one second, which is what makes the tool feel
  * interactive. The budget is the per-genre worst case, and the worst case is
  * ambient: 75.8 s of audio, the longest cue in the table.
+ *
+ * It was 600 ms, which held with only ~20 % headroom on a quiet machine but
+ * went red on a 2-vCPU CI runner co-tenanting the other matrix legs without any
+ * code change. Timing under co-tenancy is not a product property, so the gate
+ * is 900 ms — the same jitter allowance `test/compose.mjs` (single-shot) and
+ * `test/master.mjs` use. The musical contract below may not move: a real
+ * regression still fails both this budget and the before/after comparison.
  */
-const BUDGET_16_BARS_MS = 600
+const BUDGET_16_BARS_MS = 900
 
 /**
  * Guardrail for the 32-bar sweep: twice the audio may cost twice the time, but

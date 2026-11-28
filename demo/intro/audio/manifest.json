@@ -24,13 +24,6 @@
       "loop": false
     },
     {
-      "name": "voice",
-      "file": "voice.wav",
-      "at": 10,
-      "gainDb": 0,
-      "loop": false
-    },
-    {
       "name": "end",
       "file": "end.wav",
       "at": 13.5,
@@ -53,11 +46,6 @@
       "bytes": 176444,
       "durationSeconds": 4,
       "peakDbfs": -8
-    },
-    "voice": {
-      "bytes": 132344,
-      "durationSeconds": 3,
-      "peakDbfs": -4
     },
     "end": {
       "bytes": 35324,

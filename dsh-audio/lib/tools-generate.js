@@ -89,12 +89,12 @@ function toolError (error) {
 export function registerGenerateTools (ctx, config = {}) {
   ctx.tools.register({
     name: 'audio_generate',
-    description: 'Generate a .wav with the externally configured audio-generation model (Stable Audio / AudioGen / an OpenAI-compatible endpoint). Fails when config.generate is unset; the output is remote, so it is not deterministic — the same prompt may return different audio.',
+    description: 'Generate a .wav with the configured external audio-generation model (Stable Audio, AudioGen or an OpenAI-compatible endpoint). Remote and non-deterministic; fails when the generate config is unset.',
     parameters: {
       type: 'object',
       properties: {
         prompt: { type: 'string', description: 'What to generate (≤1000 chars).' },
-        duration: { type: 'number', description: `Length in seconds, ${MIN_DURATION}..${MAX_DURATION}; defaults to ${DEFAULT_DURATION}.` },
+        duration: { type: 'number', description: 'Length in seconds, 1..60; default 5.' },
         model: { type: 'string', description: 'Override the configured model id.' },
         out: { type: 'string', description: 'Output .wav path; defaults to assets/audio/generate-<content-hash>.wav.' },
         provider: { type: 'string', enum: [...GENERATE_PROVIDERS], description: 'Override the configured request shape.' }

@@ -362,11 +362,64 @@ async function readBodyBounded (response, limit, host) {
   return Buffer.concat(chunks)
 }
 
-/** Read at most `limit` characters of a failing response for the error text. */
-async function readErrorSnippet (response, limit = ERROR_SNIPPET_LIMIT) {
+/**
+ * Marker that replaces anything in a provider response that could be a
+ * credential.
+ *
+ * An error message is logged, rendered to the model and pasted into bug
+ * reports, so a gateway that echoes the request back — Authorization header
+ * included — must not be allowed to turn a 500 into a key leak. The response
+ * body is the one part of the error text the plugin does not control, and the
+ * redaction below is the only thing standing between it and a log line.
+ */
+const REDACTED = '[已隐去]'
+
+/** `authorization: …`, `"x-api-key": "…"` and `token=…` spellings. */
+const SECRET_PAIR_RE = /\b(authorization|proxy-authorization|x-api-key|api-key|apikey|api_key|access[_-]?token|refresh[_-]?token|token|secret|password)\b(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;}"']+)/gi
+/** `Bearer <token>`. */
+const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{4,}/gi
+/** A well-known key prefix (`sk-…`). */
+const PREFIXED_KEY_RE = /\bsk-[A-Za-z0-9._-]{4,}/g
+/** Any long, opaque, token-shaped run: keys, session ids, signed URLs. */
+const OPAQUE_TOKEN_RE = /[A-Za-z0-9_+/=-]{24,}/g
+
+/**
+ * Strip credentials from text that came from a provider.
+ *
+ * The configured key is replaced verbatim when it is long enough to be a key
+ * (four characters); the pattern rules catch a different key the endpoint
+ * echoes, a bearer token, or an opaque token the user never configured.
+ *
+ * @param {string} text - raw provider text.
+ * @param {string} [secret] - configured API key to mask verbatim.
+ * @returns {string} the same text with every credential-shaped run masked.
+ */
+function redactErrorText (text, secret = '') {
+  let clean = String(text)
+  if (typeof secret === 'string' && secret.length >= 4) clean = clean.split(secret).join(REDACTED)
+  return clean
+    .replace(BEARER_RE, `Bearer ${REDACTED}`)
+    .replace(PREFIXED_KEY_RE, `sk-${REDACTED}`)
+    .replace(SECRET_PAIR_RE, `$1$2${REDACTED}`)
+    .replace(OPAQUE_TOKEN_RE, REDACTED)
+}
+
+/**
+ * Read a failing response as a short, credential-free snippet.
+ *
+ * Redaction runs before the slice: cutting a token in half first would leave a
+ * fragment too short for any pattern to recognise.
+ *
+ * @param {Response} response - the failing response.
+ * @param {number} [limit] - maximum characters kept.
+ * @param {string} [secret] - configured API key to mask verbatim.
+ * @returns {Promise<string>} sanitised snippet, '' when the body cannot be read.
+ */
+async function readErrorSnippet (response, limit = ERROR_SNIPPET_LIMIT, secret = '') {
   try {
     const bytes = await readBodyBounded(response, Math.max(limit, 1024), 'endpoint')
-    return bytes.toString('utf8').replace(/\s+/g, ' ').trim().slice(0, limit)
+    const text = bytes.toString('utf8').replace(/\s+/g, ' ').trim()
+    return redactErrorText(text, secret).slice(0, limit)
   } catch {
     cancelBody(response)
     return ''
@@ -396,7 +449,7 @@ function firstBase64Audio (payload) {
   return ''
 }
 
-function decodeJsonAudio (bytes, host, contentType, status) {
+function decodeJsonAudio (bytes, host, contentType, status, secret = '') {
   let payload
   try {
     payload = JSON.parse(bytes.toString('utf8'))
@@ -407,7 +460,7 @@ function decodeJsonAudio (bytes, host, contentType, status) {
   if (base64 === '') {
     const providerMessage = payload?.error?.message ?? payload?.error ?? payload?.message
     const note = typeof providerMessage === 'string' && providerMessage.trim() !== ''
-      ? `（provider 说明：${providerMessage.trim().slice(0, 200)}）`
+      ? `（provider 说明：${redactErrorText(providerMessage.trim(), secret).slice(0, 200)}）`
       : ''
     throw generateError(
       'bad-response',
@@ -503,9 +556,10 @@ async function readSuccessResponse (response, resolved, host) {
   const status = response.status
 
   // A proxy's HTML error page with a 200 is the classic trap; the content-type
-  // is enough to refuse it before a byte is interpreted as audio.
+  // is enough to refuse it before a byte is interpreted as audio. The snippet
+  // is redacted first: an upstream error page may include the request headers.
   if (contentType.includes('html') || (contentType.startsWith('text/') && !contentType.includes('json'))) {
-    const snippet = await readErrorSnippet(response, 200)
+    const snippet = await readErrorSnippet(response, 200, resolved.apiKey)
     throw generateError(
       'bad-response',
       `${host} 返回的是 ${contentType || 'text/html'} 而不是音频${snippet === '' ? '' : `：${snippet}`}`,
@@ -524,7 +578,7 @@ async function readSuccessResponse (response, resolved, host) {
 
   // JSON by declared type, or by its opening brace when a server mislabels it.
   const jsonLike = contentType.includes('json') || firstContentByte(received) === 0x7b
-  const audioBytes = jsonLike ? decodeJsonAudio(received, host, contentType, status) : received
+  const audioBytes = jsonLike ? decodeJsonAudio(received, host, contentType, status, resolved.apiKey) : received
 
   const wav = inspectWavHeader(audioBytes)
   if (wav === null) throw notWavError(audioBytes, host, contentType, status)
@@ -602,12 +656,15 @@ export async function generateAudio (configOrResolved, request = {}) {
   }
 
   if (!response.ok) {
-    const detail = await readErrorSnippet(response)
+    // The body is untrusted and may echo the request (Authorization header
+    // included); keep only its redacted form. host/status/reasonCode carry the
+    // machine-readable part of the failure, so nothing diagnostic is lost.
+    const detail = await readErrorSnippet(response, ERROR_SNIPPET_LIMIT, resolved.apiKey)
     const status = response.status
     const reasonCode = status >= 500 ? 'http-5xx' : status >= 400 ? 'http-4xx' : 'bad-response'
     throw generateError(
       reasonCode,
-      `${host} HTTP ${status}${detail === '' ? '' : `: ${detail}`}`,
+      `${host} HTTP ${status}（${reasonCode}）${detail === '' ? '' : `: ${detail}`}`,
       { status, host, url }
     )
   }

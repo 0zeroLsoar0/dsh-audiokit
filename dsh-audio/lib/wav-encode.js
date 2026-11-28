@@ -2,8 +2,9 @@
  * WAVE writer for shipping deliverables.
  *
  * `wav.js` is the read side plus the original 16-bit write path. It stays
- * frozen: every existing tool and test depends on it, and its dither uses
- * `Math.random`, so it cannot promise identical bytes twice.
+ * frozen: every existing tool and test depends on it, and its fixed-seed dither
+ * and clipping are already baked into regression hashes and shipped files.
+ * Changing that writer is a format change, not a bug fix, so it lives here.
  *
  * Shipping needs the rest of the format matrix. A cue inlined into a single
  * HTML file wants 8-bit (a quarter of the bytes of the same cue at 32-bit); a

@@ -1,16 +1,16 @@
 {
-  "note": "The demo's own copy. No slogan is borrowed from any reference site; the archive grammar (file numbers, redaction, metadata) is a visual language, not text to copy. The voice scene was cut: audio_tts / audio_voices / audio_sing are listed as available, never faked with audio.",
+  "note": "The demo's own copy. No slogan is borrowed from any reference site; the archive grammar (file numbers, redaction, metadata) is a visual language, not text to copy. The voice scene was cut: audio_tts / audio_voices are listed as available, never faked with audio. 0.6.0 dropped the synthetic-singing tool and its voicebank, so no chip, scene, cue or tool list names them.",
   "brand": {
     "mark": "dsh-audio",
     "kicker": "DSH · AUDIO ARCHIVE",
     "subtitle": "给 HTML 动画加声音",
-    "meta": ["对象编号  DSH-AUDIO-0.5.9", "密级  公开", "工具  27", "依赖  0"]
+    "meta": ["对象编号  DSH-AUDIO-0.6.0", "密级  公开", "工具  30", "依赖  0"]
   },
   "hud": {
     "clock": "T+{t} / {total}",
     "scene": "FILE {n} / 07",
     "audio": "AUDIO INLINE · {count} CUES",
-    "toolsActive": "{n}/27"
+    "toolsActive": "{n}/30"
   },
   "scenes": [
     {
@@ -67,7 +67,7 @@
       "headline": "交付",
       "line": "cue 表 · 分轨 · 转码 · 回归",
       "detail": "8/16/24/32 位 · 单双声道 · 5.1",
-      "tools": ["audio_bind", "audio_stems", "audio_convert", "audio_check", "audio_regress", "audio_tts", "audio_voices", "audio_sing"]
+      "tools": ["audio_bind", "audio_stems", "audio_convert", "audio_check", "audio_regress", "audio_tts", "audio_voices"]
     }
   ],
   "endcard": {

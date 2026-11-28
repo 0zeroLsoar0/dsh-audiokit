@@ -22,13 +22,15 @@ const MANIFEST = join(HERE, 'audio', 'manifest.json')
 const LIMIT_BYTES = 1.2 * 1024 * 1024 // 1.2 MB
 const SOFT_BUDGET_BYTES = 900 * 1024 // spec.json requirements.sizeBudgetKB
 const EXPECTED_DURATION = 16
+const EXPECTED_SCENES = 4 // 0.6.0 dropped the singing scene: silent / first-sound / vocabulary / promise
 const DURATION_TOL = 0.01
 const TOOL_NAMES = [
   'audio_synth', 'audio_pattern', 'audio_design', 'audio_compose', 'audio_tts',
-  'audio_sing', 'audio_lipsync', 'audio_beats', 'audio_bind', 'audio_convert',
+  'audio_lipsync', 'audio_beats', 'audio_bind', 'audio_convert',
   'audio_stretch', 'audio_probe', 'audio_loudness', 'audio_check', 'audio_regress',
   'audio_mix', 'audio_voices'
 ]
+const MIN_TOOLS_ON_PAGE = 15
 
 let hardFailures = 0
 let warnings = 0
@@ -126,8 +128,8 @@ if (!spec) {
   } else ok(`duration ${duration} within tolerance`)
 
   const scenes = Array.isArray(spec.scenes) ? spec.scenes : []
-  console.log(`scenes:     ${scenes.length} (expected 5)`)
-  if (scenes.length !== 5) bug(`expected 5 scenes, found ${scenes.length}`)
+  console.log(`scenes:     ${scenes.length} (expected ${EXPECTED_SCENES})`)
+  if (scenes.length !== EXPECTED_SCENES) bug(`expected ${EXPECTED_SCENES} scenes, found ${scenes.length}`)
   let contiguous = true
   if (scenes.length === 0) {
     bug('scenes array is empty or missing')
@@ -158,7 +160,7 @@ if (!spec) {
       bug(`last scene ends at ${scenes[scenes.length - 1].to}, expected duration ${duration}`)
       contiguous = false
     }
-    if (contiguous && scenes.length === 5) ok('5 scenes are contiguous and inside duration')
+    if (contiguous && scenes.length === EXPECTED_SCENES) ok(`${EXPECTED_SCENES} scenes are contiguous and inside duration`)
     else if (!contiguous) console.log('BUG   scene timeline is not contiguous / not covering 0..duration')
   }
 }
@@ -288,7 +290,10 @@ else ok(`title "${expectedTitle}" present`)
 
 let specData = null
 try { specData = JSON.parse(readFileSync(SPEC, 'utf8')) } catch { warn(`cannot read ${SPEC}; using embedded spec for copy checks`) }
-const scenesForCopy = specData?.scenes ?? spec?.scenes ?? []
+// The page's embedded spec is the copy actually rendered (build stamps
+// `{tools}` with the registry size); fall back to spec.json only when the page
+// carries no embedded spec.
+const scenesForCopy = spec?.scenes ?? specData?.scenes ?? []
 const headlines = scenesForCopy.map((s) => (s.headline ?? '').trim()).filter(Boolean)
 const captions = scenesForCopy.map((s) => (s.caption ?? '').trim()).filter(Boolean)
 let copyMissing = 0
@@ -305,12 +310,12 @@ if (copyMissing === 0 && headlines.length > 0 && captions.length > 0) ok('all no
 const htmlLower = html.toLowerCase()
 const foundTools = TOOL_NAMES.filter((name) => htmlLower.includes(name))
 const missingTools = TOOL_NAMES.filter((name) => !foundTools.includes(name))
-console.log(`real tool names on page: ${foundTools.length}/17 (need >= 15)`)
+console.log(`real tool names on page: ${foundTools.length}/${TOOL_NAMES.length} (need >= ${MIN_TOOLS_ON_PAGE})`)
 console.log(`  found:   ${foundTools.join(', ')}`)
 if (missingTools.length > 0) console.log(`  missing: ${missingTools.join(', ')}`)
-if (foundTools.length < 15) bug(`only ${foundTools.length}/17 tool names on the page (need at least 15)`)
-else if (foundTools.length < 17) warn(`${foundTools.length}/17 tool names; requirement is >= 15, missing: ${missingTools.join(', ')}`)
-else ok('all 17 real tool names present')
+if (foundTools.length < MIN_TOOLS_ON_PAGE) bug(`only ${foundTools.length}/${TOOL_NAMES.length} tool names on the page (need at least ${MIN_TOOLS_ON_PAGE})`)
+else if (foundTools.length < TOOL_NAMES.length) warn(`${foundTools.length}/${TOOL_NAMES.length} tool names; requirement is >= ${MIN_TOOLS_ON_PAGE}, missing: ${missingTools.join(', ')}`)
+else ok(`all ${TOOL_NAMES.length} real tool names present`)
 
 // ---------------------------------------------------------------- 5. start gate + replay
 section(5, 'start gate and replay control (asserted on what the page exposes)')

@@ -79,6 +79,13 @@ await writeFile(join(workspace, 'assets', 'audio', 'broken.wav'), Buffer.from('n
 await mkdir(join(workspace, '.hidden'), { recursive: true })
 await writeFile(join(workspace, '.hidden', 'note.txt'), 'hidden')
 await writeFile(join(workspace, 'notes.txt'), 'not offered by the listing')
+// Names that expose a locale-dependent listing order. Code-unit order is
+// Z2 < _5 < a1, while `localeCompare` puts `_5` first and `a1` before `Z2` in a
+// typical locale, so a regression to localeCompare reorders these three.
+for (const name of ['Z2', '_5', 'a1']) {
+  await mkdir(join(workspace, name), { recursive: true })
+  await writeFile(join(workspace, `${name}.json`), JSON.stringify({ cues: [] }))
+}
 
 const inlineData = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA='
 const sheet = {
@@ -410,6 +417,23 @@ section('8. list endpoint')
   check('non-audio files are skipped', !(body.files ?? []).some((entry) => entry.name === 'notes.txt'))
   check('root has no parent', body.parent === null, String(body.parent))
   check('root dir is empty string', body.dir === '', JSON.stringify(body.dir))
+
+  // The order must not depend on the machine locale: code-unit sorts Z2 < _5 < a1,
+  // while localeCompare in a typical locale sorts _5 < a1 < Z2. A locale-dependent
+  // sort also changes which entries survive the truncation cutoff.
+  const dirNames = (body.dirs ?? []).map((entry) => entry.name)
+  const fileNames = (body.files ?? []).map((entry) => entry.name)
+  console.log(`  sort probe: dirs=${JSON.stringify(dirNames)} files=${JSON.stringify(fileNames)}`)
+  check('locale-probe directories are all listed',
+    ['Z2', '_5', 'a1'].every((name) => dirNames.includes(name)), JSON.stringify(dirNames))
+  check('locale-probe files are all listed',
+    ['Z2.json', '_5.json', 'a1.json'].every((name) => fileNames.includes(name)), JSON.stringify(fileNames))
+  check('directories sort by code unit (Z2, _5, a1)',
+    JSON.stringify(dirNames.filter((name) => ['Z2', '_5', 'a1'].includes(name))) === JSON.stringify(['Z2', '_5', 'a1']),
+    JSON.stringify(dirNames))
+  check('files sort by code unit (Z2, _5, a1)',
+    JSON.stringify(fileNames.filter((name) => ['Z2.json', '_5.json', 'a1.json'].includes(name))) === JSON.stringify(['Z2.json', '_5.json', 'a1.json']),
+    JSON.stringify(fileNames))
 
   const audio = await list(`?dir=${encodeURIComponent('assets/audio')}`)
   const audioBody = audio.json ?? {}

@@ -39,29 +39,19 @@
     {
       "id": "vocabulary",
       "from": 6.0,
-      "to": 10.0,
+      "to": 13.5,
       "headline": "一套声音词汇",
       "caption": "38 个音效预设 · 26 个分层配方 · 8 种曲风",
       "detail": "拟音、水气、机械、生物、UI、魔法、爆炸、配乐",
-      "action": "17 tool chips fly in, each with a tick; chips are the real tool names",
+      "action": "every registered tool chip flies in, each with a tick; chips are the real tool names",
       "cue": "ticks"
-    },
-    {
-      "id": "voice",
-      "from": 10.0,
-      "to": 13.5,
-      "headline": "还会说话，还会唱",
-      "caption": "免费 Edge 旁白 · 词级时间戳 · 零素材唱声 · 口型轨",
-      "detail": "旁白直接给出字幕时间；口型轨每帧给出嘴形与张嘴量",
-      "action": "waveform + mouth morph driven by lipsync-style frames, syllable highlight",
-      "cue": "voice"
     },
     {
       "id": "promise",
       "from": 13.5,
       "to": 16.0,
       "headline": "同一请求，同样的字节",
-      "caption": "零依赖 · 零密钥可用 · 17 个工具 · MIT © 2026 Soar_L",
+      "caption": "零依赖 · 零密钥可用 · {tools} 个工具 · MIT © 2026 Soar_L",
       "detail": "install_bundle  target: dsh-audio",
       "action": "end card: waveform flatline into a logo mark, install line types in, replay gate",
       "cue": "end"
@@ -69,8 +59,7 @@
   ],
   "cues": [
     { "name": "impact", "at": 2.5, "hint": "audio_design impact or audio_synth impact, weight 0.9" },
-    { "name": "ticks", "at": 6.0, "hint": "audio_pattern tick train 6.0-10.0, every 0.125, accelerando" },
-    { "name": "voice", "at": 10.0, "hint": "audio_sing 4 notes + short phrase, 22050 Hz" },
+    { "name": "ticks", "at": 6.0, "hint": "audio_pattern tick train from 6.0 (4 s, every 0.125, accelerando)" },
     { "name": "end", "at": 13.5, "hint": "chime / ui-success, 0.8 s" }
   ],
   "requirements": {

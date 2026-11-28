@@ -21,7 +21,7 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { analyzeLoudness } from '../lib/lufs.js'
+import { analyzeLoudness, truePeak } from '../lib/lufs.js'
 import { masterChain } from '../lib/master.js'
 import { encodeAnyWav, layoutFor, loudnessChannels } from '../lib/multichannel.js'
 import { registerLoudnessTools } from '../lib/tools-loudness.js'
@@ -171,7 +171,7 @@ console.log('\n-- audio_master reports the same LUFS as audio_loudness --')
 
 /* ------------------------------------------------- stereo stays unchanged -- */
 
-console.log('\n-- stereo and mono readings are unchanged --')
+console.log('\n-- stereo and mono readings: stereo unchanged, mono on the BS.1770-4 weight --')
 {
   const left = sine(Math.round(3 * RATE), 997, -23)
   const right = sine(Math.round(3 * RATE), 997, -23, 0.9)
@@ -181,6 +181,112 @@ console.log('\n-- stereo and mono readings are unchanged --')
   check('stereo still reads the EBU reference level', Math.abs(stereo.metrics.lufs + 23) <= 0.1, String(stereo.metrics.lufs))
   check('stereo does not claim LFE exclusion', stereo.metrics.lfeExcluded === false)
   check('stereo weights are both 1', stereo.metrics.channelWeights.join(',') === '1,1', stereo.metrics.channelWeights.join(','))
+
+  // A mono file is measured with the standard single-channel weight now, so a
+  // -23 dBFS *peak* sine (RMS -26.01 dBFS) reads -26.01 LUFS, exactly like
+  // ffmpeg's ebur128. `test/lufs.mjs` pins this against a real ffmpeg run.
+  const mono = sine(Math.round(3 * RATE), 997, -23)
+  await writeFile(join(cwd, 'mono.wav'), encodeAnyWav([mono], RATE, { bitDepth: 16 }))
+  const monoMeasured = await call('audio_loudness', { path: 'mono.wav' })
+  const monoDual = await call('audio_loudness', { path: 'mono.wav', dualMono: true })
+  console.log(`  mono 997 Hz -23 dBFS peak -> ${fmt(monoMeasured.metrics.lufs, 3)} LUFS standard, ${fmt(monoDual.metrics.lufs, 3)} LUFS with dualMono`)
+  check('mono uses the standard single-channel weight', monoMeasured.metrics.channelWeights.join(',') === '1' && monoMeasured.metrics.dualMono === false)
+  check('mono reads -26.01 LUFS for a -23 dBFS peak sine', Math.abs(monoMeasured.metrics.lufs + 26.01) <= 0.1, String(monoMeasured.metrics.lufs))
+  check('the dualMono option still reads -23.0', Math.abs(monoDual.metrics.lufs + 23) <= 0.1, String(monoDual.metrics.lufs))
+}
+
+/* -------------------------------- multichannel corrected copies -- */
+
+console.log('\n-- audio_loudness writes corrected copies for mono / stereo / 5.1 --')
+{
+  /** Scale one mono buffer to an exact integrated loudness (mono weight). */
+  function scaleMono (samples, target) {
+    const analysis = analyzeLoudness(samples, RATE)
+    const gain = Math.pow(10, (target - analysis.integratedLufs) / 20)
+    const out = new Float32Array(samples.length)
+    for (let i = 0; i < samples.length; i += 1) out[i] = samples[i] * gain
+    return out
+  }
+  /** Scale a channel list to an exact integrated loudness, measured as stereo. */
+  function scaleChannels (channels, target) {
+    const analysis = analyzeLoudness(channels[0], RATE, { channels })
+    const gain = Math.pow(10, (target - analysis.integratedLufs) / 20)
+    return channels.map((channel) => {
+      const out = new Float32Array(channel.length)
+      for (let i = 0; i < channel.length; i += 1) out[i] = channel[i] * gain
+      return out
+    })
+  }
+  /** The loudness the shared meter reports for a decoded file. */
+  function meterOf (channels) {
+    const { measured, weights } = loudnessChannels(channels)
+    return analyzeLoudness(measured[0], RATE, { channels: measured, weights }).integratedLufs
+  }
+  /** The file's true peak: the worst channel, LFE included. */
+  function filePeakOf (channels) {
+    let peak = Number.NEGATIVE_INFINITY
+    for (const channel of channels) peak = Math.max(peak, truePeak(channel, RATE))
+    return peak
+  }
+
+  // A cue-like mono signal: three tones plus a decaying hit, so the copy has to
+  // handle peaks as well as RMS (a sine would make the peak maths trivial).
+  const frames = Math.round(3 * RATE)
+  const monoSeed = new Float32Array(frames)
+  for (let i = 0; i < frames; i += 1) {
+    const t = i / RATE
+    const hit = Math.exp(-t * 8) * Math.sin(TAU * 180 * t)
+    monoSeed[i] = 0.12 * Math.sin(TAU * 220 * t) + 0.08 * Math.sin(TAU * 997 * t) + 0.05 * Math.sin(TAU * 3200 * t) + 0.3 * hit
+  }
+  const monoFixture = scaleMono(monoSeed, -30)
+  await writeFile(join(cwd, 'copy-mono.wav'), encodeAnyWav([monoFixture], RATE, { bitDepth: 16 }))
+
+  const stereoSeed = [scaleMono(monoSeed, -31), scaleMono(monoSeed, -31).map((value, index) => value * 0.9 + 0.01 * Math.sin(TAU * 1500 * index / RATE))]
+  const stereoFixture = scaleChannels(stereoSeed, -28)
+  await writeFile(join(cwd, 'copy-stereo.wav'), encodeAnyWav(stereoFixture, RATE, { bitDepth: 16 }))
+
+  const surroundFixture = fiveOne(3)
+  await writeFile(join(cwd, 'copy-surround.wav'), encodeAnyWav(surroundFixture, RATE, { bitDepth: 24 }))
+
+  const cases = [
+    { label: 'mono', source: 'copy-mono.wav', out: 'copy-mono-out.wav', channels: 1, bitDepth: 16, targetLufs: -24 },
+    { label: 'stereo', source: 'copy-stereo.wav', out: 'copy-stereo-out.wav', channels: 2, bitDepth: 16, targetLufs: -22 },
+    { label: '5.1', source: 'copy-surround.wav', out: 'copy-surround-out.wav', channels: 6, bitDepth: 24, targetLufs: -23 }
+  ]
+  for (const testCase of cases) {
+    const result = await call('audio_loudness', { path: testCase.source, targetLufs: testCase.targetLufs, out: testCase.out })
+    const written = decodeWav(await readFile(join(cwd, testCase.out)))
+    const writtenLufs = meterOf(written.channels)
+    const writtenPeak = filePeakOf(written.channels)
+    console.log(`  ${testCase.label.padEnd(6)} target ${testCase.targetLufs} LUFS -> measured ${fmt(writtenLufs, 3)} LUFS, ` +
+      `true peak ${fmt(writtenPeak, 3)} dBTP, ${written.channels.length} ch ${written.bitDepth}-bit, ` +
+      `applied gain ${fmt(result.written.appliedGainDb, 2)} dB, targetHit ${result.written.targetHit}`)
+    check(`${testCase.label}: the copy lands within 0.5 LU of the target`, Math.abs(writtenLufs - testCase.targetLufs) <= 0.5,
+      `${writtenLufs} vs ${testCase.targetLufs}`)
+    check(`${testCase.label}: the copy stays under the -1 dBTP ceiling`, writtenPeak <= -1 + 1e-9, String(writtenPeak))
+    check(`${testCase.label}: the channel count is unchanged`, written.channels.length === testCase.channels,
+      `${written.channels.length} vs ${testCase.channels}`)
+    check(`${testCase.label}: the bit depth is preserved`, written.bitDepth === testCase.bitDepth,
+      `${written.bitDepth} vs ${testCase.bitDepth}`)
+    check(`${testCase.label}: the report says the target was hit`, result.written.targetHit === true &&
+      Math.abs(result.written.lufs - writtenLufs) <= 0.05, `${result.written.targetHit} / ${result.written.lufs} vs ${writtenLufs}`)
+    check(`${testCase.label}: the report carries appliedGainDb and the measured true peak`,
+      Number.isFinite(result.written.appliedGainDb) && Math.abs(result.written.truePeakDbtp - writtenPeak) <= 0.05,
+      `${result.written.appliedGainDb} dB / ${result.written.truePeakDbtp} vs ${writtenPeak}`)
+    // The layout decision is the same one the measurement used.
+    check(`${testCase.label}: the written metrics describe the file`, result.written.channelLayout === layoutFor(testCase.channels).id &&
+      result.metrics.channelCount === testCase.channels, `${result.written.channelLayout} / ${result.metrics.channelCount}`)
+  }
+
+  // Writing over the input must be refused, not silently destroy the source.
+  let error = null
+  try {
+    await call('audio_loudness', { path: 'copy-mono.wav', targetLufs: -24, out: 'copy-mono.wav' })
+  } catch (caught) { error = caught }
+  check('overwriting the input file is refused', error !== null && /overwrite/.test(error.message), error?.message)
+  const stillThere = decodeWav(await readFile(join(cwd, 'copy-mono.wav')))
+  check('the input file survived the refused write', stillThere.channels.length === 1 &&
+    Math.abs(meterOf(stillThere.channels) + 30) < 0.05, String(meterOf(stillThere.channels)))
 }
 
 await rm(cwd, { recursive: true, force: true })

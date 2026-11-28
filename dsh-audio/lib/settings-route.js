@@ -3,7 +3,9 @@
  *
  * Five endpoints on the browser HTTP carrier, all same-origin only:
  *   GET  /dsh-audio/config  → config the running plugin uses; API keys reduced
- *                             to "is it set" flags, never echoed back;
+ *                             to "is it set" flags, never echoed back; plus the
+ *                             read-only peer-plugin detection (`ecosystem`),
+ *                             which carries names/versions/capabilities only;
  *   POST /dsh-audio/config  → merge a patch and persist it via the config editor;
  *   POST /dsh-audio/test    → really talk to the provider (synthesize a sentence,
  *                             or describe a sample) and return the audio so the
@@ -66,6 +68,7 @@ import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, isAbsolute, join, relative, resolve } from 'node:path'
 import { finalize, renderPreset, toWavBytes } from './audio.js'
+import { ecosystemStatus } from './interop.js'
 import {
   CHAT_AUDIO_DEFAULTS,
   EDGE_VOICE_CATALOG,
@@ -1023,7 +1026,11 @@ export function registerSettingsRoute (ctx, config, version) {
       try {
         if (!sameOriginOnly(request, response)) return
         if (request.method === 'GET') {
-          sendJson(response, 200, { ok: true, version, config: snapshot() })
+          // Peer-plugin detection travels with the read-only view. It is a fact
+          // about the profile on this machine (names, versions, capabilities —
+          // see `lib/interop.js`), never about the saved keys, and a failed
+          // detection is an empty `plugins` list rather than a broken page.
+          sendJson(response, 200, { ok: true, version, config: snapshot(), ecosystem: ecosystemStatus() })
           return
         }
         if (request.method !== 'POST') {

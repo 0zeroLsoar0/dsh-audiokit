@@ -51,7 +51,12 @@ function sessionCwd (ctx, exec) {
 }
 
 function fmt (value, digits = 1) {
-  return Number(value).toFixed(digits).replace(/\.0+$/, '')
+  const number = Number(value)
+  // A metric computed over non-finite samples is NaN or ±Infinity. Printing
+  // `Infinity dBFS` (or `NaN dB`) is worse than saying the number is unknown,
+  // because it reads like a measurement rather than a broken input.
+  if (!Number.isFinite(number)) return 'n/a'
+  return number.toFixed(digits).replace(/\.0+$/, '')
 }
 
 function describeValue (value) {
@@ -95,8 +100,8 @@ function summaryLine (label, cwd, path, bytes, metrics, extra = []) {
     `peak ${fmt(metrics.peakDbfs)} dBFS`,
     `rms ${fmt(metrics.rmsDbfs)} dBFS`,
     `crest ${fmt(metrics.crestDb)} dB`,
-    `centroid ${metrics.centroidHz} Hz`,
-    `onsets ${metrics.onsets}`,
+    `centroid ${fmt(metrics.centroidHz, 0)} Hz`,
+    `onsets ${fmt(metrics.onsets, 0)}`,
     metrics.clipping > 0 ? `CLIPPING ${metrics.clipping} samples` : 'no clipping',
     ...extra
   ]
@@ -132,21 +137,55 @@ async function finishChannels (cwd, channels, sampleRate, requestedOut, label, h
   return { target, bytes: info.size ?? bytes.length, metrics, channels, sampleRate }
 }
 
+/**
+ * Count the NaN / ±Infinity samples a file carries, per channel.
+ *
+ * Every other measurement here is blind to them: `NaN > peak` is false, so a
+ * file of NaNs measures as peak -120 dBFS and reads "clean", while +Infinity
+ * measures as a peak of Infinity. Both are shapes that look like a healthy
+ * report. This count is what lets `audio_probe` say the file is unusable
+ * instead of printing those numbers as if they were measurements.
+ *
+ * @param {Float32Array[]} channels - decoded channel buffers.
+ * @returns {{ nan: number, infinite: number, total: number, samples: number,
+ *   perChannel: { nan: number, infinite: number }[] }}
+ */
+export function countNonFiniteSamples (channels) {
+  let nan = 0
+  let infinite = 0
+  let samples = 0
+  const perChannel = []
+  for (const channel of channels) {
+    let channelNan = 0
+    let channelInfinite = 0
+    for (let index = 0; index < channel.length; index += 1) {
+      const value = channel[index]
+      if (Number.isNaN(value)) channelNan += 1
+      else if (!Number.isFinite(value)) channelInfinite += 1
+    }
+    nan += channelNan
+    infinite += channelInfinite
+    samples += channel.length
+    perChannel.push({ nan: channelNan, infinite: channelInfinite })
+  }
+  return { nan, infinite, total: nan + infinite, samples, perChannel }
+}
+
 /** Register the audio tools on `ctx.tools`. */
 export function registerTools (ctx) {
   ctx.tools.register({
     name: 'audio_synth',
-    description: 'Render one synthesized sound effect to a .wav file. Deterministic: the same preset, params, seed and duration always produce identical bytes, so a render can be cached and referenced by path. Returns the path plus measurements (duration, peak, RMS, crest, brightness, onset count) so the result can be judged without listening.',
+    description: 'Render one synthesized sound effect from the built-in preset table to a .wav, with measurements. Deterministic: the same preset, params, seed and duration produce identical bytes. Presets and knobs are listed in the animation-sound skill.',
     parameters: {
       type: 'object',
       properties: {
-        preset: { type: 'string', enum: PRESET_NAMES, description: 'Sound family. impact=weighty hit, whoosh=moving air, tick=very short click, chime=tonal bell, riser=tension build, zap=electric discharge, thud=soft low body, scrap=friction grains, texture=sustained bed (ambience).' },
-        params: { type: 'object', additionalProperties: true, description: 'Perceptual knobs in 0..1: weight, hardness, metallic, space, tone, speed, rise, decay, density, roughness, movement, pitchJitter. pitch is a frequency multiplier 0.5..2 on impact, whoosh, switch-click, water-drip, bubble, servo, motor-loop, alarm-beep, alarm-siren, hud-tick, creature-growl, insect-buzz, bell-toll and choir-pad; it is a 0..1 knob on tick, chime and zap; the other presets ignore it. For preset "texture" add kind: wind|rain|fire|room|hum.' },
+        preset: { type: 'string', enum: PRESET_NAMES, description: 'Preset id (38 families); one line per preset is in the animation-sound skill.' },
+        params: { type: 'object', additionalProperties: true, description: 'Perceptual knobs 0..1 plus pitch; the full knob list is in the animation-sound skill.' },
         duration: { type: 'number', description: 'Length in seconds; defaults to the preset length (0.05 for tick, 1.6 for riser, 3 for texture).' },
         seed: { type: 'integer', description: 'Variation seed. Same seed reproduces the same take; change it to get a sibling variant.' },
         loop: { type: 'boolean', description: 'Render a seamless loop (for beds and hums). The file then repeats without a thump.' },
-        sampleRate: { type: 'integer', description: 'Defaults to 44100. Use 22050 when file size matters (inline HTML), 48000 for video-grade output.' },
-        out: { type: 'string', description: 'Output path, relative to the working directory. Defaults to assets/audio/<preset>-<hash>.wav.' }
+        sampleRate: { type: 'integer', description: 'Sample rate; default 44100 (22050 for inline, 48000 for video).' },
+        out: { type: 'string', description: 'Output path; default assets/audio/<preset>-<hash>.wav.' }
       },
       required: ['preset'],
       additionalProperties: false
@@ -181,20 +220,20 @@ export function registerTools (ctx) {
 
   ctx.tools.register({
     name: 'audio_pattern',
-    description: 'Fill a span of time with a generated sequence of one preset: an even or accelerating train, a random scatter, or a riser. This is how dense textures are made without dozens of separate renders — one call with every=0.08 and an accelerating curve produces a hundred events that share a single coherent motion.',
+    description: 'Fill a span of time with a generated sequence of one preset: an even or accelerating train, a random scatter, or a riser. One call replaces dozens of separate renders.',
     parameters: {
       type: 'object',
       properties: {
         preset: { type: 'string', enum: PRESET_NAMES, description: 'Preset repeated by the pattern.' },
-        kind: { type: 'string', enum: ['train', 'scatter', 'riser'], description: 'train=evenly spaced (curve reshapes spacing), scatter=random positions, riser=one continuous rising sweep (uses the riser synth and accepts `params.tone` / `params.tension`).' },
-        from: { type: 'number', description: 'Start of the span in seconds; defaults to 0. The output timeline still begins at 0 s, so `from` only moves the placement window and the file lasts `to - from` seconds.' },
-        to: { type: 'number', description: 'End of the span in seconds; defaults to 4. The span (to - from) is capped at 180 s and is the length of the written file.' },
+        kind: { type: 'string', enum: ['train', 'scatter', 'riser'], description: 'train, scatter or riser; curve reshapes train spacing.' },
+        from: { type: 'number', description: 'Span start in seconds; default 0. The file still starts at 0 s and lasts to-from.' },
+        to: { type: 'number', description: 'Span end in seconds; default 4. Cap 180 s; this is also the file length.' },
         every: { type: 'number', description: 'Spacing between events in seconds; ignored when count is given.' },
-        count: { type: 'integer', description: 'Exact number of events instead of a spacing; capped at 20000. Every event is placed inside the span so `events` matches what the file plays.' },
+        count: { type: 'integer', description: 'Exact event count instead of a spacing; capped at 20000.' },
         curve: { type: 'string', enum: ['linear', 'accelerando', 'ritardando', 'ease'], description: 'How spacing changes across the span. accelerando crowds events toward the end.' },
         jitter: { type: 'number', description: '0..1 timing randomness; keeps a train from sounding mechanical.' },
         accentEvery: { type: 'integer', description: 'Accent every Nth event (e.g. 4 for a 4/4 feel).' },
-        pitchFrom: { type: 'number', description: 'Pitch of the first event, in the preset\'s own pitch domain: a 0..1 tone knob for tick/chime/zap/riser, a 0.5..2 frequency multiplier for impact/whoosh (and the other pitched presets). Combined with pitchTo it glides across the span.' },
+        pitchFrom: { type: 'number', description: 'First event pitch: 0..1 knob for tick/chime/zap/riser, else a 0.5..2 multiplier.' },
         pitchTo: { type: 'number', description: 'Pitch of the last event, same domain as pitchFrom.' },
         params: { type: 'object', additionalProperties: true, description: 'Base knobs for every event, same names as audio_synth.' },
         seed: { type: 'integer', description: 'Variation seed.' },
@@ -252,14 +291,14 @@ export function registerTools (ctx) {
 
   ctx.tools.register({
     name: 'audio_mix',
-    description: 'Mix existing .wav files into one track with per-input gain, fades, peak normalisation and a limiter. Channels are preserved: any stereo or multichannel input makes the output stereo (mono inputs are placed at -3 dB per side), and only an all-mono request stays mono; 4/6/8-channel inputs fold to L/R through the WAVE layout matrix with LFE dropped. Limiter and peak normalisation are linked across channels, so the image does not shift. Reports `channels`, `foldedFrom` and each input\'s channel count. Use it to assemble a finished cue from individually tweaked sounds, or to combine a bed with one-shots.',
+    description: 'Mix existing .wav files into one track with per-input gain, fades, peak normalisation and a limiter. Keeps the widest input\'s channel layout. Use audio_bus when the layers need EQ, compression or ducking.',
     parameters: {
       type: 'object',
       properties: {
         inputs: { type: 'array', items: { type: 'string' }, description: 'Input .wav paths, relative to the working directory or absolute.' },
-        offsets: { type: 'array', items: { type: 'number' }, description: 'Start time of each input in seconds, same order as inputs (finite, 0..180). This is what turns a set of one-shots into a cue track; omit for 0.' },
-        gains: { type: 'array', items: { type: 'number' }, description: 'Per-input gain in dB, same order as inputs (finite, -120..24; e.g. -6 quiets an input by 6 dB).' },
-        durationSeconds: { type: 'number', description: 'Trim or pad the result to this length (finite, > 0, at most 180 s); defaults to the longest input.' },
+        offsets: { type: 'array', items: { type: 'number' }, description: 'Start time per input in seconds, same order as inputs (0..180).' },
+        gains: { type: 'array', items: { type: 'number' }, description: 'Per-input gain in dB, same order as inputs (-120..24).' },
+        durationSeconds: { type: 'number', description: 'Trim or pad to this length (max 180 s); default the longest input.' },
         fadeInSeconds: { type: 'number', description: 'Fade in length; omit for none.' },
         fadeOutSeconds: { type: 'number', description: 'Fade out length; omit for none.' },
         limiter: { type: 'boolean', description: 'Soft-limit the sum; defaults to true.' },
@@ -268,7 +307,7 @@ export function registerTools (ctx) {
         channels: {
           type: ['string', 'integer'],
           enum: ['auto', 1, 2],
-          description: "Output channels: 'auto' (default) follows the widest input (stereo when any input has more than one channel, mono only when all are mono); 1 forces mono (stereo/multichannel folded, LFE dropped); 2 forces stereo (mono inputs at -3 dB per side, multichannel downmixed to L/R)."
+          description: 'Output channels: auto (default), 1 mono or 2 stereo; LFE is dropped on a fold.'
         },
         out: { type: 'string', description: 'Output path; defaults to assets/audio/mix-<hash>.wav.' }
       },
@@ -346,7 +385,7 @@ export function registerTools (ctx) {
 
   ctx.tools.register({
     name: 'audio_probe',
-    description: 'Measure a .wav file: duration, sample rate, peak and RMS level, crest factor, DC offset, clipping, spectral centroid (brightness), onset count, and loop-seam level jump. Every channel is measured, not a mono fold: peak, clipping and DC are the worst channel\'s and a stereo pair that cancels in mono still measures. Multi-channel files also report `perChannel` (peak/clipping/DC per channel). Use it to verify a render, compare two takes numerically, or check that a loop will not thump.',
+    description: 'Measure a .wav file: duration, peak/RMS, crest, DC, clipping, brightness, onsets and loop seam, per channel. Use it to verify a render or check that a loop will not thump.',
     parameters: {
       type: 'object',
       properties: {
@@ -371,7 +410,33 @@ export function registerTools (ctx) {
         channelCount: decoded.channelCount
       }
       const info = await stat(path)
+      const nonFinite = countNonFiniteSamples(decoded.channels)
+      // A metric computed over poisoned samples is not a measurement. Hide the
+      // level/analysis numbers behind `n/a` instead of printing the -120 dBFS
+      // floor that NaN happens to produce, or `Infinity dBFS` for Inf: both
+      // read like real readings and both are the bug, not the signal.
+      const displayMetrics = nonFinite.total > 0
+        ? {
+            ...metrics,
+            peakDbfs: Number.NaN,
+            rmsDbfs: Number.NaN,
+            crestDb: Number.NaN,
+            dcOffset: Number.NaN,
+            onsets: Number.NaN,
+            loopSeam: Number.NaN,
+            loopStep: Number.NaN,
+            centroidHz: Number.NaN
+          }
+        : metrics
       const notes = []
+      if (nonFinite.total > 0) {
+        const where = nonFinite.perChannel
+          .map((channel, index) => ({ index, ...channel }))
+          .filter((channel) => channel.nan + channel.infinite > 0)
+          .map((channel) => `ch${channel.index + 1} NaN ${channel.nan}, Inf ${channel.infinite}`)
+          .join('; ')
+        notes.push(`non-finite samples: ${nonFinite.total} of ${nonFinite.samples} (${where}); levels are not meaningful`)
+      }
       const worstChannel = metrics.channelCount > 1 && metrics.perChannel !== undefined
         ? metrics.perChannel.findIndex((channel) => channel.clipping === metrics.clipping)
         : -1
@@ -386,12 +451,14 @@ export function registerTools (ctx) {
       if (Number.isFinite(args.expectDuration) && Math.abs(metrics.durationSeconds - args.expectDuration) > 0.05) {
         notes.push(`duration ${fmt(metrics.durationSeconds, 2)}s != expected ${fmt(args.expectDuration, 2)}s`)
       }
-      const channelText = metrics.channelCount > 1
-        ? [`${metrics.channelCount} ch`, ...(metrics.perChannel ?? []).map((channel, index) => `ch${index + 1} ${fmt(channel.peakDbfs)} dBFS${channel.clipping > 0 ? ' CLIP' : ''}`)].join(' · ')
-        : 'mono'
-      const text = summaryLine('Measured', cwd, path, info.size, metrics, [
+      const channelText = nonFinite.total > 0
+        ? `${metrics.channelCount} ch (per-channel levels not meaningful)`
+        : metrics.channelCount > 1
+          ? [`${metrics.channelCount} ch`, ...(metrics.perChannel ?? []).map((channel, index) => `ch${index + 1} ${fmt(channel.peakDbfs)} dBFS${channel.clipping > 0 ? ' CLIP' : ''}`)].join(' · ')
+          : 'mono'
+      const text = summaryLine('Measured', cwd, path, info.size, displayMetrics, [
         channelText,
-        `loop seam ${fmt(metrics.loopSeam)} dB`,
+        `loop seam ${fmt(displayMetrics.loopSeam)} dB`,
         notes.length > 0 ? `notes: ${notes.join(', ')}` : 'clean'
       ])
       return {
@@ -399,7 +466,8 @@ export function registerTools (ctx) {
         relativePath: displayPath(cwd, path),
         bytes: info.size,
         channels: decoded.channelCount,
-        metrics,
+        metrics: displayMetrics,
+        nonFiniteSamples: nonFinite.total,
         notes,
         text
       }

@@ -1,6 +1,6 @@
 # dsh-audiokit
 
-> **还没做好，可能会炸。** 项目处于开发阶段（当前 0.6.0），接口、工具名和文件格式都可能变；安装前请备份好 profile。
+> **还没做好，可能会炸。** 项目处于开发阶段（当前 0.6.1），接口、工具名和文件格式都可能变；安装前请备份好 profile。
 
 dsh-audiokit 是 DeepSeek Harness（DSH）的音频处理插件，给 HTML 动画、动效和视频做声音：把合成、设计、作曲、旁白、混音、母带和验收变成 Agent 可以直接调用的工具。
 
@@ -16,7 +16,7 @@ dsh plugin add "file:<仓库>/dsh-audio"
 
 ## 工具列表
 
-30 个工具，按用途分组。每个工具渲染完都会回报测量值（峰值、RMS、质心、起音、循环接缝等），不用回头再测。
+34 个工具，按用途分组。每个工具渲染完都会回报测量值（峰值、RMS、质心、起音、循环接缝等），不用回头再测。
 
 ### 造声（10）
 
@@ -38,14 +38,16 @@ dsh plugin add "file:<仓库>/dsh-audio"
 - `audio_lipsync`：从音频生成逐帧口型（json / srt / css / ae）
 - `audio_mouth`：没有音频也能出口型（文本/字幕直接驱动嘴形）
 
-### 对画面（4）
+### 对画面（6）
 
 - `audio_beats`：从成品音乐测 bpm、起音、节拍网格和重拍
+- `audio_cues`：反向：从现成音频里检出冲击点与段落边界，输出动画 cue 时间表
 - `audio_bind`：生成 cue 表与页面播放器，可内联成单文件
 - `audio_mux`：视频探测、混流、镜头切点、抽音轨（依赖本机 ffmpeg）
 - `audio_daw`：工程导出（EDL / Reaper `.rpp` / CSV / Audacity labels / OpenTimelineIO / FCP7 XML）
+- `audio_handoff`：把属于别的音频插件的活写成交接简报（目标插件 / 能力 / 逐轨请求；不调用对方、不联网）
 
-### 混音、母带、交付（8）
+### 混音、母带、交付（9）
 
 - `audio_mix`：多轨合一，保留立体声（多声道按布局折叠）
 - `audio_bus`：混音总线（EQ / 压缩 / 侧链闪避 / 声像 / 宽度，支持 4/6/8 声道）
@@ -55,11 +57,13 @@ dsh plugin add "file:<仓库>/dsh-audio"
 - `audio_stretch`：变速不变调、移调不变时长
 - `audio_spatial`：立体声 / 双耳 / quad / 5.1 / 7.1 / 一阶 Ambisonics
 - `audio_loudness`：BS.1770 LUFS、真峰值、响度范围
+- `audio_batch`：一组 wav 一次跑完 check / loudness / normalize / master，逐条报错不中断，只写副本
 
-### 验收（4）
+### 验收（5）
 
 - `audio_probe`：单文件度量（时长、峰值、RMS、波峰因数、谱质心、起音、循环接缝、削波、直流）
 - `audio_check`：交付前质量闸（削波 / 静音 / 时间轴 / 叠加峰值）+ 本地声学自检
+- `audio_audit`：旁白 ↔ 字幕 ↔ 口型轨三方只读对账（字幕漂移 / 漏句、口型覆盖与单帧抖动），不改输入
 - `audio_analyze`：频谱分析（基频、谐波、共振峰、噪声度、衰减时间）
 - `audio_regress`：快照与容差比对，证明改动没有带歪别的指标
 
@@ -92,7 +96,7 @@ audio_check({ paths: ['out/mix.wav'], cues: [{ at: 0.82, src: 'assets/audio/slam
 - **确定性**：同一请求 + 同一 seed 产出相同的字节；文件名由内容哈希决定，可缓存、可回归比对。
 - **可测量**：峰值、RMS、波峰因数、谱质心、起音数、循环接缝、LUFS 与真峰值都有对应工具。
 - **离线可用**：合成、设计、作曲、混音、母带、验收全部离线；只有 TTS、语义检查和外部生成需要网络。
-- **测试**：57 个测试文件，`node dsh-audio/tools/test-all.mjs` 一条命令跑全量。
+- **测试**：63 个测试文件，`node dsh-audio/tools/test-all.mjs` 一条命令跑全量（一个文件一个子进程，全绿才算过）。
 
 ## 限制与说明
 
@@ -101,6 +105,7 @@ audio_check({ paths: ['out/mix.wav'], cues: [{ at: 0.82, src: 'assets/audio/slam
 - AAF 和 OMF 只做结构导出，Pro Tools 打不开；要进剪辑软件用 OTIO 或 FCP7 XML。
 - 多声道输出仅支持 16/24 位；8/32 位仅限单/双声道。
 - `audio_generate` 不配置 HTTP 端点就不可用，且结果不保证确定性。
+- `audio_batch` 的 `normalize` / `master` 产出的是副本（写进 `outDir`，默认 `out/batch`），不会改写或删除原文件；输出路径若与任一输入相同会被拒绝而不是覆盖。
 - 开发版，接口和数据格式可能变；装前备份 profile。
 
 ## 许可

@@ -2,6 +2,6 @@
   "meta": {
     "title": "Sound",
     "detail": "docs/DETAIL.md",
-    "description": "Sound for HTML animation: 38 synthesized presets, 38 layered design recipes, 8 compose genres, narration (MiniMax / OpenAI-compatible / free Edge), plus viseme tracks, beat detection, a page player, mixing, loudness and delivery checks - 30 tools in all. Pick a provider under Settings → Sound; synthesis, composing, alignment and the checks need no key, and the same request always renders the same bytes."
+    "description": "Sound for HTML animation: 38 synthesized presets, 38 layered design recipes, 8 compose genres, narration (MiniMax / OpenAI-compatible / free Edge), plus viseme tracks, beat detection, a page player, mixing, loudness, delivery audits and batch processing - 34 tools in all. Pick a provider under Settings → Sound; synthesis, composing, alignment and the checks need no key, and the same request always renders the same bytes."
   }
 }

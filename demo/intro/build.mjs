@@ -15,14 +15,17 @@ const PLUGIN_DIR = path.join(ROOT, 'dsh-audio');
 const OUT = path.join(HERE, 'index.html');
 
 const FALLBACK_TOOLS = ['audio_synth', 'audio_pattern', 'audio_design', 'audio_compose', 'audio_tts',
-  'audio_voices', 'audio_sing', 'audio_lipsync', 'audio_beats', 'audio_bind', 'audio_mix',
+  'audio_voices', 'audio_lipsync', 'audio_beats', 'audio_bind', 'audio_mix',
   'audio_convert', 'audio_stretch', 'audio_loudness', 'audio_probe', 'audio_check', 'audio_regress'];
 
 const spec = JSON.parse(fs.readFileSync(SPEC_PATH, 'utf8'));
 const duration = Number(spec.meta.duration) || 16;
 
 // ---------------------------------------------------------------- tool names
-function readTools() {
+// The plugin registry is authoritative (it is what verify.mjs and the page's
+// "N tools" line refer to); a static scan is only the fallback when the demo
+// harness cannot load index.js.
+function scanToolsStatic() {
   const found = new Set();
   const walk = (dir) => {
     let ents = [];
@@ -34,16 +37,28 @@ function readTools() {
       else if (/\.(js|mjs|cjs)$/.test(e.name)) {
         let src = '';
         try { src = fs.readFileSync(p, 'utf8'); } catch { continue; }
-        const re = /name:\s*['"](audio_[a-z_]+)['"]/g;
+        const re = /name:\s*['"](audio_[a-z0-9_]+)['"]/g;
         let m;
         while ((m = re.exec(src))) found.add(m[1]);
+        // some tools register under a local `const tool = 'audio_…'` (audio_sampler)
+        for (const m2 of src.matchAll(/const tool\s*=\s*['"](audio_[a-z0-9_]+)['"]/g)) found.add(m2[1]);
       }
     }
   };
   walk(PLUGIN_DIR);
   const tools = [...found];
   const ok = tools.length >= 12 && FALLBACK_TOOLS.every((t) => found.has(t));
-  return { tools: ok ? tools : FALLBACK_TOOLS, source: ok ? 'dsh-audio' : 'fallback' };
+  return { tools: ok ? tools : FALLBACK_TOOLS, source: ok ? 'dsh-audio (static scan)' : 'fallback' };
+}
+async function readTools() {
+  try {
+    const { pathToFileURL } = await import('node:url');
+    const harness = await import(pathToFileURL(path.join(ROOT, 'dsh-audio-lab', 'harness', 'ctx.mjs')).href);
+    const { ctx } = await harness.loadPlugin(PLUGIN_DIR, {});
+    const names = [...ctx.state.tools.keys()];
+    if (names.length >= 12) return { tools: names, source: 'dsh-audio' };
+  } catch (error) { /* fall through to the static scan */ }
+  return scanToolsStatic();
 }
 
 // --------------------------------------------------------------------- audio
@@ -135,7 +150,7 @@ function readAudio() {
   return { entries, ready: Object.keys(entries).length > 0, notes };
 }
 
-const toolInfo = readTools();
+const toolInfo = await readTools();
 const audio = readAudio();
 const cueAt = {};
 for (const c of spec.cues || []) cueAt[c.name] = Number(c.at) || 0;
@@ -153,9 +168,13 @@ for (const [name, e] of Object.entries(audio.entries)) {
 }
 
 const sceneIds = spec.scenes.map((s) => s.id);
-const sceneZh = { silent: '静默', 'first-sound': '声音出现', vocabulary: '声音词汇', voice: '旁白与唱声', promise: '承诺' };
+const sceneZh = { silent: '静默', 'first-sound': '声音出现', vocabulary: '声音词汇', promise: '承诺' };
 const zhLabels = {};
 for (const id of sceneIds) zhLabels[id] = sceneZh[id] || id;
+
+// `{tools}` in spec.json copy is stamped with the live registry size at build
+// time, so the page can never advertise a tool count the plugin does not have.
+const fillTools = (text) => String(text ?? '').replace(/\{tools\}/g, String(toolInfo.tools.length));
 
 const embeddedSpec = {
   duration,
@@ -165,9 +184,9 @@ const embeddedSpec = {
     id: s.id,
     from: s.from,
     to: s.to,
-    headline: s.headline ?? '',
-    caption: s.caption ?? '',
-    detail: s.detail ?? '',
+    headline: fillTools(s.headline),
+    caption: fillTools(s.caption),
+    detail: fillTools(s.detail),
   })),
   cues: (spec.cues || []).map((c) => ({ name: c.name, at: c.at })),
   audio: audio.ready ? Object.keys(audioPayload) : [],
@@ -578,11 +597,14 @@ const PAGE = `<!doctype html>
     txt(s.detail, 74, 168, 13, rgba(P.muted, 0.9), 400, 'left', smooth((lt - 0.24) / 0.5));
 
     var cols = 6, cw2 = 138, chh = 40, gapx = 12, gapy = 11;
+    var rows = Math.ceil(TOOLS.length / cols);
+    var span = Math.max(1, s.to - s.from);
+    var step = Math.min(0.13, Math.max(0.06, (span - 1.8) / Math.max(1, TOOLS.length)));
     var totalW = cols * cw2 + (cols - 1) * gapx;
-    var x0 = (W - totalW) / 2, y0 = 208;
+    var x0 = (W - totalW) / 2;
     for (var i = 0; i < TOOLS.length; i++){
       var col = i % cols, row = Math.floor(i / cols);
-      var start = 0.30 + i * 0.075;
+      var start = 0.30 + i * step;
       var u = (lt - start) / 0.42;
       if (u <= 0) continue;
       var e = backOut(u);
@@ -612,98 +634,9 @@ const PAGE = `<!doctype html>
       ctx.beginPath(); ctx.arc(x + 12, y + chh / 2, 2.2, 0, Math.PI * 2); ctx.fill();
       ctx.restore();
     }
-    mono(TOOLS.length + ' tools · 全部真实工具名', W / 2, 402, 11, rgba(P.muted, 0.6), 500, 'center', smooth((lt - 1.15) / 0.6));
-  }
-
-  function sceneVoice(t, s){
-    var lt = t - s.from;
-    var headA = smooth(lt / 0.5);
-    txt(s.headline, 72, 112, 34, P.text, 700, 'left', headA);
-    txt(s.caption, 74, 142, 14.5, rgba(P.accent, 0.95), 500, 'left', smooth((lt - 0.12) / 0.5));
-
-    // waveform
-    var waveA = smooth((lt - 0.1) / 0.5);
-    var bars = 56, bw = 5, gap = 718 / bars;
-    var cxb = 72 + 718 / 2, cyb = 236;
-    ctx.save();
-    ctx.globalAlpha = waveA;
-    for (var i = 0; i < bars; i++){
-      var u = i / (bars - 1);
-      var phase = u * 9.2 - lt * 3.1;
-      var env = Math.sin(Math.PI * u) * (0.55 + 0.45 * Math.sin(u * 13 + lt * 2));
-      var amp = Math.abs(Math.sin(phase) * 0.7 + Math.sin(phase * 2.3 + 1.1) * 0.3) * env;
-      var hh = 6 + amp * 74;
-      var lit = u < (0.02 + lt * 0.34);
-      ctx.fillStyle = lit ? rgba(P.accent, 0.92) : rgba(P.accent, 0.26);
-      var x = 72 + i * gap;
-      rr(x, cyb - hh / 2, bw, hh, bw / 2); ctx.fill();
-    }
-    ctx.restore();
-
-    // playhead
-    var ph = clamp01(lt / 3.4);
-    ctx.save();
-    ctx.globalAlpha = waveA * 0.55;
-    ctx.strokeStyle = rgba(P.text, 0.5); ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(72 + ph * 718, cyb - 62); ctx.lineTo(72 + ph * 718, cyb + 62); ctx.stroke();
-    ctx.restore();
-
-    // mouth: viseme-ish morph
-    var vis = [
-      { w: 1.00, h: 0.34, a: 'AA' }, { w: 0.92, h: 0.16, a: 'EE' },
-      { w: 0.74, h: 0.52, a: 'OH' }, { w: 0.86, h: 0.22, a: 'EH' },
-      { w: 0.52, h: 0.14, a: 'MM' }, { w: 1.04, h: 0.40, a: 'AA' },
-      { w: 0.78, h: 0.30, a: 'OO' }, { w: 0.70, h: 0.10, a: 'FF' }
-    ];
-    var step = 0.33;
-    var k = lt / step;
-    var k0 = Math.floor(k) % vis.length, k1 = (k0 + 1) % vis.length;
-    var mu = smooth((k - Math.floor(k)) / 0.55);
-    var vo = vis[k0], vx = vis[k1];
-    var mw = lerp(vo.w, vx.w, mu), mh = lerp(vo.h, vx.h, mu);
-    var mcx = 806, mcy = 168, base = 46;
-    var mAW = base * mw * (1 + 0.04 * Math.sin(lt * 17));
-    var mAH = 10 + base * mh * (0.9 + 0.1 * Math.sin(lt * 11 + 1));
-    ctx.save();
-    ctx.globalAlpha = smooth((lt - 0.15) / 0.5);
-    ctx.strokeStyle = rgba(P.accent, 0.30);
-    ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.arc(mcx, mcy, 76, 0, Math.PI * 2); ctx.stroke();
-    // lips
-    ctx.fillStyle = rgba(P.accent, 0.16);
-    ctx.strokeStyle = P.accent;
-    ctx.lineWidth = 2.4;
-    ctx.beginPath();
-    ctx.ellipse(mcx, mcy, mAW, mAH, 0, 0, Math.PI * 2);
-    ctx.fill(); ctx.stroke();
-    // teeth hint
-    ctx.save();
-    ctx.beginPath(); ctx.ellipse(mcx, mcy, mAW, mAH, 0, 0, Math.PI * 2); ctx.clip();
-    ctx.fillStyle = rgba(P.text, 0.20);
-    ctx.fillRect(mcx - mAW, mcy - mAH, mAW * 2, mAH * 0.62);
-    ctx.restore();
-    ctx.restore();
-    mono((vo.a + '→' + vx.a), mcx, mcy + 104, 11, rgba(P.muted, 0.75), 500, 'center', smooth((lt - 0.3) / 0.5));
-
-    // syllables
-    var syl = ['给', '动', '画', '加', '声', '音'];
-    var per = 0.46, sx0 = 72, sy = 404;
-    for (var j = 0; j < syl.length; j++){
-      var st = 0.25 + j * per;
-      var on = lt >= st && lt < st + per;
-      var a = smooth((lt - st) / 0.18);
-      if (a <= 0.01) continue;
-      var sPos = sx0 + j * 54;
-      if (on){
-        ctx.save();
-        ctx.globalAlpha = 0.16;
-        ctx.fillStyle = P.accent;
-        rr(sPos - 6, sy - 34, 44, 46, 10); ctx.fill();
-        ctx.restore();
-      }
-      txt(syl[j], sPos + 16, sy, 30, on ? P.accent : rgba(P.text, 0.72), on ? 700 : 500, 'center', a);
-    }
-    txt(s.detail, 74, 556, 12.5, rgba(P.muted, 0.9), 400, 'left', smooth((lt - 0.7) / 0.6));
+    // label sits below the last row, whatever the registry size is
+    var labelA = smooth((lt - (0.30 + TOOLS.length * step + 0.15)) / 0.6);
+    mono(TOOLS.length + ' tools · 全部真实工具名', W / 2, 402 + Math.max(0, rows - 3) * (chh + gapy), 11, rgba(P.muted, 0.6), 500, 'center', labelA);
   }
 
   function scenePromise(t, s){
@@ -761,7 +694,6 @@ const PAGE = `<!doctype html>
     'silent': sceneSilent,
     'first-sound': sceneFirstSound,
     'vocabulary': sceneVocabulary,
-    'voice': sceneVoice,
     'promise': scenePromise
   };
 

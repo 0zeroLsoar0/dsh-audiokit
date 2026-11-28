@@ -15,7 +15,7 @@
 import { stat } from 'node:fs/promises'
 import { relative } from 'node:path'
 import { defaultOutputPath, hashSpec, measure, resolvePath, writeFileAtomic } from './audio.js'
-import { GENRES, KEYS, MODES, composeScore, renderScore, toComposeWavBytes } from './compose.js'
+import { GENRES, KEYS, MODES, composeScore, renderScoreAsync, toComposeWavBytes } from './compose.js'
 
 const GENRE_NAMES = Object.keys(GENRES)
 const KEY_NAMES = Object.keys(KEYS)
@@ -107,31 +107,31 @@ function buildText (score, rendered, metrics, cwd, path, bytes, beatMapStride) {
 export function registerComposeTools (ctx) {
   ctx.tools.register({
     name: 'audio_compose',
-    description: 'Compose and render a short music cue for an animation: real harmony (diatonic chords, genre progressions, voice leading), sections (intro/build/drop/outro), five arranged tracks and a drum groove, deterministic from the seed. Returns the file, the beattimes in seconds, the chord per bar and per-track levels so hits can be synced to picture.',
+    description: 'Compose and render a short music cue: diatonic harmony, genre progressions, intro/build/drop/outro sections, five arranged tracks and a drum groove, deterministic from the seed. Returns the file, beat times in seconds, the chord per bar and per-track levels. Rendering yields between blocks so the event loop stays live, but it still occupies the CPU while it runs.',
     parameters: {
       type: 'object',
       properties: {
         genre: {
           type: 'string',
           enum: GENRE_NAMES,
-          description: 'Musical style. cinematic=slow orchestral pads and timpani, lofi=warm swung boom-bap with seventh chords, chiptune=fast square arps and noise drums, ambient=very slow pads and bells, action=driving sixteenth bass and rock kit, horror=dissonant drones and metal, fantasy=lydian harp and flute, ui-menu=short bright plucks for interface loops.'
+          description: 'Musical style; one line per genre is in the animation-sound skill.'
         },
-        bpm: { type: 'number', description: 'Tempo 40..220; defaults to the genre\'s tempo (52 ambient .. 158 action).' },
-        bars: { type: 'integer', description: 'Length in bars of 4/4, 1..96; defaults to 16. Sixteen bars is a complete cue with intro, build, drop and outro; cues are capped at 180 seconds of audio.' },
+        bpm: { type: 'number', description: 'Tempo 40..220; default the genre tempo.' },
+        bars: { type: 'integer', description: 'Length in bars of 4/4, 1..96; default 16 (a full cue).' },
         key: { type: 'string', enum: KEY_NAMES, description: 'Tonic note name; defaults to the genre\'s key.' },
         mode: {
           type: 'string',
           enum: MODE_NAMES,
-          description: 'Scale the melody uses; harmony is stacked from the diatonic parent. aeolian=minor, ionian=major, dorian=lofi jazz, phrygian=action tension, lydian=fantasy, locrian=horror.'
+          description: 'Scale the melody uses; harmony stacks from the diatonic parent.'
         },
-        seed: { type: 'integer', description: 'Variation seed: same seed, same score and same audio bytes. Change it for a sibling arrangement.' },
-        intensity: { type: 'number', description: 'Arrangement energy 0..1; scales note density, drum layers, register and how many chord tones are voiced. Defaults to 0.6.' },
-        loop: { type: 'boolean', description: 'Render a loop-safe cue: no intro/outro, a turnaround into the loop point and tails folded back onto the head, so it repeats without a thump. Use for interface/menu music.' },
-        sampleRate: { type: 'integer', description: 'Defaults to 44100. Use 22050 for small inline files, 48000 for video-grade output.' },
-        out: { type: 'string', description: 'Output path, relative to the working directory. Defaults to assets/audio/compose-<genre>-<hash>.wav.' },
+        seed: { type: 'integer', description: 'Variation seed; same seed, same score and bytes.' },
+        intensity: { type: 'number', description: 'Arrangement energy 0..1; default 0.6.' },
+        loop: { type: 'boolean', description: 'Loop-safe form: no intro/outro, tails folded back; for menu music.' },
+        sampleRate: { type: 'integer', description: 'Sample rate; default 44100 (22050 inline, 48000 video).' },
+        out: { type: 'string', description: 'Output path; default assets/audio/compose-<genre>-<hash>.wav.' },
         sections: {
           type: 'array',
-          description: 'Optional section form override; each entry is a contiguous bar range and an intensity. Without it the form is intro/build/drop/outro (or build/drop when loop is true).',
+          description: 'Optional section form override: contiguous bar ranges with an intensity.',
           items: {
             type: 'object',
             properties: {
@@ -186,7 +186,7 @@ export function registerComposeTools (ctx) {
       if (cueSeconds > 180) {
         throw new Error(`cue is too long to render (${Math.round(cueSeconds)}s); reduce bars or raise bpm (limit 180s)`)
       }
-      const rendered = renderScore(score, { sampleRate: spec.sampleRate })
+      const rendered = await renderScoreAsync(score, { sampleRate: spec.sampleRate })
       const bytes = toComposeWavBytes(rendered.samples, rendered.sampleRate, score.seed)
       const target = resolvePath(cwd, args.out) ?? defaultOutputPath(cwd, `compose-${genre}`, hash)
       await writeFileAtomic(target, bytes)

@@ -150,34 +150,34 @@ function outputTarget (cwd, requested, hash) {
 export function registerLiveTools (ctx) {
   ctx.tools.register({
     name: 'audio_live',
-    description: 'Generate an in-page WebAudio synth script (no audio bytes) that reproduces the nine core preset families live, so a page can change a sound\'s pitch and character in response to input and re-randomise per play instead of shipping wav files. Optionally bake automation lanes so the emitted play() ramps pitch/filter/gain/pan/send (and can run an LFO) while a voice sounds, plus a duration that decides when the voice stops. Writes <out>.js and, with demo:true, a tiny <out>.html that plays every preset with one button. Use it instead of audio_synth when the page must react to the user, run offline as a single file, or stay byte-free; use audio_synth when the sound is fixed and must be measured or mixed.',
+    description: 'Generate an in-page WebAudio synth script (no audio bytes) for the nine core preset families, optionally with automation lanes baked in; demo:true also writes a demo page. Use it instead of audio_synth when the page must react to input or stay byte-free.',
     parameters: {
       type: 'object',
       properties: {
-        presets: { type: 'array', items: { type: 'string', enum: PRESET_NAMES }, description: 'Preset families to bake into the script; defaults to all nine. Each adds ~0.5-1.6 KB of code; a page needs only the ones it plays.' },
-        seed: { type: 'integer', description: 'Seeds the page-side random generator (ring gains, grain placement, tick jitter). Same seed reproduces the same script bytes and the same per-play variation sequence.' },
-        maxVoices: { type: 'integer', description: 'Simultaneous voice limit, 1..64, default 12. The oldest voice is stolen with a short fade, and each new voice is scaled by 1/sqrt(1+active) so rapid retriggering does not clip.' },
-        volumeDb: { type: 'number', description: 'Initial master volume in dB, -60..12, default 0. The page can change it later with dshLive.setVolume(db).' },
+        presets: { type: 'array', items: { type: 'string', enum: PRESET_NAMES }, description: 'Preset families to bake in; default all nine.' },
+        seed: { type: 'integer', description: 'Seeds the page-side random generator; same seed, same script bytes.' },
+        maxVoices: { type: 'integer', description: 'Simultaneous voice limit 1..64, default 12; the oldest voice is stolen.' },
+        volumeDb: { type: 'number', description: 'Initial master volume in dB, -60..12, default 0.' },
         automation: {
           type: 'array',
-          description: 'Default automation lanes baked into the script: each lane ramps one AudioParam while a voice sounds, and play(name, params, { automation: lanes, duration }) can replace them per call. A lane may ascend or descend (from > to is a closing/ducking move). Units: pitch in cents, filter in Hz, gain in dB, pan -1..1, send 0..1.',
+          description: 'Default automation lanes; units and curves are in the animation-sound skill.',
           items: {
             type: 'object',
             additionalProperties: false,
             properties: {
-              target: { type: 'string', enum: TARGET_NAMES, description: 'Which parameter the lane moves: pitch = oscillator detune in cents, filter = a low-pass cutoff in Hz, gain = a voice trim in dB, pan = stereo position -1..1, send = reverb send 0..1.' },
-              from: { type: 'number', description: 'Start value in the target unit (pitch cents, filter Hz, gain dB, pan -1..1, send 0..1).' },
-              to: { type: 'number', description: 'End value in the target unit; it may be below from (a descending closing/ducking lane) or above it.' },
+              target: { type: 'string', enum: TARGET_NAMES, description: 'Which parameter the lane moves: pitch, filter, gain, pan or send.' },
+              from: { type: 'number', description: 'Start value, in the lane target\'s unit.' },
+              to: { type: 'number', description: 'End value; may be below from (a descending lane).' },
               duration: { type: 'number', description: 'Ramp length in seconds, greater than 0 and at most 60.' },
-              start: { type: 'number', description: 'Delay before the ramp starts, in seconds from the voice start (0..60); defaults to 0.' },
-              curve: { type: 'string', enum: CURVE_NAMES, description: 'linear = straight ramp (default), exp = exponential when both values are positive, sine = half-cosine ease sampled at 8 points, step = hold from then jump to at the end.' },
+              start: { type: 'number', description: 'Delay before the ramp starts, seconds (0..60); default 0.' },
+              curve: { type: 'string', enum: CURVE_NAMES, description: 'linear, exp, sine or step.' },
               lfo: {
                 type: 'object',
                 additionalProperties: false,
-                description: 'Optional oscillation layered on top of the lane (or on another target): an OscillatorNode into a depth gain connected to the target param.',
+                description: 'Optional oscillation layered on the lane or on another target.',
                 properties: {
                   hz: { type: 'number', description: 'LFO rate in Hz, 0.01..40.' },
-                  depth: { type: 'number', description: 'LFO depth in the target unit (pitch cents, filter Hz, gain dB, pan, send); bounded by that target.' },
+                  depth: { type: 'number', description: 'LFO depth in the target unit; bounded by that target.' },
                   target: { type: 'string', enum: TARGET_NAMES, description: 'Parameter the LFO modulates; defaults to the lane target.' }
                 },
                 required: ['hz', 'depth']
@@ -186,9 +186,9 @@ export function registerLiveTools (ctx) {
             required: ['target', 'from', 'to', 'duration']
           }
         },
-        duration: { type: 'number', description: 'Default voice length in seconds (0.02..60) baked into the script: it decides when the emitted play() schedules stop() and stretches the preset contours. play(name, params, { duration }) can override it per call.' },
-        out: { type: 'string', description: 'Output path for the .js, relative to the working directory. Defaults to assets/audio/live-<hash>.js; a bare stem gets .js appended.' },
-        demo: { type: 'boolean', description: 'Also write a tiny demo HTML next to the script with one button per preset, a stop-all and a volume slider. Defaults to false.' }
+        duration: { type: 'number', description: 'Default voice length in seconds (0.02..60) baked into the script.' },
+        out: { type: 'string', description: 'Output path for the .js; default assets/audio/live-<hash>.js.' },
+        demo: { type: 'boolean', description: 'Also write a demo HTML page with one button per preset.' }
       },
       additionalProperties: false
     },

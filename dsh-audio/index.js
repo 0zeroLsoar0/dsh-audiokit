@@ -23,13 +23,17 @@ import { registerExtraPresets } from './lib/presets-extra.js'
 
 import { registerCheckTool } from './lib/check.js'
 import { registerAnalyzeTools } from './lib/tools-analyze.js'
+import { registerAuditTool } from './lib/tools-audit.js'
+import { registerBatchTools } from './lib/tools-batch.js'
 import { registerBindTools } from './lib/tools-bind.js'
 import { registerBusTools } from './lib/tools-bus.js'
 import { registerComposeTools } from './lib/tools-compose.js'
 import { registerConvertTools } from './lib/tools-convert.js'
+import { registerCueTools } from './lib/tools-cues.js'
 import { registerDesignTools } from './lib/tools-design.js'
 import { registerEditorRoute } from './lib/editor-route.js'
 import { registerGraphTools } from './lib/tools-graph.js'
+import { registerHandoffTools } from './lib/tools-handoff.js'
 import { registerDawTools } from './lib/tools-daw.js'
 import { registerLoudnessTools } from './lib/tools-loudness.js'
 import { registerMouthTools } from './lib/tools-mouth.js'
@@ -97,6 +101,7 @@ export const PROMPT_SECTION = [
   '- narration, dialogue or singing → `audio_tts` (singing is a TTS job or an external plugin); `audio_voices` lists voice ids',
   '- character mouth / lip-sync → `audio_lipsync` (per-frame viseme + jaw openness)',
   '- motion that should land on the music → `audio_beats`',
+  '- the picture should follow a finished track (impact points, section boundaries) → `audio_cues`',
   '- assembling cues + the page player → `audio_bind` (generates the scheduling code, inline or external)',
   '- the UI making its own sounds (hover, click, success, error) → `audio_react` (16 interactions, 5 palettes,',
   '  drop-in binding script); per-layer deliverables for video/games → `audio_stems` (stems + master)',
@@ -105,11 +110,14 @@ export const PROMPT_SECTION = [
   '- a sound that must come from a direction, or a file wider than stereo → `audio_spatial`',
   '- the final deliverable is a video → `audio_mux` (probe, mux, shot-cut times, extract)',
   '- handing the work to a DAW or editor → `audio_daw` (EDL, Reaper project, CSV, labels, OpenTimelineIO, FCP7 xmeml; AAF/OMF are structural exports)',
+  '- work that belongs to another audio plugin (instrument libraries, voice banks, sfx licences) → `audio_handoff` (writes the division-of-labour brief; it never calls the peer)',
   '- a mouth track without any voice audio (captions, silent comics) → `audio_mouth`',
   '- what a sound is made of: f0, harmonics, formants, noise, decay → `audio_analyze`',
   '- fixing an existing file: trim/join/fade/re-encode → `audio_convert`; retime or transpose → `audio_stretch`',
   '- before delivery: `audio_probe` (measure), `audio_loudness` (LUFS/true peak), `audio_check` (quality gate),',
   '  `audio_regress` (prove a change did not break a sound), `audio_master` (multiband + true-peak limiting to a target LUFS)',
+  '- narration ↔ subtitle ↔ mouth-track sync → `audio_audit` (read-only three-way audit; reports drift, never edits an input)',
+  '- one operation over a whole cue set (check / loudness / normalize / master) → `audio_batch` (one table, inputs never overwritten)',
   '',
   'Call the `animation-sound` skill before the first render: it carries the timing contract that keeps picture and',
   'sound in sync, the preset and recipe cheat sheets, and the recipe for inlining audio into a single-file HTML.'
@@ -130,6 +138,8 @@ export function apply (ctx, config = {}) {
   registerVoicesTool(ctx, config)
   registerCheckTool(ctx, config)
   registerAnalyzeTools(ctx)
+  registerAuditTool(ctx)
+  registerBatchTools(ctx)
   registerConvertTools(ctx)
   registerLoudnessTools(ctx)
   registerDesignTools(ctx)
@@ -140,6 +150,7 @@ export function apply (ctx, config = {}) {
   registerSpatialTools(ctx)
   registerVideoTools(ctx)
   registerBindTools(ctx)
+  registerCueTools(ctx)
   registerReactTools(ctx)
   registerLiveTools(ctx)
   registerComposeTools(ctx)
@@ -147,6 +158,7 @@ export function apply (ctx, config = {}) {
   registerSamplerTools(ctx)
   registerStemsTools(ctx)
   registerDawTools(ctx)
+  registerHandoffTools(ctx)
   registerStretchTools(ctx)
   registerSettingsRoute(ctx, config, VERSION)
   // The cue editor is a page, not a tool: a URL the user can open to drag cues

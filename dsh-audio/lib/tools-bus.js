@@ -28,7 +28,7 @@ import {
   resolvePath,
   writeFileAtomic
 } from './audio.js'
-import { BUS_LIMITS, renderBus } from './bus.js'
+import { BUS_LIMITS, renderBusAsync } from './bus.js'
 import { CHANNEL_COUNTS, encodeAnyWav, layoutFor } from './multichannel.js'
 import { STEM_BIT_DEPTHS, packageStems, renderStems } from './stems.js'
 import { decodeWav } from './wav.js'
@@ -383,13 +383,13 @@ function summaryLine (cwd, summary) {
 export function registerBusTools (ctx) {
   ctx.tools.register({
     name: 'audio_bus',
-    description: 'Assemble a cue through a processing bus: per-track high-pass, low-pass, bell, shelf, compressor, sidechain duck `duckFrom`, gain, offset, pan and width, then a master drive/limiter/peak stage. Use it instead of audio_mix when the layers have to be cleaned, tucked, glued or placed rather than merely summed; every processor reports its gain reduction so the result can be judged without listening. Inputs may be mono, stereo or 4/6/8-channel files: the master follows the widest input (or `channels`), stereo processors link their detector across all channels, and a narrower input is upmixed / a wider one downmixed with LFE excluded from the fold. With stems:true the processed mono layers are also exported through lib/stems.js (one file per track, a master that equals their sum, and a stems.json manifest); stems are mono-only and refused when the bus or any layer is wider than mono.',
+    description: 'Assemble a cue through a per-track processing bus (highpass, lowpass, bell, shelf, compressor, sidechain duck, gain, offset, pan, width) and a master drive/limiter/peak stage, optionally exporting the layers as stems. Use audio_mix when the layers only need summing; processor fields are documented in the animation-sound skill. Rendering yields between blocks so the event loop stays live, but it still occupies the CPU while it runs.',
     parameters: {
       type: 'object',
       properties: {
         tracks: {
           type: 'array',
-          description: 'Layers in mix order. Each is { path | render, gainDb, offsetSeconds, pan, width, highpassHz, lowpassHz, peaking, shelf, compressor, duck, duckFrom, name }. Processing order is fixed: highpass, lowpass, peaking, shelf, compressor, duck.',
+          description: 'Layers in mix order; per-layer fields and chain order are in the skill.',
           items: {
             type: 'object',
             properties: {
@@ -397,13 +397,13 @@ export function registerBusTools (ctx) {
               render: {
                 type: 'object',
                 additionalProperties: true,
-                description: 'Inline render instead of a file: { preset, params, duration, seed, loop, sampleRate } exactly as audio_synth accepts (a bare preset name string also works). Finalised like audio_synth writes it. Give this or path, not both.'
+                description: 'Inline render { preset, params, duration, seed, loop, sampleRate }; give this or path.'
               },
               gainDb: { type: 'number', description: 'Track gain in dB, applied before the chain (finite, -120..24; default 0).' },
               offsetSeconds: { type: 'number', description: 'Where the layer starts on the timeline, in seconds (finite, 0..180; default 0).' },
-              pan: { type: 'number', description: 'Constant-power pan -1..1 (default 0). Centre is unity in both channels; hard pan is +3 dB in one and silence in the other. Only applies to a mono source: a multichannel input already has a layout.' },
-              width: { type: 'number', description: 'Mid/side width 0..2 (default 1). 0 folds the panned image to mono at the mid level, 2 doubles the side. Only applies to a mono source.' },
-              highpassHz: { type: 'number', description: 'Second-order high-pass corner in Hz (10..48000). Removes rumble and DC.' },
+              pan: { type: 'number', description: 'Constant-power pan -1..1, default 0; mono sources only.' },
+              width: { type: 'number', description: 'Mid/side width 0..2, default 1; mono sources only.' },
+              highpassHz: { type: 'number', description: 'Second-order high-pass corner, Hz (10..48000); removes rumble and DC.' },
               lowpassHz: { type: 'number', description: 'Second-order low-pass corner in Hz. Tucks a bed under dialogue.' },
               peaking: {
                 type: 'object',
@@ -451,21 +451,21 @@ export function registerBusTools (ctx) {
               },
               duckFrom: {
                 type: ['string', 'integer'],
-                description: 'Sidechain source: a track index (0-based, cannot be this track) or a .wav path. The duck depth follows that source\'s level, so a narration bed ducks exactly where the words are.'
+                description: 'Sidechain source: a track index (0-based) or a .wav path; duck depth follows its level.'
               },
-              name: { type: 'string', description: 'Track id used in the report and as the stem file name. Defaults to the file name or preset name.' }
+              name: { type: 'string', description: 'Track id in the report and stem file name; default the source name.' }
             },
             additionalProperties: false
           }
         },
-        masterPeakDbfs: { type: 'number', description: 'Master peak-normalisation target in dBFS, -120..0 (default -1). Null is not accepted; use a low target to keep headroom.' },
-        driveDb: { type: 'number', description: 'Gain into the master limiter, -24..24 dB (default 0). Pushing it makes the limiter work and the mix denser.' },
+        masterPeakDbfs: { type: 'number', description: 'Master peak target in dBFS, -120..0, default -1.' },
+        driveDb: { type: 'number', description: 'Gain into the master limiter in dB, -24..24, default 0.' },
         limiter: { type: 'boolean', description: 'Soft-limit the master above the knee; defaults to true.' },
         sampleRate: { type: 'integer', description: 'Output rate in Hz (8000..96000); defaults to the highest input rate.' },
         bitDepth: { type: 'integer', enum: STEM_BIT_DEPTHS, description: '8=smallest (inline HTML), 16=CD (default), 24=video master, 32=IEEE float intermediate.' },
-        channels: { type: 'integer', enum: [...CHANNEL_COUNTS], description: 'Output channel count: 1 mono, 2 stereo, 4 quad, 6 5.1 (FL FR FC LFE BL BR), 8 7.1 (FL FR FC LFE BL BR SL SR). Defaults to the widest input, else 2 when any track is panned, else 1. Every track is up/downmixed to it with LFE excluded from downmixes.' },
-        stems: { type: 'boolean', description: 'Also export the processed mono layers through lib/stems.js: <layer>.wav per track, master.wav, and a stems.json manifest. Defaults to false.' },
-        outDir: { type: 'string', description: 'Directory for the stem set, relative to the working directory. Only used with stems; defaults to assets/audio/bus-stems-<hash>.' },
+        channels: { type: 'integer', enum: [...CHANNEL_COUNTS], description: 'Output channels 1/2/4/6/8; default follows the widest input (2 if any track is panned).' },
+        stems: { type: 'boolean', description: 'Also export the processed layers as stems (mono only).' },
+        outDir: { type: 'string', description: 'Directory for the stem set; default assets/audio/bus-stems-<hash>.' },
         out: { type: 'string', description: 'Master output path, relative to the working directory. Defaults to assets/audio/bus-<hash>.wav.' }
       },
       required: ['tracks'],
@@ -527,7 +527,7 @@ export function registerBusTools (ctx) {
         })
       }
 
-      const bus = renderBus(busTracks, {
+      const bus = await renderBusAsync(busTracks, {
         sampleRate,
         channels,
         master: { peakDbfs: masterPeakDbfs, limiter, drive: driveDb }

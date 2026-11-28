@@ -381,8 +381,12 @@ for (const entry of CREATURES) {
   const ms = performance.now() - started
   if (ms > slowest.ms) slowest = { id: entry.id, ms }
 }
-console.log(`slowest creature at 3 s: ${slowest.id} ${slowest.ms.toFixed(1)} ms (budget 400 ms)`)
-check('every creature renders a 3 s design in under 400 ms', slowest.ms < 400, `${slowest.ms.toFixed(1)} ms`)
+// Timing gate only: the 400 ms ceiling was measured on a quiet machine and has
+// no room for a 2-vCPU CI runner sharing the box with the other matrix legs.
+// 600 ms keeps "a creature is cheap to render" meaningful without turning host
+// load into a red line; the audio properties asserted above are unchanged.
+console.log(`slowest creature at 3 s: ${slowest.id} ${slowest.ms.toFixed(1)} ms (budget 600 ms)`)
+check('every creature renders a 3 s design in under 600 ms', slowest.ms < 600, `${slowest.ms.toFixed(1)} ms`)
 
 /* ------------------------------------------------------------- distinct -- */
 

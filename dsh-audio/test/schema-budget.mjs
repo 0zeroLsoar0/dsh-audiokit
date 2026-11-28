@@ -8,9 +8,21 @@
  * test measures exactly the model-visible payload and fails when the surface
  * grows past its budget.
  *
- * The budget is deliberately a hard ceiling, not a target: `docs/SCHEMA_DIET.zh.md`
- * tracks the reduction plan (prose is 65% of the payload; the DSL manual in
- * `audio_synth_graph`'s description is the single biggest line item).
+ * The budget is deliberately a hard ceiling, not a target. This file is the
+ * enforcement half of the diet in `docs/SCHEMA_DIET.zh.md`:
+ *
+ *   - before the diet the surface cost 98,442 B for 30 tools, of which 65.9%
+ *     was prose (tool descriptions + parameter descriptions);
+ *   - the long DSL, id catalogs, per-format fidelity tables and per-parameter
+ *     rationale now live in the `animation-sound` skill (`lib/skill.js`), which
+ *     is loaded on demand, so the model pays for them only when it asks;
+ *   - after the diet the surface measured ≈68.7 KB for 31 tools; the three tools
+ *     that landed in the 0.6.0 integration (audio_audit / audio_batch /
+ *     audio_handoff) bring it to 74,884 B = 73.1 KB for 34 tools, so the 77,000 B
+ *     budget below keeps ≈3 % headroom for small additions without another diet.
+ *
+ * When a new tool legitimately needs more, raise the budget deliberately — do
+ * not grow a description back into a manual.
  *
  * Run: node test/schema-budget.mjs
  */
@@ -23,9 +35,9 @@ import { apply } from '../index.js'
 const pluginDir = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 /** Total model-visible bytes the surface may cost per session. */
-const MAX_TOTAL_BYTES = 105_000
+const MAX_TOTAL_BYTES = 77_000
 /** Any single tool above this is a smell: it is one choice, not a manual. */
-const MAX_TOOL_BYTES = 9_000
+const MAX_TOOL_BYTES = 6_000
 /** Prose should not dominate structure by more than this ratio. */
 const MAX_PROSE_SHARE = 0.75
 

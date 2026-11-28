@@ -36,6 +36,7 @@ import {
   softLimit
 } from './dsp.js'
 import { encodeWav } from './wav.js'
+import { YIELD_EVERY_FRAMES, driveAsync, driveSync } from './yield.js'
 
 const TAU = Math.PI * 2
 const A4 = 440
@@ -2335,43 +2336,44 @@ function renderNote (voice, midi, durSeconds, velocity, sampleRate, rng, artic, 
 }
 
 /**
- * Schroeder reverb send, applied in place.
+ * One block of the Schroeder reverb send (the cooperative version of
+ * `applyReverb`).
  *
- * This is the same algorithm as `reverb()` from `dsp.js` specialised for the
- * one way a score uses it: over a full-length master buffer, straight away.
- * The arithmetic and its order are unchanged, so the samples are identical;
- * what changes is that the four combs and two allpasses are unrolled into local
- * variables (no object property reads or `%` per sample) and the wet signal is
- * folded back into the buffer instead of being materialised in two extra
- * full-length arrays. Reverb was the largest single master-stage cost.
+ * The per-sample work stays in a plain function on purpose: a `yield` inside a
+ * sample loop keeps the loop variables in the generator's context object and
+ * makes the arithmetic about twice as slow, which would cost the synchronous
+ * API real time for a benefit only the asynchronous caller needs. The generator
+ * splits the buffer and this function does one block — same expressions, same
+ * order, so the samples are identical to one unsplit pass.
+ *
+ * State lives in two small arrays because it has to survive the block boundary:
+ * the six buffer positions are integers (`Int32Array`, so array indexing stays
+ * integer) and the four damping values are doubles (`Float64Array`).
  */
-function applyReverb (buffer, sampleRate, amount, size) {
-  const scale = sampleRate / 44100
-  const feedback = 0.74 + size * 0.18
-  const factor = 0.7 + size * 0.9
-  const c0 = new Float32Array(Math.max(2, Math.round(0.0297 * factor * 44100 * scale)))
-  const c1 = new Float32Array(Math.max(2, Math.round(0.0371 * factor * 44100 * scale)))
-  const c2 = new Float32Array(Math.max(2, Math.round(0.0411 * factor * 44100 * scale)))
-  const c3 = new Float32Array(Math.max(2, Math.round(0.0437 * factor * 44100 * scale)))
-  const a0 = new Float32Array(Math.max(2, Math.round(0.005 * 44100 * scale)))
-  const a1 = new Float32Array(Math.max(2, Math.round(0.0017 * 44100 * scale)))
+function reverbRange (buffer, delays, sti, stf, from, to, feedback, amount) {
+  const c0 = delays[0]
+  const c1 = delays[1]
+  const c2 = delays[2]
+  const c3 = delays[3]
+  const a0 = delays[4]
+  const a1 = delays[5]
   const n0 = c0.length
   const n1 = c1.length
   const n2 = c2.length
   const n3 = c3.length
   const m0 = a0.length
   const m1 = a1.length
-  let i0 = 0
-  let i1 = 0
-  let i2 = 0
-  let i3 = 0
-  let j0 = 0
-  let j1 = 0
-  let d0 = 0
-  let d1 = 0
-  let d2 = 0
-  let d3 = 0
-  for (let index = 0; index < buffer.length; index += 1) {
+  let i0 = sti[0]
+  let i1 = sti[1]
+  let i2 = sti[2]
+  let i3 = sti[3]
+  let j0 = sti[4]
+  let j1 = sti[5]
+  let d0 = stf[0]
+  let d1 = stf[1]
+  let d2 = stf[2]
+  let d3 = stf[3]
+  for (let index = from; index < to; index += 1) {
     const sample = buffer[index]
     let sum = c0[i0]
     d0 = sum * 0.75 + d0 * 0.25
@@ -2408,21 +2410,55 @@ function applyReverb (buffer, sampleRate, amount, size) {
     if (j1 >= m1) j1 = 0
     buffer[index] = sample + Math.fround(output * 0.22) * amount
   }
+  sti[0] = i0
+  sti[1] = i1
+  sti[2] = i2
+  sti[3] = i3
+  sti[4] = j0
+  sti[5] = j1
+  stf[0] = d0
+  stf[1] = d1
+  stf[2] = d2
+  stf[3] = d3
 }
 
-/** Static 2-pole low/high-pass over a finished buffer (master tone shaping). */
-function applyTone (buffer, sampleRate, spec) {
-  if (spec === null || spec === undefined) return buffer
-  const mode = spec.mode === 'hp' ? 'hp' : 'lp'
-  const cutoff = clamp(Number(spec.cutoff) || 4000, 60, sampleRate * 0.45)
-  const k = 1 / 0.8
-  const g = Math.tan(Math.PI * cutoff / sampleRate)
-  const a1 = 1 / (1 + g * (g + k))
-  const a2 = g * a1
-  const a3 = g * a2
-  let ic1 = 0
-  let ic2 = 0
-  for (let index = 0; index < buffer.length; index += 1) {
+/**
+ * Schroeder reverb send, applied in place, in cooperatively-yielded blocks.
+ *
+ * This is the same algorithm as `reverb()` from `dsp.js` specialised for the
+ * one way a score uses it: over a full-length master buffer, straight away.
+ * The arithmetic and its order are unchanged, so the samples are identical;
+ * what changes is that the four combs and two allpasses are unrolled into local
+ * variables (no object property reads or `%` per sample) and the wet signal is
+ * folded back into the buffer instead of being materialised in two extra
+ * full-length arrays. Reverb was the largest single master-stage cost, so it is
+ * also the one that most needs to give the host a turn.
+ */
+function* applyReverb (buffer, sampleRate, amount, size) {
+  const scale = sampleRate / 44100
+  const feedback = 0.74 + size * 0.18
+  const factor = 0.7 + size * 0.9
+  const c0 = new Float32Array(Math.max(2, Math.round(0.0297 * factor * 44100 * scale)))
+  const c1 = new Float32Array(Math.max(2, Math.round(0.0371 * factor * 44100 * scale)))
+  const c2 = new Float32Array(Math.max(2, Math.round(0.0411 * factor * 44100 * scale)))
+  const c3 = new Float32Array(Math.max(2, Math.round(0.0437 * factor * 44100 * scale)))
+  const a0 = new Float32Array(Math.max(2, Math.round(0.005 * 44100 * scale)))
+  const a1 = new Float32Array(Math.max(2, Math.round(0.0017 * 44100 * scale)))
+  const delays = [c0, c1, c2, c3, a0, a1]
+  const sti = new Int32Array(6)
+  const stf = new Float64Array(4)
+  for (let from = 0; from < buffer.length; from += YIELD_EVERY_FRAMES) {
+    const to = Math.min(buffer.length, from + YIELD_EVERY_FRAMES)
+    reverbRange(buffer, delays, sti, stf, from, to, feedback, amount)
+    yield
+  }
+}
+
+/** One block of the master tone filter (see `applyTone`). */
+function toneRange (buffer, from, to, mode, k, a1, a2, a3, state) {
+  let ic1 = state[0]
+  let ic2 = state[1]
+  for (let index = from; index < to; index += 1) {
     const input = buffer[index]
     const v3 = input - ic2
     const v1 = a1 * ic1 + a2 * v3
@@ -2431,7 +2467,26 @@ function applyTone (buffer, sampleRate, spec) {
     ic2 = 2 * v2 - ic2
     buffer[index] = mode === 'hp' ? input - k * v1 - v2 : v2
   }
-  return buffer
+  state[0] = ic1
+  state[1] = ic2
+}
+
+/** Static 2-pole low/high-pass over a finished buffer (master tone shaping). */
+function* applyTone (buffer, sampleRate, spec) {
+  if (spec === null || spec === undefined) return
+  const mode = spec.mode === 'hp' ? 'hp' : 'lp'
+  const cutoff = clamp(Number(spec.cutoff) || 4000, 60, sampleRate * 0.45)
+  const k = 1 / 0.8
+  const g = Math.tan(Math.PI * cutoff / sampleRate)
+  const a1 = 1 / (1 + g * (g + k))
+  const a2 = g * a1
+  const a3 = g * a2
+  const state = new Float64Array(2)
+  for (let from = 0; from < buffer.length; from += YIELD_EVERY_FRAMES) {
+    const to = Math.min(buffer.length, from + YIELD_EVERY_FRAMES)
+    toneRange(buffer, from, to, mode, k, a1, a2, a3, state)
+    yield
+  }
 }
 
 /** dB from a linear level, floored so silence reports -120 rather than -Infinity. */
@@ -2441,21 +2496,78 @@ function levelDb (value) {
 
 /* ---------------------------------------------------------------- render -- */
 
+/** Add the squares of a buffer range to `state[0]` (a running total, in order). */
+function sumSquaresRange (buffer, from, to, state) {
+  let total = state[0]
+  for (let index = from; index < to; index += 1) {
+    const value = buffer[index]
+    total += value * value
+  }
+  state[0] = total
+}
+
+/** Mix one block of a levelled track into the master and measure it. */
+function mixTrackRange (master, scratch, levelScale, from, to, state) {
+  let peak = state[0]
+  let sumSquares = state[1]
+  for (let index = from; index < to; index += 1) {
+    const value = scratch[index] * levelScale
+    master[index] += value
+    const magnitude = Math.abs(value)
+    if (magnitude > peak) peak = magnitude
+    sumSquares += value * value
+  }
+  state[0] = peak
+  state[1] = sumSquares
+}
+
+/** Fold one block of the reverb tail back onto the loop head. */
+function foldRange (master, mainFrames, from, to) {
+  for (let index = from; index < to; index += 1) master[index] += master[mainFrames + index]
+}
+
+/** Fade one block at the end of a one-shot cue. */
+function fadeRange (master, renderFrames, fade, from, to) {
+  for (let index = from; index < to; index += 1) master[renderFrames - 1 - index] *= index / fade
+}
+
+/** Peak and sum of squares of one block of the finished file (for section stats). */
+function sectionStatsRange (samples, from, to, state) {
+  let peak = state[0]
+  let sumSquares = state[1]
+  for (let index = from; index < to; index += 1) {
+    const value = samples[index]
+    const magnitude = Math.abs(value)
+    if (magnitude > peak) peak = magnitude
+    sumSquares += value * value
+  }
+  state[0] = peak
+  state[1] = sumSquares
+}
+
 /**
- * Render a score to mono samples.
+ * Render a score to mono samples, as a generator with cooperation points.
  *
  * Each track is rendered on its own, levelled to the RMS level its `gainDb`
  * states, then summed; the master gets the genre's tone filter and reverb, a DC
  * blocker, peak normalisation and a soft-limit ceiling. Loop scores are folded at
  * the loop point instead of faded out.
  *
+ * The generator yields between blocks of samples: `renderScore` drains it
+ * synchronously (no behaviour change) and `renderScoreAsync` drains it with a
+ * `setImmediate` at each yield. All the per-sample arithmetic lives in the plain
+ * `*Range` helpers and in the note renderers above, so a block boundary is not a
+ * place where any value is recomputed, reordered or read from a different
+ * source. Note synthesis is per note and a note is the smallest unit that can be
+ * stopped between samples, so every note is also a cooperation point.
+ *
  * @param {object} score - produced by `composeScore` (or hand written).
  * @param {object} [options] - `sampleRate`, `peakDbfs`, `tailSeconds`.
- * @returns {{ samples: Float32Array, sampleRate: number, beatMap: number[],
- *   trackStats: object[], sectionStats: object[], durationSeconds: number,
- *   loop: boolean }}
+ * @returns {Generator<unknown, { samples: Float32Array, sampleRate: number,
+ *   beatMap: number[], barMap: number[], trackStats: object[],
+ *   sectionStats: object[], durationSeconds: number, loop: boolean }, unknown>}
  */
-export function renderScore (score, options = {}) {
+export function* renderScoreGen (score, options = {}) {
   if (score === null || typeof score !== 'object') throw new Error('renderScore needs a score object')
   const sampleRate = clamp(Math.round(Number(options.sampleRate ?? 44100)), 8000, 96000)
   const genre = GENRES[score.genre] ?? GENRES.cinematic
@@ -2511,29 +2623,40 @@ export function renderScore (score, options = {}) {
         : renderNote(voice, midi, durBeats * secondsPerBeat, velocity, sampleRate, rng, note.artic, envelopes)
       // `addInto(scratch, voiceSamples, offset, 1)` inlined: the source buffer is
       // accumulated note by note in order, so the sum is identical; dropping the
-      // function call and the multiply by unity is free accuracy-wise.
+      // function call and the multiply by unity is free accuracy-wise. A note
+      // longer than one block accumulates in blocks, in the same order, so the
+      // samples cannot differ.
       const limit = Math.min(renderFrames, offset + voiceSamples.length)
-      for (let index = offset; index < limit; index += 1) scratch[index] += voiceSamples[index - offset]
+      for (let from = offset; from < limit; from += YIELD_EVERY_FRAMES) {
+        const to = Math.min(limit, from + YIELD_EVERY_FRAMES)
+        for (let index = from; index < to; index += 1) scratch[index] += voiceSamples[index - offset]
+        yield
+      }
       rendered += 1
+      // One note is a few milliseconds of synthesis; that is the cooperation
+      // granularity available here, and short notes would otherwise slip
+      // between blocks entirely.
+      yield
     }
 
-    let rawSumSquares = 0
-    for (let index = 0; index < renderFrames; index += 1) {
-      const value = scratch[index]
-      rawSumSquares += value * value
+    const rawState = new Float64Array(1)
+    for (let from = 0; from < renderFrames; from += YIELD_EVERY_FRAMES) {
+      const to = Math.min(renderFrames, from + YIELD_EVERY_FRAMES)
+      sumSquaresRange(scratch, from, to, rawState)
+      yield
     }
+    const rawSumSquares = rawState[0]
     const rawRms = Math.sqrt(rawSumSquares / Math.max(1, renderFrames))
     const levelScale = rawRms > 1e-7 ? clamp(targetRms / rawRms, 0, 1000) : 0
 
-    let peak = 0
-    let sumSquares = 0
-    for (let index = 0; index < renderFrames; index += 1) {
-      const value = scratch[index] * levelScale
-      master[index] += value
-      const magnitude = Math.abs(value)
-      if (magnitude > peak) peak = magnitude
-      sumSquares += value * value
+    const mixState = new Float64Array(2)
+    for (let from = 0; from < renderFrames; from += YIELD_EVERY_FRAMES) {
+      const to = Math.min(renderFrames, from + YIELD_EVERY_FRAMES)
+      mixTrackRange(master, scratch, levelScale, from, to, mixState)
+      yield
     }
+    const peak = mixState[0]
+    const sumSquares = mixState[1]
     const rms = Math.sqrt(sumSquares / Math.max(1, renderFrames))
     trackStats.push({
       id: track.id ?? track.role ?? `track-${trackIndex}`,
@@ -2544,12 +2667,18 @@ export function renderScore (score, options = {}) {
       peakDbfs: levelDb(peak),
       rmsDbfs: levelDb(rms)
     })
+    // A track with no notes would otherwise offer no cooperation point at all.
+    yield
   }
 
-  applyTone(master, sampleRate, genre.masterTone ?? null)
+  yield* applyTone(master, sampleRate, genre.masterTone ?? null)
   if (genre.reverb !== undefined && genre.reverb.amount > 0) {
-    applyReverb(master, sampleRate, genre.reverb.amount, genre.reverb.size ?? 0.5)
+    yield* applyReverb(master, sampleRate, genre.reverb.amount, genre.reverb.size ?? 0.5)
   }
+  // `dcBlock` is a single pass from `dsp.js`, a module this change does not own;
+  // it is a few milliseconds even for the longest cue that may be rendered, so
+  // the cooperation point is before it rather than inside it.
+  yield
   dcBlock(master, sampleRate)
 
   let samples
@@ -2557,17 +2686,28 @@ export function renderScore (score, options = {}) {
     // Fold everything that would ring past the loop point back onto the head, so
     // replaying the file is a continuation rather than a cut.
     const fold = Math.min(tailFrames, mainFrames)
-    for (let index = 0; index < fold; index += 1) master[index] += master[mainFrames + index]
+    for (let from = 0; from < fold; from += YIELD_EVERY_FRAMES) {
+      const to = Math.min(fold, from + YIELD_EVERY_FRAMES)
+      foldRange(master, mainFrames, from, to)
+      yield
+    }
     samples = master.slice(0, mainFrames)
   } else {
     // Cutting a still-ringing reverb tail clicks; every cue ends with a fade.
     const fade = Math.min(Math.round(0.05 * sampleRate), Math.floor(mainFrames / 8))
-    for (let index = 0; index < fade; index += 1) master[renderFrames - 1 - index] *= index / fade
+    for (let from = 0; from < fade; from += YIELD_EVERY_FRAMES) {
+      const to = Math.min(fade, from + YIELD_EVERY_FRAMES)
+      fadeRange(master, renderFrames, fade, from, to)
+      yield
+    }
     samples = master
   }
   const targetPeakDbfs = Number.isFinite(Number(options.peakDbfs)) ? Number(options.peakDbfs) : -1
+  // `normalizePeak` and `softLimit` are one atomic pass each from `dsp.js`; the
+  // cooperation points sit between them.
   const masterGain = normalizePeak(samples, targetPeakDbfs)
   const masterGainDb = masterGain > 0 ? 20 * Math.log10(masterGain) : 0
+  yield
   softLimit(samples, 0.92)
   // Report track levels as they sit in the finished file, not as they were
   // before peak normalisation, so no track can look like it is over 0 dBFS.
@@ -2586,19 +2726,20 @@ export function renderScore (score, options = {}) {
     ? score.sections
     : [{ name: 'full', fromBar: 0, toBar: bars, intensity: 1 }]
 
-  const sectionStats = sections.map((section) => {
+  const sectionStats = []
+  for (const section of sections) {
     const fromBar = clamp(Math.round(section.fromBar), 0, bars)
     const toBar = clamp(Math.round(section.toBar), fromBar, bars)
     const startFrame = Math.min(samples.length, Math.round(fromBar * beatsPerBar * secondsPerBeat * sampleRate))
     const endFrame = Math.min(samples.length, Math.round(toBar * beatsPerBar * secondsPerBeat * sampleRate))
-    let peak = 0
-    let sumSquares = 0
-    for (let index = startFrame; index < endFrame; index += 1) {
-      const value = samples[index]
-      const magnitude = Math.abs(value)
-      if (magnitude > peak) peak = magnitude
-      sumSquares += value * value
+    const sectionState = new Float64Array(2)
+    for (let from = startFrame; from < endFrame; from += YIELD_EVERY_FRAMES) {
+      const to = Math.min(endFrame, from + YIELD_EVERY_FRAMES)
+      sectionStatsRange(samples, from, to, sectionState)
+      yield
     }
+    const peak = sectionState[0]
+    const sumSquares = sectionState[1]
     let noteCount = 0
     for (const track of tracks) {
       for (const note of track.notes ?? []) {
@@ -2606,7 +2747,7 @@ export function renderScore (score, options = {}) {
         if (bar >= fromBar && bar < toBar) noteCount += 1
       }
     }
-    return {
+    sectionStats.push({
       name: section.name,
       fromBar,
       toBar,
@@ -2615,8 +2756,8 @@ export function renderScore (score, options = {}) {
       durationSeconds: round2((endFrame - startFrame) / sampleRate),
       peakDbfs: levelDb(peak),
       rmsDbfs: levelDb(Math.sqrt(sumSquares / Math.max(1, endFrame - startFrame)))
-    }
-  })
+    })
+  }
 
   return {
     samples,
@@ -2630,15 +2771,50 @@ export function renderScore (score, options = {}) {
   }
 }
 
+/**
+ * Render a score to mono samples.
+ *
+ * The synchronous API every existing caller uses: it drives `renderScoreGen` to
+ * completion, ignoring the cooperation points (which is what a synchronous
+ * caller can do — there is no event loop to hand control to mid-call).
+ * @param {object} score - produced by `composeScore` (or hand written).
+ * @param {object} [options] - `sampleRate`, `peakDbfs`, `tailSeconds`.
+ * @returns {{ samples: Float32Array, sampleRate: number, beatMap: number[],
+ *   barMap: number[], trackStats: object[], sectionStats: object[],
+ *   durationSeconds: number, loop: boolean }}
+ */
+export function renderScore (score, options = {}) {
+  return driveSync(renderScoreGen(score, options))
+}
+
+/**
+ * Render a score without holding the event loop for the whole render.
+ *
+ * Same arithmetic, same generator, same bytes as `renderScore`; the only
+ * difference is that each block boundary also waits for a `setImmediate`, so
+ * timers and I/O of the host process run while a long cue renders. This is the
+ * entry point the tool layer uses.
+ * @param {object} score - produced by `composeScore` (or hand written).
+ * @param {object} [options] - `sampleRate`, `peakDbfs`, `tailSeconds`.
+ * @returns {Promise<{ samples: Float32Array, sampleRate: number, beatMap: number[],
+ *   barMap: number[], trackStats: object[], sectionStats: object[],
+ *   durationSeconds: number, loop: boolean }>}
+ */
+export function renderScoreAsync (score, options = {}) {
+  return driveAsync(renderScoreGen(score, options))
+}
+
 /* ------------------------------------------------------------- encoding -- */
 
 /**
  * Encode rendered samples as deterministic 16-bit WAV bytes.
  *
- * The codec's own dither uses `Math.random`, which would make two renders of
- * one score differ by a few least-significant bits. Music cues are cached and
- * diffed, so this applies a seeded triangular dither instead and asks the codec
- * not to add its own: same score in, byte-identical file out.
+ * The codec's own dither is deterministic but applies one fixed noise sequence
+ * to every render (it is a property of the writer, not of the score), so two
+ * different cues would carry the same noise pattern and the noise would not
+ * follow the score it belongs to. This applies a dither derived from the score
+ * seed instead and asks the codec not to add its own: same score in,
+ * byte-identical file out, and different scores get different noise.
  *
  * @param {Float32Array} samples - mono samples.
  * @param {number} sampleRate - Hz.

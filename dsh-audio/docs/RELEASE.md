@@ -1,4 +1,4 @@
-# Release runbook — `dsh-audiokit` 0.6.0
+# Release runbook — `dsh-audiokit` 0.6.1
 
 This is the exact manual procedure for publishing the plugin. The publish
 actions themselves — `npm publish`, creating the GitHub repository and pushing —
@@ -39,7 +39,7 @@ node is not on `PATH`; use its full path, e.g.
   `animation-sound`, and the JSON format tags
   `dsh-audio-lipsync` / `dsh-audio-beats` / `dsh-audio-stems` / `dsh-audio-analyze`
   (on-disk data contracts, read back by the tests).
-- The package version is **0.6.0**, and it is written **only** in `package.json`:
+- The package version is **0.6.1**, and it is written **only** in `package.json`:
   `index.js` reads it into `VERSION` (the settings page and the editor header echo
   it), and `test/version-single-source.mjs` fails the suite if `index.js`, this
   runbook, the tarball name or the git tag names a different version. Bump the
@@ -102,8 +102,8 @@ npm view dsh-audio version        # -> 0.0.1, belongs to another package; do not
 node tools/test-all.mjs
 ```
 
-Expected final line: `57 file(s) · 57 ok · 0 failed · …` with one `ok` line per
-file (57 files at the time of writing — the suite keeps changing as features land
+Expected final line: `63 file(s) · 63 ok · 0 failed · …` with one `ok` line per
+file (63 files at the time of writing — the suite keeps changing as features land
 and leave; `node tools/test-all.mjs --list` prints the authoritative list and its
 final `<n> file(s)` count, so trust that number if this line has drifted). No file
 skips on this machine: DSH's bundled ffmpeg lets `test/video.mjs` run.
@@ -119,9 +119,10 @@ being counted as passing tests.
 
 Tests that cannot run on the machine **skip themselves** by printing `SKIP:` and
 exiting 0; the runner reports them as `ok … [skip]`. Never "fix" a SKIP by
-deleting the test. The full suite takes ~3-4 minutes on this Windows machine
-(3 m 37 s measured on the 0.6.0 tree, node 24) with no skips here; on a hosted
-runner `test/video.mjs` is the one skip (see the table below).
+deleting the test. The full suite takes ~4 minutes on this Windows machine
+(3 m 27 s measured on the 0.6.1 integration tree, node 24 / 63 files, 0 failed) with
+no skips here; on a hosted runner `test/video.mjs` is the one skip (see the table
+below).
 
 ### What CI skips, and why
 
@@ -139,6 +140,13 @@ asset is added or removed, re-read the run log instead of assuming a number.
 | file | why it skips on CI |
 | --- | --- |
 | `test/video.mjs` | needs `ffmpeg`/`ffprobe`. It only trusts DSH's bundled ffmpeg (`~/.dsh/tools/ffmpeg/bin`) or one on `PATH`; neither the [ubuntu-latest image](https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md) nor the [windows-latest image](https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md) ships ffmpeg in its software list. It runs on a machine with DSH's bundled ffmpeg (this one). |
+
+`test/lufs.mjs` is **not** a whole-file skip: its `ffmpeg ebur128 cross-check`
+section finds an ffmpeg (DSH's bundled copy, `DSH_FFMPEG_PATH`, or one on `PATH`),
+compares a real mono render and a real stereo render against the plugin's LUFS,
+and prints `SKIP:` for just that section when none is available. The rest of the
+file always runs, so the BS.1770 calibration (mono single-channel weight, EBU
+Tech 3341 stereo reference, dual-mono option) is checked on every CI leg.
 
 `test/edge.mjs` is **not** a SKIP. It talks live to Microsoft's Edge read-aloud
 service; it passes here and on a runner with network, and fails loudly (`FAIL`,
@@ -177,25 +185,26 @@ npm pack --dry-run
 # machine-readable: npm pack --dry-run --json
 ```
 
-This writes nothing. Expected result (measured on the 0.6.0 tree on 2026-11-28;
-the tree keeps gaining `lib/` modules and tests while this runbook is written,
-so the exact counts drift — re-run `npm pack --dry-run --json` and trust the
-`entryCount` / `size` / `unpackedSize` it reports, and check the *groups* below
+This writes nothing. Expected result (measured on the 0.6.1 integration tree on
+2026-11-28; the tree keeps gaining `lib/` modules and tests while this runbook is
+written, so the exact counts drift — re-run `npm pack --dry-run --json` and trust
+the `entryCount` / `size` / `unpackedSize` it reports, and check the *groups* below
 and the absence of residue):
 
-- tarball name: **`dsh-audiokit-0.6.0.tgz`** (the one value this runbook must get
+- tarball name: **`dsh-audiokit-0.6.1.tgz`** (the one value this runbook must get
   right; `test/version-single-source.mjs` fails the suite if it drifts)
-- **151 files** (measured on 2026-11-28 while the 0.6.0 tree was still being
-  edited), packed size ≈ **1.13 MB**, unpacked ≈ **3.97 MB**
+- **167 files** (`entryCount`; measured on 2026-11-28), packed size
+  **1,284,918 B ≈ 1.23 MiB** (`size`), unpacked **4,477,690 B ≈ 4.27 MiB**
+  (`unpackedSize`)
 - root: `package.json`, `index.js`, `client.js`, `cordis.patch.yml`, `icon.svg`,
   `README.md`, `LICENSE`
-- `lib/`: every `.js` module (68 at the time of writing; grows with every new
+- `lib/`: every `.js` module (78 at the time of writing; grows with every new
   tool/module — all of them must be there, none may be missing)
 - `locale/`: `en.json`, `zh.json`
 - `docs/`: every document under `docs/` (`CREATURES.zh.md`, `DETAIL.md`,
   `DETAIL.zh.md`, `ECOSYSTEM.zh.md`, `EDITOR.zh.md`, `GENERATE.zh.md`,
   `INTEROP.zh.md`, `preview.svg`, `RELEASE.md`, `SCHEMA_DIET.zh.md`)
-- `test/`: 57 `.mjs` files at the time of writing (one per file the runner
+- `test/`: 63 `.mjs` files at the time of writing (one per file the runner
   executes; `node tools/test-all.mjs --list` is authoritative) plus
   `test/support/fake-provider.mjs` and `test/support/legacy-resample.mjs`,
   shared helpers the HTTP and resampler tests import
@@ -217,8 +226,8 @@ wrong version. Two safe routes:
 
 ```powershell
 # route A (works today): pack here, then publish exactly the tarball step 5 inspected
-npm pack                                          # -> dsh-audiokit-0.6.0.tgz
-npm publish .\dsh-audiokit-0.6.0.tgz --access public
+npm pack                                          # -> dsh-audiokit-0.6.1.tgz
+npm publish .\dsh-audiokit-0.6.1.tgz --access public
 ```
 
 ```powershell
@@ -233,7 +242,7 @@ array, so the groups in step 5 are exactly what gets published. Route B reports
 the tarball name, file count and size without `--publish` — run that once first
 and compare with step 5.
 
-Expected: `dsh-audiokit-0.6.0.tgz`, then `+ dsh-audiokit@0.6.0` and a registry
+Expected: `dsh-audiokit-0.6.1.tgz`, then `+ dsh-audiokit@0.6.1` and a registry
 URL `https://www.npmjs.com/package/dsh-audiokit`.
 
 - Publishing the **same version twice fails**: npm rejects it with `E403 You
@@ -248,15 +257,15 @@ URL `https://www.npmjs.com/package/dsh-audiokit`.
 The publish target is a standalone repository whose root is **this plugin
 directory**. In this workspace the tree is instead tracked by the repository one
 level up (`default-workspace/`, which whitelists `dsh-audio/`), so either tag
-there (`git -C .. tag v0.6.0`) or export this directory to a staging folder —
+there (`git -C .. tag v0.6.1`) or export this directory to a staging folder —
 which has no `.git` — and initialise it from its root:
 
 ```powershell
 git init -b main
 git add -A
 git status                 # confirm no test/out, no *.tgz, no scratch assets/audio/*.wav
-git commit -m "dsh-audiokit 0.6.0"
-git tag v0.6.0
+git commit -m "dsh-audiokit 0.6.1"
+git tag v0.6.1
 
 # create the repository (browser, or with the GitHub CLI)
 #   gh repo create 0zeroLsoar0/dsh-audiokit --public --source . --remote origin
@@ -277,7 +286,7 @@ git push -u origin main --tags
   (`node tools/test-all.mjs`). See §4 for the file that self-skips on a
   hosted runner and for the live-network `test/edge.mjs`. The workflow is not in
   the npm tarball (not in `files`).
-- The `v0.6.0` tag is a convention, not a CI trigger; the source of truth for
+- The `v0.6.1` tag is a convention, not a CI trigger; the source of truth for
   the published artifact is npm.
 - If the real repo URL is not `github.com/0zeroLsoar0/...`, finish step 2 with the
   final URL **before** step 6, or publish a corrected metadata patch release.
@@ -291,8 +300,8 @@ artifact by installing the tarball into a scratch profile:
 ```powershell
 mkdir "$env:TEMP\dsh-audiokit-verify"
 cd "$env:TEMP\dsh-audiokit-verify"
-npm pack dsh-audiokit@0.6.0
-tar -xzf dsh-audiokit-0.6.0.tgz
+npm pack dsh-audiokit@0.6.1
+tar -xzf dsh-audiokit-0.6.1.tgz
 dir package          # same file list as step 5
 ```
 
@@ -310,7 +319,7 @@ Check that:
 - The tool list contains `audio_synth` (and the other `audio_*` tools).
 - One short render returns a `.wav` path plus measured numbers, e.g.
   `audio_synth({ preset: 'impact', duration: 0.6 })`.
-- `npm view dsh-audiokit@0.6.0 dist.tarball` prints a registry URL.
+- `npm view dsh-audiokit@0.6.1 dist.tarball` prints a registry URL.
 
 Remove the scratch profile/install afterwards so it does not shadow your real
 plugin entry.
@@ -320,7 +329,7 @@ plugin entry.
 **Within 72 hours** of publishing, npm allows unpublishing that version:
 
 ```powershell
-npm unpublish dsh-audiokit@0.6.0 --force
+npm unpublish dsh-audiokit@0.6.1 --force
 ```
 
 Limits: npm only permits unpublish of a version within 72 h of its publish, and
@@ -328,7 +337,7 @@ repeated unpublishes are throttled. After the window it fails; do not fight it �
 publish a fixed patch and deprecate the bad one instead:
 
 ```powershell
-npm deprecate dsh-audiokit@0.6.0 "broken: use a later version"
+npm deprecate dsh-audiokit@0.6.1 "broken: use a later version"
 npm version patch
 node dsh-audio-lab/tools/publish-pack.mjs --name dsh-audiokit --repo https://github.com/0zeroLsoar0/dsh-audiokit --publish
 ```
@@ -336,8 +345,8 @@ node dsh-audio-lab/tools/publish-pack.mjs --name dsh-audiokit --repo https://git
 Git side (only if the tag itself was wrong):
 
 ```powershell
-git tag -d v0.6.0
-git push origin :refs/tags/v0.6.0
+git tag -d v0.6.1
+git push origin :refs/tags/v0.6.1
 ```
 
 Do not rewrite `main` if anyone has cloned it; a revert commit is safer than a
@@ -351,13 +360,13 @@ tarball.
 - [ ] `npm login` with your account (2FA/OTP); an agent cannot do this.
 - [ ] `npm view dsh-audiokit version` still returns 404 right before publish.
 - [ ] Step 5's dry run is re-run on the final tree; publish from this root as
-      `npm pack` + `npm publish .\dsh-audiokit-0.6.0.tgz`. Do **not** run the
+      `npm pack` + `npm publish .\dsh-audiokit-0.6.1.tgz`. Do **not** run the
       `dsh-audio-lab` packer as-is: it still stages the stale 0.5.10 copy (§6).
 - [ ] Publish (human action, needs the npm OTP; never run by an agent).
 - [ ] Create the GitHub repo, `git remote add origin`, `git push -u origin main --tags`.
 - [ ] Leave `cordis.patch.yml`'s `id: dsh-audio` and the `/dsh-audio/*` routes
       as-is — they are the profile's link target, not the package name (see §0).
-- [ ] Verify by installing the packed tarball (`npm pack dsh-audiokit@0.6.0`)
+- [ ] Verify by installing the packed tarball (`npm pack dsh-audiokit@0.6.1`)
       in a scratch profile — there is no `npx` CLI.
 - [ ] After the push, confirm CI is green on all six legs (ubuntu/windows × node
       20/22/24): no `FAIL`, and the `[skip]` line is the environment skip from

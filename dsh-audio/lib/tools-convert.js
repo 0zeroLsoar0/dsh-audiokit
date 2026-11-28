@@ -490,7 +490,7 @@ async function runGainScan (cwd, tracks, args, format) {
 export function registerConvertTools (ctx) {
   ctx.tools.register({
     name: 'audio_convert',
-    description: 'Edit and finish a rendered cue: trim a span, apply a gain, fade in/out, reverse, join takes with a gap or crossfade, level a whole cue set to one common peak (gain-scan), or just re-encode the format. Writes 8-bit (tiny, for a base64 data URI in one HTML file), 16-bit, 24-bit (video master) or 32-bit float at 1/2/4/6/8 channels and any sample rate with a windowed-sinc resampler. Trim/gain/fade/reverse/convert pass a multichannel file through channel for channel and default to keeping its layout (a 4/6/8-channel file gets the WAVE extensible header with its channel mask and supports 16/24-bit); pan/width place a mono input and are refused on a wider track. Use it after audio_synth/audio_pattern/audio_tts instead of re-rendering with different settings. Returns the path plus the format actually written; `inline: true` also returns the bytes as a base64 data URI.',
+    description: 'Edit and finish a rendered cue: trim, gain, fade, reverse, concat, gain-scan a cue set, or re-encode the format (bit depth, channel count, sample rate). Keeps the input\'s channel layout unless you ask otherwise; `inline` returns a data URI for single-file HTML.',
     parameters: {
       type: 'object',
       properties: {
@@ -503,31 +503,31 @@ export function registerConvertTools (ctx) {
               { type: 'object', additionalProperties: true }
             ]
           },
-          description: 'Input tracks in order: a .wav path (relative to the working directory or absolute), or an inline render spec { preset, params, duration, seed, sampleRate, loop } that is rendered first. trim/gain/fade/reverse/convert take exactly one; concat and gain-scan take one or more.'
+          description: 'Input paths or render specs; most ops take one, concat/gain-scan take more.'
         },
         op: {
           type: 'string',
           enum: OPS,
-          description: 'trim=cut to start..end; gain=apply gainDb; fade=fade in/out; reverse=play backwards; concat=join takes with a gap or crossfade; gain-scan=normalise a batch to one common peak and report each gain; convert=re-encode at the requested format only.'
+          description: 'trim, gain, fade, reverse, concat, gain-scan or convert (per-op fields in skill).'
         },
         start: { type: 'number', description: 'trim: start of the span in seconds (default 0).' },
         end: { type: 'number', description: 'trim: end of the span in seconds (default end of the track).' },
         snapToZeroCrossing: { type: 'boolean', description: 'trim only: move the cut to the nearest zero crossing (within 5 ms) so the edit does not click.' },
         gainDb: { type: 'number', description: 'gain: level change in dB (finite, -120..24); negative attenuates.' },
-        fadeInSeconds: { type: 'number', description: 'Fade-in length in seconds; applied after the op (or as the fade op itself).' },
-        fadeOutSeconds: { type: 'number', description: 'Fade-out length in seconds; applied after the op (or as the fade op itself).' },
+        fadeInSeconds: { type: 'number', description: 'Fade-in length in seconds; applied after the op.' },
+        fadeOutSeconds: { type: 'number', description: 'Fade-out length in seconds; applied after the op.' },
         curve: { type: 'string', enum: ['linear', 'equalPower'], description: 'Fade shape; equalPower keeps perceived loudness steadier.' },
-        gapSeconds: { type: 'number', description: 'concat: silent gap between takes (finite, at most 60 s; negative clamps to 0); use this or crossfadeSeconds, not both.' },
-        crossfadeSeconds: { type: 'number', description: 'concat: overlap between takes instead of a gap (finite, at most 60 s; negative clamps to 0).' },
+        gapSeconds: { type: 'number', description: 'concat: silent gap between takes, at most 60 s; use this or crossfadeSeconds.' },
+        crossfadeSeconds: { type: 'number', description: 'concat: overlap between takes, at most 60 s; use this or gapSeconds.' },
         peakDbfs: { type: 'number', description: 'gain-scan: the common peak to hit in dBFS (default -1).' },
-        pan: { type: 'number', description: 'Stereo placement, -1 left .. 0 centre .. 1 right; only used when channels is 2 and the input is mono. Refused on a multichannel input, which already has a layout.' },
-        width: { type: 'number', description: 'Stereo width 0..1: 0 folds both channels to mono, 1 keeps the pan image; only when placing a mono input in stereo. Refused on a multichannel input.' },
-        bitDepth: { type: 'integer', enum: BIT_DEPTHS, description: '8=smallest, good for an inline HTML data URI; 16=default; 24=video master; 32=32-bit IEEE float. A 4/6/8-channel file supports 16 or 24 bits (the extensible WAV writer); 8/32-bit is refused for surround. Defaults to 16.' },
-        channels: { type: 'integer', enum: [...CHANNEL_COUNTS], description: 'Output channel count: 1 mono, 2 stereo, 4 quad, 6 5.1, 8 7.1. Defaults to the input file\'s own channel count (so convert re-encodes a 5.1 file as 5.1); an explicit count converts through the layout matrix with LFE dropped by a downmix. A mono input with channels 2 is placed by pan/width.' },
-        sampleRate: { type: 'integer', description: 'Output rate in Hz; defaults to the input rate. Uses a windowed-sinc resampler, safe as the final rate change.' },
-        out: { type: 'string', description: 'Output path, relative to the working directory. Defaults to assets/audio/<op>-<label>-<hash>.wav. For gain-scan with several inputs this is a directory.' },
-        inline: { type: 'boolean', description: 'Also return the written file as a base64 data URI (audio/wav) for single-file HTML. Skipped when the file exceeds maxInlineBytes.' },
-        maxInlineBytes: { type: 'integer', description: `Size guard for inline output (positive; defaults to ${DEFAULT_MAX_INLINE_BYTES} = 2 MB).` }
+        pan: { type: 'number', description: 'Stereo placement -1..1, only when a mono input is placed in stereo.' },
+        width: { type: 'number', description: 'Stereo width 0..1, only when a mono input is placed in stereo.' },
+        bitDepth: { type: 'integer', enum: BIT_DEPTHS, description: '8, 16 (default), 24 or 32-bit float; surround supports only 16 or 24.' },
+        channels: { type: 'integer', enum: [...CHANNEL_COUNTS], description: 'Output channels 1/2/4/6/8; default keeps the input layout. LFE is dropped by a downmix.' },
+        sampleRate: { type: 'integer', description: 'Output rate in Hz; default the input rate (windowed-sinc resampler).' },
+        out: { type: 'string', description: 'Output path; default assets/audio/<op>-<label>-<hash>.wav (a directory for gain-scan batches).' },
+        inline: { type: 'boolean', description: 'Also return the file as a base64 data URI for single-file HTML.' },
+        maxInlineBytes: { type: 'integer', description: 'Inline output size guard in bytes; default 2097152 (2 MB).' }
       },
       required: ['inputs', 'op'],
       additionalProperties: false

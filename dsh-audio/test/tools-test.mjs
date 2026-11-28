@@ -29,6 +29,41 @@ function pcmHex (seconds, sampleRate = 32000) {
   return buffer.toString('hex')
 }
 
+/**
+ * A 32-bit IEEE-float WAVE file.
+ *
+ * Only the float encoding can carry NaN/Infinity samples, and `encodeWavEx`
+ * deliberately replaces non-finite input with silence, so the poisoned fixtures
+ * have to be built by hand.
+ */
+function floatWav (channels, sampleRate) {
+  const frames = channels[0].length
+  const blockAlign = channels.length * 4
+  const dataBytes = frames * blockAlign
+  const buffer = Buffer.alloc(44 + dataBytes)
+  buffer.write('RIFF', 0, 'ascii')
+  buffer.writeUInt32LE(36 + dataBytes, 4)
+  buffer.write('WAVE', 8, 'ascii')
+  buffer.write('fmt ', 12, 'ascii')
+  buffer.writeUInt32LE(16, 16)
+  buffer.writeUInt16LE(3, 20) // WAVE_FORMAT_IEEE_FLOAT
+  buffer.writeUInt16LE(channels.length, 22)
+  buffer.writeUInt32LE(sampleRate, 24)
+  buffer.writeUInt32LE(sampleRate * blockAlign, 28)
+  buffer.writeUInt16LE(blockAlign, 32)
+  buffer.writeUInt16LE(32, 34)
+  buffer.write('data', 36, 'ascii')
+  buffer.writeUInt32LE(dataBytes, 40)
+  let offset = 44
+  for (let frame = 0; frame < frames; frame += 1) {
+    for (const channel of channels) {
+      buffer.writeFloatLE(channel[frame], offset)
+      offset += 4
+    }
+  }
+  return buffer
+}
+
 const server = createServer((request, response) => {
   const chunks = []
   request.on('data', (chunk) => chunks.push(chunk))
@@ -55,7 +90,9 @@ registerTtsTool(ctx, { tts: { provider: 'minimax', baseUrl: mockBase, apiKey: 'k
 registerCheckTool(ctx, {})
 
 let failures = 0
+let assertions = 0
 const check = (label, ok, detail = '') => {
+  assertions += 1
   if (ok) return
   failures += 1
   console.log(`  FAIL ${label} ${detail}`)
@@ -97,6 +134,42 @@ console.log('-- audio_check: cue timeline --')
   })
   check('summed peak reported', typeof result.summedPeakDbfs === 'number', String(result.summedPeakDbfs))
   check('timeline check runs', result.verdict !== undefined)
+}
+
+console.log('-- audio_probe: non-finite samples are named, not silently healthy --')
+{
+  const { writeFile } = await import('node:fs/promises')
+  const rate = 8000
+  const frames = 1600
+  const tone = Float32Array.from({ length: frames }, (_, index) => Math.sin(2 * Math.PI * 330 * index / rate) * 0.5)
+  // The red-team shape: a stereo float file whose left channel is all NaN. The
+  // right channel is a normal tone, so every level metric looks healthy while a
+  // whole channel is unreadable.
+  await writeFile(join(cwd, 'nan-left.wav'), floatWav([new Float32Array(frames).fill(Number.NaN), tone], rate))
+  // Infinities are the other half: the peak itself becomes Infinity.
+  await writeFile(join(cwd, 'inf.wav'), floatWav([new Float32Array(frames).fill(Number.POSITIVE_INFINITY)], rate))
+
+  const nan = await call('audio_probe', { path: 'nan-left.wav' })
+  console.log(`  NaN left  -> ${nan.text}`)
+  check('NaN file: the poisoned samples are counted', nan.nonFiniteSamples === frames, String(nan.nonFiniteSamples))
+  check('NaN file: notes name the count and the channel',
+    nan.notes.some((note) => /non-finite samples: 1600 of 3200/.test(note) && /ch1 NaN 1600/.test(note)),
+    JSON.stringify(nan.notes))
+  check('NaN file: the text says so instead of "clean"',
+    /non-finite samples/.test(nan.text) && !/clean/.test(nan.text), nan.text)
+  check('NaN file: level metrics read as n/a, not as a measurement',
+    /peak n\/a dBFS/.test(nan.text) && /crest n\/a dB/.test(nan.text) && /loop seam n\/a dB/.test(nan.text), nan.text)
+  check('NaN file: no Infinity leaks into the text', !/Infinity/.test(nan.text), nan.text)
+  check('NaN file: the returned metrics are not finite numbers',
+    Number.isNaN(nan.metrics.peakDbfs) && Number.isNaN(nan.metrics.crestDb), JSON.stringify(nan.metrics))
+
+  const inf = await call('audio_probe', { path: 'inf.wav' })
+  console.log(`  Inf mono  -> ${inf.text}`)
+  check('Inf file: the poisoned samples are counted',
+    inf.nonFiniteSamples === frames && inf.notes.some((note) => /Inf 1600/.test(note)), JSON.stringify(inf.notes))
+  check('Inf file: no "Infinity dBFS" is printed', !/Infinity/.test(inf.text), inf.text)
+  check('Inf file: peak and rms read as n/a',
+    /peak n\/a dBFS/.test(inf.text) && /rms n\/a dBFS/.test(inf.text), inf.text)
 }
 
 console.log('-- audio_tts: chunk stitching --')
@@ -145,5 +218,5 @@ console.log('-- audio_voices --')
 server.close()
 await rm(cwd, { recursive: true, force: true })
 
-console.log(failures === 0 ? '\nOK: tool layer behaves' : `\nFAILED: ${failures}`)
+console.log(failures === 0 ? `\nOK: tool layer behaves (${assertions} assertions)` : `\nFAILED: ${failures} of ${assertions} assertions`)
 process.exit(failures === 0 ? 0 : 1)

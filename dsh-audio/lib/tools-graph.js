@@ -17,7 +17,7 @@
 import { stat } from 'node:fs/promises'
 import { relative } from 'node:path'
 import { defaultOutputPath, finalize, hashSpec, measure, resolvePath, toWavBytes, writeFileAtomic } from './audio.js'
-import { GRAPH_SCHEMA, graphCatalog, renderGraph, validateGraph } from './graph.js'
+import { graphCatalog, renderGraph, validateGraph } from './graph.js'
 
 const CATALOG = graphCatalog()
 const CATALOG_IDS = CATALOG.map((entry) => entry.id)
@@ -25,50 +25,14 @@ const CATALOG_BY_ID = new Map(CATALOG.map((entry) => [entry.id, entry]))
 
 /* ------------------------------------------------------------- help text -- */
 
-/** One field of a node, in the compact form the tool description uses. */
-function fieldText (field) {
-  const star = field.required === true ? '*' : ''
-  const fallback = field.default === undefined ? '' : ` (=${field.default})`
-  if (field.type === 'number') return `${field.range[0]}..${field.range[1]}${star}${fallback}`
-  if (field.type === 'string') return `${field.values.join('|')}${star}${fallback}`
-  if (field.type === 'ref') return `ref${star}`
-  if (field.type === 'refs') return `refs${star}`
-  if (field.type === 'numbers') return 'dB[]'
-  return 'object'
-}
-
 /**
- * Generated from GRAPH_SCHEMA, so the promise in the description and the table
- * the validator enforces cannot drift apart.
+ * Two sentences: what the DSL is and where the field reference lives. The node
+ * table that used to sit here is now a section of the `animation-sound` skill,
+ * which the model loads on demand instead of paying for it on every request.
+ * `test/graph.mjs` still requires every node type, "node id" and "index" to be
+ * named here, so this string doubles as the tool's one-line index.
  */
-const NODE_HELP = Object.entries(GRAPH_SCHEMA.nodes)
-  .map(([type, schema]) => {
-    const parts = Object.entries(schema.fields).map(([name, field]) => {
-      if (field.type === 'object') {
-        const nested = Object.entries(field.fields).map(([key, inner]) => `${key} ${fieldText(inner)}`).join(', ')
-        return `${name}={${nested}}`
-      }
-      return `${name} ${fieldText(field)}`
-    })
-    return `${type} [${schema.description}]: ${parts.join(', ')}`
-  })
-  .join('\n')
-
-const CATALOG_HELP = CATALOG.map((entry) => `${entry.id}: ${entry.description}`).join('\n')
-
-/** How long a description may be before a host truncates it is not our call. */
-const GRAPH_REFERENCE = [
-  'Graph shape: { nodes: [ { type, id?, input?, lfo?, ...fields } ], output? }. A source (osc, noise) starts a chain, a processor takes one `input`, sum takes `inputs`. A reference is a node id ("n0" by default) or a 0-based index; `output` defaults to the last audio node. Fields are optional unless marked *; "(=v)" is the default.',
-  'Node reference:',
-  NODE_HELP,
-  'Add `lfo: { hz, depth, target }` to any node instead of writing a separate lfo node. depth is a fraction: 0.02 on pitch is about 34 cents of vibrato, 0.3 on filter moves the cutoff +-30 %.',
-  'The render is mono and ends with an 8 ms guard fade. The seed only changes nodes that use noise, so a graph of pure oscillators is identical for every seed.'
-].join('\n')
-
-const TOOL_DESCRIPTION = [
-  'Render a sound from a synthesis graph: a small JSON DSL the model writes itself (oscillators with FM, noise, filters with sweeps, ADSR envelopes, LFOs, gain, drive, wavefolding, ring modulation, pan, reverb, summing). Use it instead of audio_synth when the fixed preset table cannot express the sound you need, and instead of audio_design when no preset stack gets there. The graph is validated before anything is rendered: an invalid document comes back as a short list of document paths (nodes[2].hz) instead of a stack trace. Deterministic: the same graph, duration, seed and sample rate always produce identical bytes.',
-  GRAPH_REFERENCE
-].join('\n\n')
+const TOOL_DESCRIPTION = 'Render a sound from a JSON synthesis graph the model writes itself (nodes: osc, noise, filter, env, lfo, gain, drive, ring, pan, reverb, sum). Use it when no preset or recipe expresses the sound; references are a node id string or a 0-based index, and the field-by-field DSL is in the animation-sound skill.'
 
 /* --------------------------------------------------------------- helpers -- */
 
@@ -170,17 +134,17 @@ export function registerGraphTools (ctx) {
         graph: {
           type: 'object',
           additionalProperties: true,
-          description: 'The synthesis graph: { nodes: [ { type, ... } ], output? }. Node types and fields are listed in the tool description. References are node ids ("n0" by default) or 0-based indices.'
+          description: 'Graph object { nodes, output? }; DSL in the animation-sound skill.'
         },
         catalog: {
           type: 'string',
           enum: CATALOG_IDS,
-          description: `Named example graph, rendered with its own length and seed when duration/seed are omitted. Use it to hear the DSL, or copy its nodes as a starting point.\n${CATALOG_HELP}`
+          description: 'Example graph id; its length and seed are built in.'
         },
-        duration: { type: 'number', description: 'Length in seconds, 0.008..30; defaults to the catalog example\'s length, else 1 s. The render is cut at exactly this length and ends with an 8 ms fade.' },
-        seed: { type: 'integer', description: 'Variation seed; only nodes that use noise change. Defaults to the catalog example\'s seed, else 1.' },
-        sampleRate: { type: 'integer', description: 'Defaults to 44100. Use 22050 when file size matters (inline HTML), 48000 for video-grade output.' },
-        out: { type: 'string', description: 'Output path, relative to the working directory. Defaults to assets/audio/<catalog id or "graph">-<hash>.wav.' }
+        duration: { type: 'number', description: 'Length in seconds, 0.008..30; default the example length, else 1.' },
+        seed: { type: 'integer', description: 'Variation seed; only nodes that use noise change. Default 1.' },
+        sampleRate: { type: 'integer', description: 'Sample rate; default 44100 (22050 for inline, 48000 for video).' },
+        out: { type: 'string', description: 'Output path; default assets/audio/<catalog or graph>-<hash>.wav.' }
       },
       additionalProperties: false
     },

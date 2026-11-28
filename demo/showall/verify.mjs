@@ -1,6 +1,6 @@
 /**
  * Verify demo/showall/index.html — a single-file, offline, audio-reactive
- * showcase of all 24 dsh-audio tools.
+ * showcase of every tool the plugin currently registers.
  *
  *   node demo/showall/verify.mjs [path/to/index.html]
  *
@@ -151,7 +151,7 @@ if (scenes.length === 0) {
   if (new Set(names).size !== names.length) warn(`duplicate scene names (${names.length} scenes, ${new Set(names).size} unique)`)
 }
 
-/* ---------------------------------------------------- 3. tool coverage 24/24 */
+/* -------------------------------------------------------- 3. tool coverage */
 
 head('3. tool coverage')
 let realTools = []
@@ -188,7 +188,7 @@ if (specTools === null) {
   const missing = unique.filter((n) => !realSet.has(n) && !normSet.has(norm(n)))
   const uncovered = realTools.filter((r) => !unique.includes(r) && !unique.some((n) => norm(n) === norm(r)))
   const coverage = realTools.length === 0 ? 0 : realTools.filter((r) => unique.includes(r) || unique.some((n) => norm(n) === norm(r))).length
-  if (missing.length === 0 && uncovered.length === 0) ok(`tool coverage ${coverage}/24 — every scene tool is a real registered tool`)
+  if (missing.length === 0 && uncovered.length === 0) ok(`tool coverage ${coverage}/${realTools.length} — every scene tool is a real registered tool`)
   else {
     if (missing.length > 0) bug(`${missing.length} spec tool name(s) not registered: ${missing.join(', ')}`)
     if (uncovered.length > 0) bug(`${uncovered.length} plugin tool(s) not represented: ${uncovered.join(', ')}`)

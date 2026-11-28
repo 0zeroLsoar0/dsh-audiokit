@@ -599,6 +599,19 @@ function sizeText (bytes) {
 }
 
 /**
+ * Code-unit ordering for the listing.
+ *
+ * `localeCompare` orders by the machine's collation: it puts `_` before `Z`,
+ * folds case and treats `ä` as `a`, so the same workspace lists differently in
+ * different locales — and a truncated list keeps a different head depending on
+ * who is looking. The editor's output must be reproducible, so the order is
+ * plain code-unit comparison, the same rule the rest of the plugin uses.
+ */
+function compareNames (a, b) {
+  return a.name < b.name ? -1 : a.name > b.name ? 1 : 0
+}
+
+/**
  * List one workspace directory: subdirectories, `.json` and `.wav` files.
  * Hidden entries (`.git`, `.env`) are skipped, as is `node_modules`, because
  * the point of the panel is finding cue sheets and wavs, not browsing a checkout.
@@ -634,8 +647,8 @@ async function listDirectory (root, requested) {
     } catch { /* a file that vanished mid-listing is simply skipped */ }
     files.push({ name: entry.name, path: childPath, kind: extension === '.json' ? 'json' : 'wav', size: bytes, sizeText: sizeText(bytes) })
   }
-  dirs.sort((a, b) => a.name.localeCompare(b.name))
-  files.sort((a, b) => a.name.localeCompare(b.name))
+  dirs.sort(compareNames)
+  files.sort(compareNames)
   const limit = EDITOR_LIMITS.listEntries
   const truncated = dirs.length + files.length > limit
   const keepDirs = dirs.slice(0, limit)

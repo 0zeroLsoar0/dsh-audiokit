@@ -197,7 +197,7 @@ function summaryText (cwd, target, bytes, rendered, sourceCount) {
 export function registerSpatialTools (ctx) {
   ctx.tools.register({
     name: TOOL,
-    description: 'Place mono sounds on a real spatial layout — mono, stereo, binaural headphones, quad, 5.1, 7.1 or first-order B-format — using constant-power speaker panning, a Woodworth ITD/ILD head model and four early reflections, then write one multichannel WAV. Use it instead of audio_mix when the deliverable has more than two channels or when a sound must come from a direction (behind, above, left) rather than from a pan value.',
+    description: 'Place mono sounds on a real spatial layout (mono, stereo, binaural, quad, 5.1, 7.1 or first-order B-format) with constant-power panning, an ITD/ILD head model and four early reflections, and write one multichannel WAV. Use it instead of audio_mix when the deliverable has more than two channels or a sound needs a direction.',
     parameters: {
       type: 'object',
       properties: {
@@ -207,18 +207,18 @@ export function registerSpatialTools (ctx) {
             type: 'object',
             additionalProperties: false,
             properties: {
-              path: { type: 'string', description: 'Source .wav, relative to the working directory or absolute. Multi-channel files are folded to mono. Give this or render, not both.' },
-              render: { type: 'object', additionalProperties: true, description: 'Inline render instead of a file: { preset, params, duration, seed, loop } exactly as audio_synth accepts. Give this or path, not both.' },
-              azimuth: { type: 'number', description: 'Degrees in the listener frame: 0 = straight ahead, +90 = right, -90 = left, ±180 = behind. Defaults to 0.' },
-              distance: { type: 'number', description: `Metres from the listener, ${SPATIAL_LIMITS.minDistance}..${SPATIAL_LIMITS.maxDistance}. 1 m is 0 dB and every doubling is -6 dB; the far field also loses high frequencies. Defaults to 1.` },
-              elevation: { type: 'number', description: 'Degrees above ear height, -90..90. Used by binaural (it shrinks the lateral cue); horizontal speaker layouts have no height channels, so it is ignored there. Defaults to 0.' },
+              path: { type: 'string', description: 'Source .wav; multichannel is folded to mono. Give this or render.' },
+              render: { type: 'object', additionalProperties: true, description: 'Inline render spec instead of a file; give this or path.' },
+              azimuth: { type: 'number', description: 'Degrees: 0 ahead, +90 right, -90 left, 卤180 behind. Default 0.' },
+              distance: { type: 'number', description: 'Metres from the listener, 0.1..1000; 1 m is 0 dB and each doubling is -6 dB. Default 1.' },
+              elevation: { type: 'number', description: 'Degrees above ear height (-90..90); used by binaural only. Default 0.' },
               gainDb: { type: 'number', description: 'Level relative to a 1 m reference source, in dB. Defaults to 0.' },
-              loop: { type: 'boolean', description: 'Tile this source across durationSeconds instead of playing it once. Use it for a spatial ambience bed.' }
+              loop: { type: 'boolean', description: 'Tile this source across durationSeconds (ambience bed).' }
             }
           },
-          description: 'Sources to place, each with a direction. Two sources in the same direction sum; pan law keeps total power constant, so adding sources is not a level change but a space change.'
+          description: 'Sources to place, each with a direction and distance.'
         },
-        layout: { type: 'string', enum: LAYOUT_IDS, description: 'mono (1 ch) · stereo speakers L R at ±30, 2 ch · binaural ears, 2 ch, headphones only · quad FL FR BL BR, 4 ch · 5.1 FL FR FC LFE BL BR, 6 ch · 7.1 adds SL SR, 8 ch · ambisonic-first-order W X Y Z FuMa, 4 ch, for export to a spatial tool. Defaults to stereo.' },
+        layout: { type: 'string', enum: LAYOUT_IDS, description: 'mono, stereo, binaural, quad, 5.1, 7.1 or ambisonic-first-order; default stereo.' },
         room: {
           type: 'object',
           additionalProperties: false,
@@ -227,10 +227,10 @@ export function registerSpatialTools (ctx) {
             damping: { type: 'number', description: '0..1: darkens and quietens the reflections. Defaults to 0.5.' },
             wet: { type: 'number', description: '0..1: reflection level relative to the direct sound. Defaults to 0.18.' }
           },
-          description: 'Four discrete early reflections, not a reverb: there is no diffuse tail. Set wet 0 for a dry, close-miked placement.'
+          description: 'Four early reflections, no diffuse tail; wet 0 for a dry placement.'
         },
-        durationSeconds: { type: 'number', description: `Timeline length in seconds (at most ${SPATIAL_LIMITS.maxSeconds}); defaults to the longest source. The file is this long plus the room tail, so the last reflection is not cut off.` },
-        bitDepth: { type: 'integer', enum: BIT_DEPTHS, description: '16 (default) or 24. Integer PCM only: the multichannel header this tool writes must stay readable by the plugin\'s own decoder.' },
+        durationSeconds: { type: 'number', description: 'Timeline length in seconds (at most 180); default the longest source.' },
+        bitDepth: { type: 'integer', enum: BIT_DEPTHS, description: '16 (default) or 24; integer PCM only for the multichannel header.' },
         sampleRate: { type: 'integer', description: 'Master rate; defaults to the first source\'s rate. Other sources are resampled linearly.' },
         out: { type: 'string', description: 'Output path; defaults to assets/audio/spatial-<hash>.wav.' }
       },

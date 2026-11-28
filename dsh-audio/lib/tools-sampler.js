@@ -242,7 +242,7 @@ export function registerSamplerTools (ctx) {
   const tool = 'audio_sampler'
   ctx.tools.register({
     name: tool,
-    description: 'Play the user\'s own recorded .wav as an instrument: pitch it across the keyboard, map velocity layers and round-robin takes, loop a sustain region with a click-free crossfade, and gate it with an ADSR envelope. This is the sampled tier — it ships no audio, so there is nothing to license and nothing to download: point it at a file the user already has. Playback is interpolated resampling, so pitch and speed move together (a note an octave up plays twice as fast); use audio_stretch when the duration must not change.',
+    description: 'Play the user\'s own recorded .wav as an instrument: pitch across the keyboard, velocity layers, round-robin takes, a crossfaded sustain loop and an ADSR gate. It ships no audio, and playback is resampled, so pitch and speed move together; use audio_stretch when duration must not change.',
     parameters: {
       type: 'object',
       properties: {
@@ -251,27 +251,27 @@ export function registerSamplerTools (ctx) {
             { type: 'string' },
             { type: 'array', items: { anyOf: [{ type: 'string' }, { type: 'object', additionalProperties: true }] } }
           ],
-          description: 'The recording(s) to play: a .wav path, or an array of paths (extra takes of the same note, cycled round-robin), or an array of zone objects { path, rootMidi, lowMidi, highMidi, loopStart, loopEnd, tuneCents, gainDb, velocityLo, velocityHi, name } for velocity layers and multi-sampled instruments. Relative paths resolve against the working directory.'
+          description: 'A .wav path, an array of takes, or zone objects (fields in the skill).'
         },
-        rootMidi: { type: 'integer', description: 'MIDI note the recording was played at (60 = C4, 69 = A4 = 440 Hz); default 60. A zone object overrides it.' },
-        lowMidi: { type: 'integer', description: 'Lowest MIDI note the sample answers; default 0. A zone object overrides it.' },
-        highMidi: { type: 'integer', description: 'Highest MIDI note the sample answers; default 127. A zone object overrides it.' },
+        rootMidi: { type: 'integer', description: 'MIDI note the recording was played at (60 = C4); default 60.' },
+        lowMidi: { type: 'integer', description: 'Lowest MIDI note it answers; default 0.' },
+        highMidi: { type: 'integer', description: 'Highest MIDI note it answers; default 127.' },
         notes: {
           type: 'array',
           items: { anyOf: [{ type: 'number' }, { type: 'string' }, { type: 'object', additionalProperties: true }] },
-          description: 'Notes to play, in order: { midi, startBeat?, durBeats?, velocity? } (midi may be a number or a name; midi: null is a rest), or bare MIDI numbers / note names placed end to end. Omit with no melody to audition the sample once.'
+          description: 'Notes in order as { midi, startBeat?, durBeats?, velocity? } or bare numbers/names.'
         },
-        melody: { type: 'string', description: 'Compact melody such as "C4:1 E4:1 G4:2" (pitch:beats; "r" is a rest), same syntax as audio_midi note lists. Used when notes is absent.' },
+        melody: { type: 'string', description: 'Compact melody like \'C4:1 E4:1 G4:2\'; \'r\' is a rest. Used when notes is absent.' },
         bpm: { type: 'number', description: 'Tempo the startBeat/durBeats are measured in (20..400); default 96.' },
-        envelope: { type: 'object', additionalProperties: true, description: 'ADSR: { attack, decay, release } in seconds and { sustain } 0..1. Default a 2 ms de-click attack and a 50 ms release. Applied after pitch, so a recorded transient survives a slow pitch.' },
+        envelope: { type: 'object', additionalProperties: true, description: 'ADSR: attack, decay, release in seconds, sustain 0..1.' },
         loop: {
           anyOf: [{ type: 'boolean' }, { type: 'object', additionalProperties: true }],
-          description: 'true = auto sustain loop (25%..95% of each sample); { start, end } = loop region in seconds; omit for a one-shot. The loop is crossfaded, so the seam does not click.'
+          description: 'true for an auto sustain loop, { start, end } for a region; omit for one-shot.'
         },
-        tuneCents: { type: 'number', description: 'Fine tuning in cents, applied to every zone (a zone object can override); default 0.' },
-        velocity: { type: 'number', description: 'Velocity for every note that does not carry one, 0..1; default 1. It also selects the layer when zones define velocityLo/velocityHi, and scales the note gain.' },
-        seed: { type: 'integer', description: 'Rotates which round-robin take plays first; the same seed renders the same bytes. Default 1.' },
-        sampleRate: { type: 'integer', description: 'Output rate; defaults to 44100. Zones recorded at another rate are converted on playback.' },
+        tuneCents: { type: 'number', description: 'Fine tuning in cents; default 0.' },
+        velocity: { type: 'number', description: 'Velocity for notes without one, 0..1; also selects the layer and scales gain.' },
+        seed: { type: 'integer', description: 'Rotates the round-robin take order; default 1.' },
+        sampleRate: { type: 'integer', description: 'Output rate; default 44100 (zones are converted on playback).' },
         out: { type: 'string', description: 'Output path; defaults to assets/audio/sampler-<hash>.wav.' }
       },
       required: ['samples'],

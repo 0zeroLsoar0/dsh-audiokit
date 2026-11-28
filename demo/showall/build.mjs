@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Build demo/showall/index.html — one self-contained, network-free 44 s page that
-// exercises all 24 dsh-audio tools.
+// Build demo/showall/index.html — one self-contained, network-free 38 s page that
+// exercises every registered dsh-audio tool.
 //
 // Inputs (all optional; missing ones fall back to documented placeholders and the
 // build prints "audio missing — rebuild later"):
@@ -11,8 +11,11 @@
 //
 // Build-time tool calls (real libraries, no network):
 //   dsh-audio/lib/compose.js  composeScore()    -> piano-roll notes + chords
-//   dsh-audio/lib/lipsync.js  analyzeVisemes()  -> mouth A frames from the sung wav
-//   dsh-audio/lib/mouth.js    mouthFromText()   -> mouth B frames from a caption
+//   dsh-audio/lib/mouth.js    mouthFromText()   -> text-driven mouth frames, no audio
+//
+// 0.6.0 dropped the synthetic-singing tool and the voicebank: no chip, scene or
+// tool list in this build may name a tool the plugin no longer registers, and the
+// page's tool coverage is re-discovered from the registry at build time.
 //
 // Deterministic: same inputs -> byte-identical index.html.
 'use strict';
@@ -31,19 +34,22 @@ const PALETTE = path.join(HERE, 'palette.json');
 const DUR = 38;
 const MAX_PAGE_BYTES = 2200 * 1024;
 
-// dsh-audio is still being developed while this page is built (audio_spatial and
-// audio_mux both landed mid-flight), so the list is DISCOVERED from the plugin and
-// only the presentation order is curated here. Every discovered tool is placed in a
-// scene; anything new is assigned by keyword and reported by the build.
+// dsh-audio is still being developed while this page is built, so the list is
+// DISCOVERED from the plugin and only the presentation order is curated here.
+// The registry (loading index.js through the demo harness) is authoritative: it
+// is what `verify.mjs` checks, and a static scan would also pick up modules that
+// exist on disk but are not wired into index.js yet. Every discovered tool is
+// placed in a scene; anything new is assigned by keyword and reported by the build.
 const PLUGIN_DIR = path.join(HERE, '..', '..', 'dsh-audio');
 const TOOLS_CURATED = [
-  'audio_synth', 'audio_pattern', 'audio_probe', 'audio_design', 'audio_mix', 'audio_mux',
+  'audio_synth', 'audio_pattern', 'audio_synth_graph', 'audio_generate', 'audio_sampler',
+  'audio_probe', 'audio_design', 'audio_mix', 'audio_mux',
   'audio_compose', 'audio_midi', 'audio_beats', 'audio_loudness', 'audio_tts',
-  'audio_sing', 'audio_lipsync', 'audio_mouth', 'audio_voices', 'audio_react',
+  'audio_lipsync', 'audio_mouth', 'audio_voices', 'audio_react',
   'audio_live', 'audio_analyze', 'audio_bus', 'audio_spatial', 'audio_stretch',
   'audio_bind', 'audio_stems', 'audio_convert', 'audio_check', 'audio_regress',
 ];
-function discoverTools() {
+function scanToolsStatic() {
   const found = new Set();
   const walk = (dir, depth) => {
     if (depth > 4) return;
@@ -58,13 +64,28 @@ function discoverTools() {
         try { src = fs.readFileSync(p, 'utf8'); } catch { continue; }
         for (const m of src.matchAll(/name:\s*['"](audio_[a-z0-9_]+)['"]/g)) found.add(m[1]);
         for (const m of src.matchAll(/const TOOL = ['"](audio_[a-z0-9_]+)['"]/g)) found.add(m[1]);
+        // some tools register under a local `const tool = 'audio_…'` (audio_sampler)
+        for (const m of src.matchAll(/const tool\s*=\s*['"](audio_[a-z0-9_]+)['"]/g)) found.add(m[1]);
       }
     }
   };
   walk(PLUGIN_DIR, 0);
   return [...found];
 }
-const TOOLS_REGISTERED = discoverTools();
+async function discoverTools() {
+  try {
+    const { pathToFileURL } = await import('node:url');
+    const harness = await import(pathToFileURL(path.join(HERE, '..', '..', 'dsh-audio-lab', 'harness', 'ctx.mjs')).href);
+    const { ctx } = await harness.loadPlugin(PLUGIN_DIR, {});
+    const names = [...ctx.state.tools.keys()];
+    if (names.length === 0) throw new Error('empty registry');
+    return names;
+  } catch (error) {
+    console.log('tool discovery: registry load failed (' + error.message + '); falling back to a static scan');
+    return scanToolsStatic();
+  }
+}
+const TOOLS_REGISTERED = await discoverTools();
 const TOOLS = TOOLS_CURATED.filter((t2) => TOOLS_REGISTERED.includes(t2));
 const TOOL_NOTES = [];
 for (const t2 of TOOLS_REGISTERED) if (!TOOLS.includes(t2)) { TOOLS.push(t2); TOOL_NOTES.push(t2 + ' (new, appended)'); }
@@ -84,7 +105,6 @@ const RECIPES = ['door-slam-metal', 'door-close-soft', 'glass-break', 'wood-crac
   'ui-error', 'ui-hover', 'ui-toggle', 'machinery-loop', 'creature-scream', 'creature-growl',
   'heartbeat', 'alarm-loop', 'coin-pickup', 'thunder-distant'];
 const GENRES = ['cinematic', 'lofi', 'chiptune', 'ambient', 'action', 'horror', 'fantasy', 'ui-menu'];
-const VOICES = ['alto', 'bass', 'child', 'breathy', 'choir'];
 const CUE_SHEET_TOOLS = ['audio_bind', 'audio_stems', 'audio_convert', 'audio_check', 'audio_regress'];
 
 // copy.json is the only source of on-screen copy (headlines, lines, details, HUD
@@ -103,18 +123,18 @@ const SCENES = [
   { id: 'compose', label: '配乐', from: 14, to: 20, tools: ['audio_compose', 'audio_midi', 'audio_beats', 'audio_loudness'] },
   { id: 'interactive', label: '交互', from: 20, to: 26, tools: ['audio_react', 'audio_live'] },
   { id: 'analysis', label: '测量', from: 26, to: 32, tools: ['audio_analyze', 'audio_loudness', 'audio_master', 'audio_bus', 'audio_spatial', 'audio_stretch', 'audio_lipsync', 'audio_mouth'] },
-  { id: 'delivery', label: '交付', from: 32, to: 38, tools: ['audio_bind', 'audio_stems', 'audio_convert', 'audio_mix', 'audio_mux', 'audio_check', 'audio_regress', 'audio_tts', 'audio_voices', 'audio_sing'] },
+  { id: 'delivery', label: '交付', from: 32, to: 38, tools: ['audio_bind', 'audio_stems', 'audio_convert', 'audio_mix', 'audio_mux', 'audio_daw', 'audio_check', 'audio_regress', 'audio_tts', 'audio_voices'] },
 ];
 // Any tool a scene does not cover yet is placed by keyword, then reported.
 const TOOL_HINTS = [
-  [/mux|bind|stems|convert|check|regress|mix/, 'delivery'],
+  [/mux|bind|stems|convert|check|regress|mix|daw/, 'delivery'],
   [/spatial|bus|master|loud|analy|probe|stretch/, 'analysis'],
   [/compose|midi|beats/, 'compose'],
-  [/tts|sing|voices/, 'delivery'],
+  [/tts|voices/, 'delivery'],
   [/lipsync|mouth/, 'analysis'],
   [/react|live/, 'interactive'],
   [/design|recipe/, 'recipes'],
-  [/synth|pattern/, 'library'],
+  [/synth|pattern|graph|generate|sampler/, 'library'],
 ];
 for (const name of TOOLS) {
   if (SCENES.some((s) => s.tools.includes(name))) continue;
@@ -295,8 +315,9 @@ if (manifest) {
     }
   }
 }
-// Voice scene cut: the sung and narrating cues are dropped, not re-timed, and
-// everything that used to sit after 20 s slides 6 s earlier with its scene.
+// The 0.6.0 voice scene is cut: cue NAMES that look like a vocal take (this is a
+// cue-name filter, not a tool reference) are dropped rather than re-timed, and
+// everything after 20 s slides 6 s earlier with its scene.
 cueList = cueList.filter((c) => !/^(sing|narration|tts|vocal|voice)/i.test(c.name));
 for (const c of cueList) if (c.at >= 20) c.at = Math.max(0, Math.round((c.at - 6) * 1000) / 1000);
 cueList.sort((a, b) => a.at - b.at);
@@ -402,7 +423,7 @@ const S2 = 4, S3 = 9, S4 = 14;
 
 // Scene 2: 8 preset cells carry measured numbers. Each is measured from the cue
 // wav that demonstrates that preset family; readouts.probe wins where it covers
-// the same file (impact / bed / sing).
+// the same file (impact / bed).
 const PROBE_MAP = [
   ['impact', 'impact'], ['tick', 'ticks'], ['chime', 'ui-success'], ['zap', 'ui-error'],
   ['riser', 'riser'], ['thud', 'design-hit'], ['scrap', 'glass'], ['choir-pad', 'bed'],
@@ -556,7 +577,6 @@ const data = {
   presets: PRESETS,
   recipes: RECIPES,
   genres: GENRES,
-  voices: VOICES,
   uiClips,
   probe,
   design,
@@ -1209,7 +1229,7 @@ function buildDelivery(){
     fc.appendChild(c);
   });
   var av=q('#availchips');
-  ['audio_tts','audio_voices','audio_sing'].forEach(function(n){ av.appendChild(mk('span','chip sm',n)); });
+  ['audio_tts','audio_voices'].forEach(function(n){ av.appendChild(mk('span','chip sm',n)); });
   var ck=q('#checks');
   [['audio_check','PASS'],['audio_regress','PASS'],['audio_bind','inline'],['page','no network']].forEach(function(p){
     var d=mk('div','pass');
@@ -1708,7 +1728,7 @@ requestAnimationFrame(gateRing);
 
 // ---------------------------------------------------------------------- spec
 // Parseable contract for the verifier: duration, scenes (id/from/to/tools),
-// cues (name/at), and the 24 tool names.
+// cues (name/at), and the registered tool names.
 const spec = {
   duration: DUR,
   scenes: SCENES.map((s) => ({ id: s.id, from: s.from, to: s.to, tools: s.tools.slice() })),

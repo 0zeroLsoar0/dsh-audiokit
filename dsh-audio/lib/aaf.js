@@ -1,4 +1,4 @@
-﻿/**
+/**
  * AAF (Advanced Authoring Format) export 鈥?a written subset, and the parser
  * that proves what was written.
  *
@@ -165,7 +165,7 @@ const AAF_DATE = Object.freeze({ year: 2025, month: 1, day: 1, hour: 0, minute: 
 
 /** Product identity written into the file's Identification object. */
 const PRODUCT_NAME = 'dsh-audiokit'
-const PRODUCT_VERSION = '0.6.0'
+const PRODUCT_VERSION = '0.6.1'
 const COMPANY_NAME = 'dsh-audiokit'
 
 /**

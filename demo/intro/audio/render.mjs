@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 // Reproducible soundtrack for demo/intro (16.0 s, 120 BPM).
 // Every sound is produced by the dsh-audio-lab engines this intro introduces:
-// compose.js (bed), audio.js (impact, ticks), sing.js (voice), design.js (end).
+// compose.js (bed), audio.js (impact, ticks), design.js (end).
 // Fixed seeds, fixed sample rate, fixed peak targets -> byte-identical rebuilds.
+//
+// The 0.6.0 intro has no voice scene: the synthetic-singing tool (and its voice
+// bank) was removed from the plugin, so this soundtrack stays instrumental.
 //
 // run: <node.exe> demo/intro/audio/render.mjs   (writes .wav files + manifest.json here)
 
@@ -17,7 +20,6 @@ const LIB = 'file:///F:/Users/Administrator/Documents/deepseek-harness/default-w
 const { composeScore, renderScore } = await import(LIB + 'compose.js')
 const { renderPreset, renderPattern, finalize, measure } = await import(LIB + 'audio.js')
 const { designSound } = await import(LIB + 'design.js')
-const { singPlan, renderSing } = await import(LIB + 'sing.js')
 const { normalizePeak } = await import(LIB + 'dsp.js')
 const { encodeWav, decodeWav } = await import(LIB + 'wav.js')
 
@@ -68,15 +70,7 @@ const ticksSrc = renderPattern({ preset: 'tick', kind: 'train', to: 4, every: 0.
 const ticks = Float32Array.from(ticksSrc.samples)
 const ticksPeak = peakTo(ticks, -8)
 
-/* 4. voice.wav — sung phrase for 10.0 s (3.0 s, inside the 3.4 s window), -4 dBFS */
-const plan = singPlan({ melody: 'C4:1 E4:1 G4:2 E4:1 D4:1', lyric: 'dsh au di o', bpm: 120 })
-const voiceSrc = renderSing(plan, { sampleRate: SR, voice: 'alto', vibrato: 0.35, breath: 0.2 })
-let voice = Float32Array.from(voiceSrc.samples)
-const maxFrames = Math.round(3.4 * SR) // the phrase is 3.0 s; never let it spill past the scene
-if (voice.length > maxFrames) voice = voice.slice(0, maxFrames)
-const voicePeak = peakTo(voice, -4)
-
-/* 5. end.wav — end card at 13.5 s, ui-success design at 22050 Hz, -3 dBFS */
+/* 4. end.wav — end card at 13.5 s, ui-success design at 22050 Hz, -3 dBFS */
 const endSrc = designSound({ recipe: 'ui-success', sampleRate: SR })
 const end = Float32Array.from(endSrc.samples)
 const endPeak = peakTo(end, -3)
@@ -85,21 +79,19 @@ const written = [
   write('bed', bed, -6),
   write('impact', impact, -1),
   write('ticks', ticks, -8),
-  write('voice', voice, -4),
   write('end', end, -3)
 ]
-const actual = { bed: bedPeak, impact: impactPeak, ticks: ticksPeak, voice: voicePeak, end: endPeak }
+const actual = { bed: bedPeak, impact: impactPeak, ticks: ticksPeak, end: endPeak }
 for (const w of written) {
   const delta = Math.abs(w.peakDbfs - actual[w.name])
   if (delta > 0.05) throw new Error(`${w.name}: encode changed the peak by ${delta.toFixed(2)} dB`)
 }
 
-/* 6. manifest.json — cue times in animation seconds, matching spec.json */
+/* 5. manifest.json — cue times in animation seconds, matching spec.json */
 const cues = [
   { name: 'bed', file: 'bed.wav', at: 0, gainDb: 0, loop: true },
   { name: 'impact', file: 'impact.wav', at: 2.5, gainDb: 0, loop: false },
   { name: 'ticks', file: 'ticks.wav', at: 6.0, gainDb: 0, loop: false },
-  { name: 'voice', file: 'voice.wav', at: 10.0, gainDb: 0, loop: false },
   { name: 'end', file: 'end.wav', at: 13.5, gainDb: 0, loop: false }
 ]
 const manifest = {
