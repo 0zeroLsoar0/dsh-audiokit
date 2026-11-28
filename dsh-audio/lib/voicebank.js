@@ -15,8 +15,9 @@
  * data, not something we control.
  *
  * Limitations we do not hide:
- * - Aliases are decoded as UTF-8/UTF-16LE only (no Shift-JIS table in `node:`),
- *   so a Shift-JIS bank yields garbled non-ASCII aliases; romaji aliases work.
+ * - Aliases are decoded as UTF-8/UTF-16LE, falling back to latin1 (no Shift-JIS
+ *   table in `node:`). A Shift-JIS bank therefore yields garbled non-ASCII
+ *   aliases, but distinct aliases stay distinct; romaji aliases work.
  * - Pitch shifting moves formants with the pitch (unavoidable without a full
  *   PSOLA/phase-vocoder formant path); picking the nearest recorded take keeps
  *   the correction within a couple of semitones.
@@ -105,7 +106,14 @@ export function parseNoteScript (text, options = {}) {
 
 /**
  * Decode oto.ini bytes to text. Handles the BOMs Node can decode natively;
- * Shift-JIS is read as latin1, which keeps aliases byte-visible but garbled.
+ * anything else is tried as strict UTF-8 first and falls back to latin1.
+ *
+ * The fallback matters for real UTAU banks, which are usually Shift-JIS: a
+ * non-fatal UTF-8 decode turns every invalid byte into U+FFFD, so two different
+ * Shift-JIS aliases collapse into the same string and one silently overwrites
+ * the other. latin1 keeps the bytes distinct, so the aliases stay usable even
+ * though their glyphs are garbled (no Shift-JIS table ships with `node:`).
+ *
  * @param {Buffer} bytes - raw file bytes.
  * @returns {{ text: string, encoding: string }}
  */
@@ -116,7 +124,11 @@ function decodeOtoText (bytes) {
   if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
     return { text: bytes.toString('utf8', 3), encoding: 'utf8-bom' }
   }
-  return { text: bytes.toString('utf8'), encoding: 'utf8' }
+  try {
+    return { text: new TextDecoder('utf-8', { fatal: true }).decode(bytes), encoding: 'utf8' }
+  } catch {
+    return { text: bytes.toString('latin1'), encoding: 'latin1' }
+  }
 }
 
 /**
@@ -406,7 +418,16 @@ export function loadVoicebank (dir, options = {}) {
       decoded.set(absolutePath, null)
       return null
     }
-    const wav = decodeWav(bytes)
+    let wav
+    try {
+      wav = decodeWav(bytes)
+    } catch {
+      // A malformed take is one missing syllable, not a dead bank. Remember the
+      // failure so it is counted with the missing files and keep loading: the
+      // rest of a user's voicebank may be perfectly fine.
+      decoded.set(absolutePath, null)
+      return null
+    }
     const frames = wav.channels[0].length
     let mono = wav.channels[0]
     if (wav.channels.length > 1) {
@@ -859,7 +880,10 @@ export function renderVoicebank (plan, options = {}) {
           fade: Math.max(1, Math.round(periodSrc / step / 2))
         }
       : undefined
-    const preOut = Math.max(0, Math.round((record.preutteranceMs / 1000) * sampleRate / step))
+    // Preutterance is a *source*-time offset: convert it with the recorded rate,
+    // then divide by `step`, which already carries both the output rate and the
+    // pitch ratio. Using the output rate here doubled it for a 22.05 kHz bank.
+    const preOut = Math.max(0, Math.round((record.preutteranceMs / 1000) * record.sampleRate / step))
     const placeFrame = noteStartFrame - preOut
     earliest = Math.min(earliest, placeFrame)
     prepared.push({

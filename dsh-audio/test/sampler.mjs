@@ -476,6 +476,53 @@ console.log('\n-- validation --')
   }), /too close to the end/)
 }
 
+/* ---- 8b. a velocity-band gap is not a keymap hole ---- */
+console.log('\n-- velocity bands vs keymap holes --')
+{
+  // Key 60 is mapped, but only above velocity 0.5: a 0.2 note on it used to be
+  // skipped silently and then reported as "outside the keymap", sending the
+  // caller to widen the key range instead of the velocity range.
+  const bandMap = buildKeymap([
+    { path: tonePath, name: 'loud', rootMidi: 60, lowMidi: 60, highMidi: 60, velocityLo: 0.5, velocityHi: 1 }
+  ])
+  const mixed = renderSampler({
+    keymap: bandMap,
+    bpm: BPM,
+    notes: [
+      { midi: 60, startBeat: 0, durBeats: 1, velocity: 0.9 },
+      { midi: 60, startBeat: 1, durBeats: 1, velocity: 0.2 },
+      { midi: 64, startBeat: 2, durBeats: 1, velocity: 0.9 }
+    ]
+  })
+  const velocityWarning = mixed.report.warnings.find((warning) => /velocity band/.test(warning))
+  console.log(`  noteCount ${mixed.report.noteCount}, unmapped ${JSON.stringify(mixed.report.unmappedNotes)}, ` +
+    `velocity misses ${JSON.stringify(mixed.report.unmatchedVelocityNotes)}`)
+  console.log(`  warning: ${velocityWarning ?? '(none)'}`)
+  check('a key-mapped note with no velocity band is not reported as unmapped',
+    mixed.report.unmappedNotes.length === 1 && mixed.report.unmappedNotes[0].midi === 64,
+    JSON.stringify(mixed.report.unmappedNotes))
+  check('the velocity miss is counted separately',
+    mixed.report.unmatchedVelocityCount === 1 &&
+    mixed.report.unmatchedVelocityNotes.length === 1 &&
+    mixed.report.unmatchedVelocityNotes[0].midi === 60 &&
+    Math.abs(mixed.report.unmatchedVelocityNotes[0].velocity - 0.2) < 1e-9,
+    JSON.stringify(mixed.report.unmatchedVelocityNotes))
+  check('the report names the midi and the velocity',
+    velocityWarning !== undefined && /midi 60/.test(velocityWarning) && /velocity 0\.2/.test(velocityWarning) &&
+    /C4/.test(velocityWarning),
+    velocityWarning ?? '')
+  check('the covered note still renders', mixed.report.noteCount === 1, String(mixed.report.noteCount))
+
+  let allVelocityMiss = ''
+  try {
+    renderSampler({ keymap: bandMap, notes: [{ midi: 60, durBeats: 1, velocity: 0.2 }] })
+  } catch (error) {
+    allVelocityMiss = error.message
+  }
+  console.log(`  all notes below the band: ${allVelocityMiss}`)
+  check('an all-velocity-miss render explains the velocity bands', /matched a velocity band/.test(allVelocityMiss), allVelocityMiss)
+}
+
 /* ---- 9. determinism and performance ---- */
 console.log('\n-- determinism and performance --')
 {
@@ -563,6 +610,17 @@ console.log('\n-- audio_sampler tool --')
   check('tool layer 2 hit', layered.report.zoneHits[1].name === 'quiet' && layered.report.zoneHits[1].hits === 1)
   check('tool reports 2 zones', layered.zones === 2)
 
+  const bandMiss = await call({
+    samples: [{ path: 'tone.wav', name: 'loud', velocityLo: 0.5, velocityHi: 1 }],
+    rootMidi: 57,
+    bpm: 96,
+    notes: [{ midi: 57, velocity: 0.9 }, { midi: 57, startBeat: 1, velocity: 0.2 }],
+    out: 'out/band-miss.wav'
+  })
+  console.log(`  velocity band gap: ${bandMiss.text}`)
+  check('tool text reports the velocity band miss', /1 note\(s\) matched no velocity band/.test(bandMiss.text), bandMiss.text)
+  check('tool does not report the velocity band miss as a keymap hole', !/outside the keymap/.test(bandMiss.text), bandMiss.text)
+
   const looped = await call({ samples: 'tone.wav', rootMidi: 57, loop: { start: 0.2, end: 0.50123 }, bpm: 96, melody: 'A3:2', out: 'out/looped.wav' })
   const loopedDuration = await durationOf('out/looped.wav')
   console.log(`  looped: ${looped.text}`)
@@ -601,7 +659,7 @@ console.log('\n-- audio_sampler tool --')
   const listed = (await import('node:fs/promises')).readdir(join(cwd, 'out'))
   const files = await listed
   console.log(`  wrote ${files.length} file(s): ${files.sort().join(', ')}`)
-  check('tool wrote every requested file', files.length === 4, files.join(','))
+  check('tool wrote every requested file', files.length === 5, files.join(','))
 }
 
 await rm(cwd, { recursive: true, force: true })

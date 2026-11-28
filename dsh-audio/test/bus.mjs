@@ -480,6 +480,103 @@ console.log('\n-- renderBus: placement, pan, master, meters --')
   row('renderBus', '2 tracks, hp + compressor, offset', `${bus.frames} frames, GR ${fmt(bus.meter.gainReductionDb, 2)} dB, sum error ${sumError}`, 'master = sum(stems)')
 }
 
+/* ------------------------------------------------------- cross-rate layers -- */
+
+console.log('\n-- cross-rate layers: hi-fi resampling instead of linear interpolation --')
+{
+  // A layer on a bus of another rate used to be read by nearest-neighbour-ish
+  // linear interpolation, which has no anti-alias filter: a 13 kHz partial on a
+  // 22.05 kHz bus mirrors to 9 kHz, and a 9 kHz partial on a 48 kHz bus paints
+  // an image at 13 kHz. Both are audible, neither is the cue. The bus now runs
+  // the same polyphase windowed-sinc resampler as `audio_convert`, so the test
+  // measures the mirror band of the old linear path against the new one.
+
+  /** The old resampleLinear, verbatim, as the measurement reference. */
+  function legacyLinearResample (samples, fromRate, toRate) {
+    if (fromRate === toRate) return samples
+    const ratio = toRate / fromRate
+    const length = Math.max(1, Math.round(samples.length * ratio))
+    const out = new Float32Array(length)
+    for (let index = 0; index < length; index += 1) {
+      const position = index / ratio
+      const floor = Math.floor(position)
+      const fraction = position - floor
+      const a = samples[floor] ?? 0
+      const b = samples[floor + 1] ?? a
+      out[index] = a + (b - a) * fraction
+    }
+    return out
+  }
+
+  /** Energy in [lo, hi) by direct DFT, dB: a precise probe for "is this band empty?". */
+  function bandEnergyDb (samples, sampleRate, lo, hi, stepHz = 100) {
+    const start = Math.floor(samples.length * 0.2)
+    const count = Math.min(samples.length - start, Math.round(sampleRate * 0.8))
+    let energy = 0
+    for (let hz = lo; hz < hi; hz += stepHz) {
+      let real = 0
+      let imaginary = 0
+      const omega = TAU * hz / sampleRate
+      for (let index = 0; index < count; index += 1) {
+        const value = samples[start + index]
+        real += value * Math.cos(omega * index)
+        imaginary += value * Math.sin(omega * index)
+      }
+      const amplitude = 2 * Math.sqrt(real * real + imaginary * imaginary) / count
+      energy += amplitude * amplitude
+    }
+    return 10 * Math.log10(energy + 1e-24)
+  }
+
+  // Down: a 48 kHz layer whose 12/13/14 kHz partials are above the 22.05 kHz
+  // bus's Nyquist, so a correct resampler must remove them instead of folding
+  // them to 10.05/9.05/8.05 kHz. A 1 kHz partial is the passband control.
+  const HI = 48000
+  const LO = 22050
+  const downFrames = Math.round(1.2 * HI)
+  const downSource = new Float32Array(downFrames)
+  for (const hz of [1000, 12000, 13000, 14000]) {
+    const tone = sine(downFrames, hz, 0.22, HI)
+    for (let index = 0; index < downFrames; index += 1) downSource[index] += tone[index]
+  }
+  const downLegacy = legacyLinearResample(downSource, HI, LO)
+  const downBus = renderBus([{ id: 'hi', samples: downSource, sampleRate: HI }], {
+    sampleRate: LO,
+    master: { peakDbfs: null, limiter: false }
+  })
+  const downNew = downBus.master.channelSamples[0]
+  const downAliasOld = bandEnergyDb(downLegacy, LO, 8000, 11000)
+  const downAliasNew = bandEnergyDb(downNew, LO, 8000, 11000)
+  const downPassOld = bandEnergyDb(downLegacy, LO, 900, 1100)
+  const downPassNew = bandEnergyDb(downNew, LO, 900, 1100)
+  console.log(`  48k -> 22.05k: frames ${downBus.frames} (legacy ${downLegacy.length}), alias band 8-11 kHz ` +
+    `linear ${fmt(downAliasOld, 1)} dB -> hi-fi ${fmt(downAliasNew, 1)} dB (${fmt(downAliasOld - downAliasNew, 1)} dB lower)`)
+  console.log(`                 passband 1 kHz: linear ${fmt(downPassOld, 1)} dB -> hi-fi ${fmt(downPassNew, 1)} dB (${fmt(downPassNew - downPassOld, 2)} dB)`)
+  check('the linear resampler really did alias', downAliasOld > -70, `${fmt(downAliasOld, 1)} dB`)
+  check('48k -> 22.05k alias is at least 20 dB lower', downAliasOld - downAliasNew >= 20, `${fmt(downAliasOld - downAliasNew, 1)} dB`)
+  check('48k -> 22.05k passband is unchanged', Math.abs(downPassNew - downPassOld) <= 1, `${fmt(downPassNew - downPassOld, 2)} dB`)
+  check('48k -> 22.05k keeps the cue length', downBus.frames === downLegacy.length, `${downBus.frames} vs ${downLegacy.length}`)
+
+  // Up: a 22.05 kHz layer with a 9 kHz partial on a 48 kHz bus. Zero-image
+  // interpolation would put its image at 13.05 kHz; linear interpolation lets it
+  // through almost unattenuated.
+  const upFrames = Math.round(1.2 * LO)
+  const upSource = sine(upFrames, 9000, 0.4, LO)
+  const upLegacy = legacyLinearResample(upSource, LO, HI)
+  const upBus = renderBus([{ id: 'lo', samples: upSource, sampleRate: LO }], {
+    sampleRate: HI,
+    master: { peakDbfs: null, limiter: false }
+  })
+  const upNew = upBus.master.channelSamples[0]
+  const upImageOld = bandEnergyDb(upLegacy, HI, 12500, 14000)
+  const upImageNew = bandEnergyDb(upNew, HI, 12500, 14000)
+  console.log(`  22.05k -> 48k: image band 12.5-14 kHz linear ${fmt(upImageOld, 1)} dB -> hi-fi ${fmt(upImageNew, 1)} dB (${fmt(upImageOld - upImageNew, 1)} dB lower)`)
+  check('the linear resampler really did image', upImageOld > -70, `${fmt(upImageOld, 1)} dB`)
+  check('22.05k -> 48k image is at least 20 dB lower', upImageOld - upImageNew >= 20, `${fmt(upImageOld - upImageNew, 1)} dB`)
+  check('22.05k -> 48k keeps the cue length', upBus.frames === upLegacy.length, `${upBus.frames} vs ${upLegacy.length}`)
+  row('cross-rate bus', '48k->22.05k and 22.05k->48k', `alias ${fmt(downAliasOld - downAliasNew, 1)} dB / image ${fmt(upImageOld - upImageNew, 1)} dB lower`, 'linear resampler replaced by the polyphase kernel')
+}
+
 /* ------------------------------------------------------------ determinism -- */
 
 console.log('\n-- determinism --')

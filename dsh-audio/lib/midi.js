@@ -352,9 +352,9 @@ export function writeMidiFile (request, options = {}) {
  *
  * The hard parts, all handled here:
  * - running status (a data byte where a status byte would be, meaning "same
- *   status as last time"); system and sysex messages cancel it, meta events do
- *   not, because files in the wild rely on both readings and carrying it is the
- *   forgiving one;
+ *   status as last time"); any status byte at or above 0xF0 cancels it, which
+ *   per the SMF spec includes sysex and meta events (0xFF), not only the system
+ *   common/real-time messages of live MIDI;
  * - variable-length delta times;
  * - note pairing by FIFO per (channel, note), so a repeated pitch does not pair
  *   its first off with its second on;
@@ -413,7 +413,9 @@ function parseTrack (data, start, end, index) {
       status = running // the byte is data, leave the cursor on it
     } else {
       cursor += 1
-      // A system or sysex status cancels running status; a meta event does not.
+      // Any status byte at or above 0xF0 cancels running status: per the SMF
+      // spec that covers sysex and meta events (0xFF) as well as the system
+      // common/real-time messages, and running status may not span them.
       running = status < 0xf0 ? status : null
     }
 

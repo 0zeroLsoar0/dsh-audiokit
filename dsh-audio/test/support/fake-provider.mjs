@@ -34,7 +34,7 @@
 
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
-import { encodeWav } from '../lib/wav.js'
+import { encodeWav } from '../../lib/wav.js'
 
 /* ---- protocol constants ---- */
 

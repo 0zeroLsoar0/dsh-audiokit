@@ -50,6 +50,12 @@
  * buffers (unless the count already matches, where the input buffers are
  * returned as-is — the caller must not mutate them), so a conversion cannot
  * alias its input.
+ *
+ * It also owns the one loudness-layout decision: `loudnessChannels` returns the
+ * channels a BS.1770-4 measurement may use (LFE excluded) with their standard
+ * weights (surrounds at +1.5 dB). That is layout knowledge, not signal
+ * processing, and it keeps `audio_loudness` and the master chain from
+ * disagreeing about what a 5.1 file reads.
  */
 
 import { dbToGain } from './dsp.js'
@@ -115,6 +121,48 @@ export function layoutFor (channelCount) {
     throw new Error(`multichannel: ${channelCount} channels has no WAVE layout; supported counts are ${CHANNEL_COUNTS.join(', ')}`)
   }
   return layout
+}
+
+/* -------------------------------------------------------------- loudness -- */
+
+/**
+ * BS.1770-4 surround weight: Ls/Rs count 1.5 dB above L/R/C.
+ *
+ * The standard's channel table gives L, R and C a weight of 1.0 and each
+ * surround channel +1.5 dB (10^(1.5/20) = 1.4125). Counting them equally is the
+ * old compromise: a 5.1 file whose surrounds carry the action then reads too
+ * quiet, and a master aimed at -23 LUFS pushes the fronts too hot.
+ */
+export const SURROUND_LOUDNESS_WEIGHT = 1.41
+
+/** Channel names BS.1770-4 weights at +1.5 dB (every rear/side channel). */
+const SURROUND_CHANNEL_NAMES = new Set(['BL', 'BR', 'SL', 'SR'])
+
+/**
+ * The channels and per-channel weights a loudness measurement may use.
+ *
+ * ITU-R BS.1770 does not include an LFE channel in the loudness measure — it is
+ * an effects channel that plays up to 10 dB louder than its samples say — so it
+ * is excluded here rather than counted, and each surround channel carries the
+ * standard's +1.5 dB weight. This is the one place both `audio_loudness` and
+ * the master chain take that decision from, so the two tools cannot disagree
+ * about what a 5.1 file reads.
+ *
+ * @param {Float32Array[]} channels - channel list in WAVE order.
+ * @returns {{ measured: Float32Array[], weights: number[], lfeExcluded: boolean, layout: object }}
+ *   the metered channels, their BS.1770 weights, whether LFE was dropped, and
+ *   the layout record that says why.
+ */
+export function loudnessChannels (channels) {
+  const layout = layoutFor(channels.length)
+  const measured = []
+  const weights = []
+  for (let index = 0; index < channels.length; index += 1) {
+    if (index === layout.lfeIndex) continue
+    measured.push(channels[index])
+    weights.push(SURROUND_CHANNEL_NAMES.has(layout.names[index]) ? SURROUND_LOUDNESS_WEIGHT : 1)
+  }
+  return { measured, weights, lfeExcluded: layout.hasLfe, layout }
 }
 
 /* ------------------------------------------------------------ conversions -- */

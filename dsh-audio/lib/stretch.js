@@ -189,6 +189,15 @@ function kernelValue (table, x) {
  * Weights are normalised per output sample, so the edges neither lose level nor
  * pick up a DC step. Downsampling widens the kernel support and lowers its
  * corner, which is what keeps aliases out of the result.
+ *
+ * The window and the tap count are two different things and used to be
+ * conflated: the table's taper must always span the fixed `RESAMPLE_HALF`
+ * support, while `half` only says how many input taps the rescaled kernel
+ * reaches. Building the table at `half` spreads the Blackman taper over
+ * `half * cutoff` in the sinc's own argument, so as soon as `cutoff < 1` (every
+ * upward pitch shift) the tap support ends where the window is still at ~0.34
+ * instead of 0. That truncation costs the stopband its attenuation and folds
+ * the top octave back into the output; a fixed-support window keeps it flat.
  */
 function resampleTo (input, outFrames) {
   const inFrames = input.length
@@ -201,8 +210,12 @@ function resampleTo (input, outFrames) {
   }
   const step = inFrames / outFrames
   const cutoff = step > 1 ? 1 / step : 1
+  // Tap count: the kernel reaches `RESAMPLE_HALF` in its rescaled distance, i.e.
+  // `RESAMPLE_HALF / cutoff` input samples — the standard trade that keeps the
+  // filter's transition width (in Hz) constant instead of letting heavy
+  // downsampling degrade it.
   const half = Math.max(RESAMPLE_HALF, Math.ceil(RESAMPLE_HALF / cutoff))
-  const table = sincTable(half)
+  const table = sincTable(RESAMPLE_HALF)
   for (let i = 0; i < outFrames; i += 1) {
     const position = i * step
     const center = Math.floor(position)
@@ -213,8 +226,11 @@ function resampleTo (input, outFrames) {
       const index = center + tap
       if (index < 0 || index >= inFrames) continue
       const distance = (fraction - tap) * cutoff
-      if (distance <= -half || distance >= half) continue
-      const weight = kernelValue(table, distance < 0 ? -distance : distance)
+      const magnitude = distance < 0 ? -distance : distance
+      // Past the window's support the kernel is zero (and truncated there): the
+      // taps that remain are exactly those inside the fixed window.
+      if (magnitude >= RESAMPLE_HALF) continue
+      const weight = kernelValue(table, magnitude)
       sum += weight * input[index]
       norm += weight
     }

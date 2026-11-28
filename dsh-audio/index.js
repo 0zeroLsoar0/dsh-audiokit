@@ -43,6 +43,7 @@ import { registerStemsTools } from './lib/tools-stems.js'
 import { registerStretchTools } from './lib/tools-stretch.js'
 import { registerTools } from './lib/tools.js'
 import { registerTtsTool, registerVoicesTool } from './lib/tts.js'
+import { registerGenerateTools } from './lib/tools-generate.js'
 import { registerVisualTools } from './lib/tools-visual.js'
 import { registerVideoTools } from './lib/tools-video.js'
 
@@ -55,7 +56,12 @@ const VERSION = '0.5.10'
 /** The tool registry is required; the other seams are used when present. */
 export const inject = ['tools']
 
-const PROMPT_SECTION = [
+// The standing instruction is **deliberately not registered** as a host system
+// prompt section any more: it injected ~1.2 KB into every session (even ones
+// that never touch audio) and repeated what the tool descriptions already say.
+// The text is kept exported so an opt-in wrapper, the docs-consistency test and
+// the hand-written docs can still reuse one source of truth.
+export const PROMPT_SECTION = [
   '## Sound for HTML animation',
   '',
   'A page you author is silent by default. When the deliverable is an animation, motion graphic, transition, video or',
@@ -67,6 +73,8 @@ const PROMPT_SECTION = [
   '- many events from one rule (typing, rain, accelerating ticks) → `audio_pattern`',
   '- a designed object ("metal door slam", "magic sparkle") → `audio_design` (38 layered recipes)',
   '- your own recorded wav, pitched and mapped across a keyboard → `audio_sampler` (no bundled assets)',
+  '- an external audio generation model (Stable Audio / AudioGen / a self-hosted gateway) → `audio_generate`',
+  '  (config-driven, off until an endpoint is set, not deterministic)',
   '- combining rendered files into one cue → `audio_mix` (per-track gain and time offsets)',
   '- music: a cue with harmony and a groove → `audio_compose` (8 genres, returns beat times for sync)',
   '- narration or dialogue → `audio_tts`; singing → `audio_sing` (zero assets); `audio_voices` lists voice ids',
@@ -101,6 +109,7 @@ export function apply (ctx, config = {}) {
   registerTools(ctx)
   registerGraphTools(ctx)
   registerTtsTool(ctx, config)
+  registerGenerateTools(ctx, config)
   registerVoicesTool(ctx, config)
   registerCheckTool(ctx, config)
   registerAnalyzeTools(ctx)
@@ -136,12 +145,9 @@ export function apply (ctx, config = {}) {
   const skills = ctx.get('skills')
   if (skills !== undefined) registerSkill(skills)
 
-  const systemPrompt = ctx.get('systemPrompt')
-  if (systemPrompt !== undefined) {
-    systemPrompt.section({
-      name: 'dsh-audiokit:animation-sound',
-      order: 2950,
-      text: PROMPT_SECTION
-    })
-  }
+  // NOTE: `ctx.get('systemPrompt')` is intentionally not called. Registering a
+  // standing prompt section made every DSH session pay for audio instructions it
+  // may never need; activity is now opt-in (see `PROMPT_SECTION` above). The
+  // `animation-sound` skill is still available on demand, which is where the
+  // workflow contract belongs.
 }

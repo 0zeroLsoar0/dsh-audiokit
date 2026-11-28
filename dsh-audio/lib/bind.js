@@ -10,11 +10,21 @@
  * Sync contract (the whole point of this file):
  *   - every cue is scheduled with `source.start(t0 + at)` on the AudioContext
  *     clock, so a cue lands on its sample frame no matter how late the timer
- *     that woke the scheduler was;
- *   - `setTimeout` is only a wake-up, and the look-ahead window is wider than
- *     the wake interval, which leaves the scheduler roughly 350 ms of slack;
+ *     that woke the scheduler was — as long as the scheduler placed it before
+ *     it was due;
+ *   - `setTimeout` is only a wake-up and the look-ahead window leaves roughly
+ *     350 ms of slack (0.45 s window over a 0.1 s wake), which is what the drift
+ *     report calls the margin. A wake-up later than that margin — a throttled
+ *     background tab, a long main-thread task — starts the cue at the current
+ *     time instead, i.e. late by the excess. The report says so (`shiftBounded:
+ *     false`); it does not claim timer jitter can never move a cue;
  *   - the page drives its animation from the same clock through
  *     `dshAudio.currentTime()` instead of `performance.now()`.
+ *
+ * Loop contract: a loop cue is always stopped. On the timeline it stops at the
+ * sheet's `duration` (or 50 ms after a late start if it begins at the very end);
+ * `dshAudio.play('loopName')` schedules one `loopPhraseSeconds` phrase and
+ * stops. Nothing in the generated player can leave a source looping forever.
  */
 
 import { readFile } from 'node:fs/promises'
@@ -26,8 +36,18 @@ export const PLAYER_TIMING = Object.freeze({
   leadSeconds: 0.08,
   aheadSeconds: 0.45,
   wakeSeconds: 0.1,
-  lateSeconds: 0.02
+  lateSeconds: 0.02,
+  /**
+   * How long an on-demand `play()` of a loop cue sounds before it is stopped:
+   * two bars at 120 BPM. A loop started outside the timeline has no end to
+   * play to, and "until the page closes" is not a length a sound designer can
+   * use — one phrase is.
+   */
+  loopPhraseSeconds: 4
 })
+
+/** Shortest stop a loop gets when it starts at (or after) the end of the timeline. */
+const LOOP_MIN_SECONDS = 0.05
 
 /** Default ceiling for inline audio: a page heavier than this is usually a mistake. */
 export const DEFAULT_MAX_INLINE_BYTES = 2 * 1024 * 1024
@@ -41,6 +61,7 @@ const PLAYER_SOURCE = `/* dsh-audiokit cue player: paste in <script>; call dshAu
 (() => {
   const D = __DATA__, C = D.cues, END = D.duration
   const LEAD = __LEAD__, AHEAD = __AHEAD__, WAKE = __WAKE__, LATE = __LATE__
+  const PHRASE = __PHRASE__, MINLOOP = __MINLOOP__
   const ctx = new (window.AudioContext || window.webkitAudioContext)()
   const bus = ctx.createGain(), comp = ctx.createDynamicsCompressor()
   comp.threshold.value = -6, comp.ratio.value = 12, comp.attack.value = 0.003
@@ -63,7 +84,9 @@ const PLAYER_SOURCE = `/* dsh-audiokit cue player: paste in <script>; call dshAu
     const src = ctx.createBufferSource(), gain = ctx.createGain(), g = gain.gain
     const t = Math.max(when, ctx.currentTime), lv = Math.pow(10, (c.gainDb || 0) / 20)
     const fi = c.fadeIn || 0, fo = c.fadeOut || 0
-    const end = c.loop ? (tied && END - c.at > 0.02 ? t + END - c.at : 0) : t + buf.duration
+    // A loop always stops: tied loops end with the timeline (never less than
+    // MINLOOP after a late start), and an on-demand play() sounds one PHRASE.
+    const end = c.loop ? (tied ? Math.max(t0 + END, t + MINLOOP) : t + PHRASE) : t + buf.duration
     src.buffer = buf, src.loop = c.loop === true
     g.setValueAtTime(fi ? 0 : lv, t)
     if (fi) g.linearRampToValueAtTime(lv, t + fi)
@@ -71,7 +94,7 @@ const PLAYER_SOURCE = `/* dsh-audiokit cue player: paste in <script>; call dshAu
     const v = { name: c.name, src, gain }
     src.onended = () => unhook(v)
     src.connect(gain), gain.connect(bus), src.start(t)
-    if (c.loop && end) src.stop(end)
+    if (c.loop) src.stop(end)
     live.push(v)
     if (c.loop) loops.set(c.name, v)
     return true
@@ -81,7 +104,8 @@ const PLAYER_SOURCE = `/* dsh-audiokit cue player: paste in <script>; call dshAu
   const stopAll = () => { run = false; next = 0; t0 = 0; clearTimeout(wake); wake = 0; live.slice().forEach(halt); loops.clear() }
 
   // Cues land on the audio clock as src.start(t0 + at); this timer only wakes
-  // the scheduler, and a 0.45 s window over a 0.1 s wake cannot move a sound.
+  // the scheduler. The 0.45 s window over a 0.1 s wake leaves 350 ms of slack: a
+  // wake-up later than that starts the cue at the current time instead.
   function pump () {
     wake = 0
     if (!run || ctx.state !== 'running') return
@@ -174,6 +198,8 @@ function renderPlayer (sheet) {
     .replace('__AHEAD__', () => String(PLAYER_TIMING.aheadSeconds))
     .replace('__WAKE__', () => String(PLAYER_TIMING.wakeSeconds))
     .replace('__LATE__', () => String(PLAYER_TIMING.lateSeconds))
+    .replace('__PHRASE__', () => String(PLAYER_TIMING.loopPhraseSeconds))
+    .replace('__MINLOOP__', () => String(LOOP_MIN_SECONDS))
 }
 
 /**
@@ -182,8 +208,11 @@ function renderPlayer (sheet) {
  * Cue fields: `{ name, at, src|data, gainDb, fadeIn, fadeOut, loop }`.
  * `at` is seconds from the start of the timeline; `src` is a URL resolved
  * against `basePath`; `data` is raw base64 (or a full data URI) for inline
- * audio; `gainDb` is applied at mix time; fades are seconds; `loop: true`
- * plays until `duration`.
+ * audio; `gainDb` is applied at mix time; fades are seconds. A `loop: true`
+ * cue repeats until the sheet's `duration`; when a page calls
+ * `dshAudio.play('name')` for it outside the timeline, it sounds exactly one
+ * `PLAYER_TIMING.loopPhraseSeconds` phrase and stops — a loop cue is never
+ * left running with no end.
  *
  * @param {{ cues: object[], duration?: number, basePath?: string }} request
  * @returns {{ cues: object[], json: string, script: string }}
@@ -304,12 +333,23 @@ export async function inlineAudio (request = {}) {
 /* ---- schedule drift ---- */
 
 /**
- * Worst-case scheduling error budget, in samples, for a cue list at a device
- * sample rate. The player asks for absolute seconds; the audio clock resolves
- * a start to the nearest sample frame, so half a frame is the rounding bound,
- * and the whole budget is one sample. Timer jitter contributes zero because
- * the look-ahead window is wider than the wake interval, so a wake-up can be
- * late by up to `marginSeconds` without moving a cue.
+ * Scheduling error budget for a cue list at a device sample rate.
+ *
+ * Two different error sources, reported separately because they have different
+ * guarantees:
+ *
+ * 1. **Sample alignment** — the player asks for absolute seconds and the audio
+ *    clock resolves a start to the nearest sample frame, so the rounding bound
+ *    is half a frame; `worstCaseSamples` is that bound (at least one sample).
+ * 2. **Timer lateness** — the scheduler wakes every `wakeSeconds` and looks
+ *    `aheadSeconds` ahead, so a wake-up can be late by `marginSeconds` (0.35 s
+ *    with the shipped constants) without moving a cue at all. A *later* wake-up
+ *    starts the cue at the current time, i.e. late by the excess, and there is
+ *    no upper bound on that: a throttled background tab or a stalled main
+ *    thread can wake the timer a second later. So the report says
+ *    `timerCanShiftCue: true` and `shiftBounded: false`, and names the margin
+ *    as the condition under which a cue does not move. The previous wording
+ *    ("timer jitter contributes zero") was only true inside that margin.
  *
  * @param {{ name?: string, at: number }[]} cues
  * @param {number} [sampleRate] - device rate in Hz (48000 is the common case).
@@ -338,23 +378,34 @@ export function cueScheduleDrift (cues, sampleRate = 48000) {
     if (worst === null || errorSamples > worst.errorSamples) worst = { ...row, errorSamples }
     return row
   })
-  const budgetSamples = Math.max(1, Math.ceil(worst.errorSamples + 0.5))
+  const alignmentSamples = Math.max(1, Math.ceil(worst.errorSamples + 0.5))
+  const marginSeconds = round(PLAYER_TIMING.aheadSeconds - PLAYER_TIMING.wakeSeconds, 3)
   return {
     sampleRate: rate,
     sampleMs: round(1000 / rate, 6),
     cues: rows,
     worstCue: worst,
     roundingSamples: 0.5,
-    worstCaseSamples: budgetSamples,
-    worstCaseMs: round(budgetSamples / rate * 1000, 6),
+    /** Frame-alignment bound: the part of the budget that is bounded at all. */
+    worstCaseSamples: alignmentSamples,
+    worstCaseMs: round(alignmentSamples / rate * 1000, 6),
     lookahead: {
       aheadSeconds: PLAYER_TIMING.aheadSeconds,
       wakeSeconds: PLAYER_TIMING.wakeSeconds,
-      marginSeconds: round(PLAYER_TIMING.aheadSeconds - PLAYER_TIMING.wakeSeconds, 3),
-      timerCanShiftCue: false
+      /** Slack before a late wake-up can move a cue. */
+      marginSeconds,
+      marginSamples: Math.round(marginSeconds * rate),
+      /** A wake-up later than the margin does shift the cue (not a claim of zero). */
+      timerCanShiftCue: true,
+      /** There is no bound on how late a browser timer can be. */
+      shiftBounded: false,
+      note: `a cue keeps its frame while every wake-up is at most ${marginSeconds} s late; ` +
+        'a later wake-up starts it at the current time, late by the excess'
     },
-    math: `${budgetSamples} sample(s) = ceil(${round(worst.errorSamples, 6)} observed + 0.5 frame rounding) ` +
-      `at ${rate} Hz = ${round(budgetSamples / rate * 1000, 4)} ms`
+    math: `${alignmentSamples} sample(s) = ceil(${round(worst.errorSamples, 6)} observed + 0.5 frame rounding) ` +
+      `at ${rate} Hz = ${round(alignmentSamples / rate * 1000, 4)} ms; ` +
+      `timer: shift-free up to a ${marginSeconds} s late wake-up (ahead ${PLAYER_TIMING.aheadSeconds} s - wake ${PLAYER_TIMING.wakeSeconds} s), ` +
+      'unbounded beyond it'
   }
 }
 

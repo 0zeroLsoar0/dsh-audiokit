@@ -228,6 +228,12 @@ function summaryText (cwd, target, sourceLabel, rootLabel, rangeLabel, metrics, 
     const list = report.unmappedNotes.map((note) => midiToName(note.midi)).join(', ')
     parts.push(`${report.unmappedNotes.length} note(s) outside the keymap (${list})`)
   }
+  if (report.unmatchedVelocityCount > 0) {
+    const list = report.unmatchedVelocityNotes
+      .map((note) => `${midiToName(note.midi)}@${fmt(note.velocity, 2)}`)
+      .join(', ')
+    parts.push(`${report.unmatchedVelocityCount} note(s) matched no velocity band${list === '' ? '' : ` (${list})`}`)
+  }
   return parts.join(' · ')
 }
 

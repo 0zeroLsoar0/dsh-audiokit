@@ -326,6 +326,58 @@ console.log('\n-- edges --')
   check('a plain number[] gives the same character', fromArray.flatness < 0.05, String(fromArray.flatness))
 }
 
+/* ------------------------------------------------ non-finite samples -- */
+
+console.log('\n-- non-finite samples read as silence --')
+{
+  // A Float32Array used to be returned to the analyser untouched: one NaN made
+  // the frame energy NaN, so the spectrum collapsed and centroid/flatness came
+  // back as the round() fallback 0 while the peak/rms were meaningless. The
+  // contract is the same one the Float64Array/number[] paths already had — a
+  // non-finite sample is silence — so the poisoned buffer must analyse exactly
+  // like the same buffer with those samples zeroed.
+  const clean = Float32Array.from(harmonic440.subarray(0, RATE))
+  const dirty = Float32Array.from(clean)
+  const poisoned = [0, 7, Math.floor(clean.length / 2)]
+  dirty[poisoned[0]] = NaN
+  dirty[poisoned[1]] = Infinity
+  dirty[poisoned[2]] = -Infinity
+  const zeroed = Float32Array.from(clean)
+  for (const index of poisoned) zeroed[index] = 0
+  const dirtyReport = analyzeSound(dirty, RATE)
+  const zeroedReport = analyzeSound(zeroed, RATE)
+  console.log(`NaN/Infinity input: f0 ${fmt(dirtyReport.f0.hz, 1)} Hz, centroid ${fmt(dirtyReport.centroidHz, 0)} Hz, ` +
+    `flatness ${dirtyReport.flatness}, harmonics ${dirtyReport.harmonics.length}, peak ${fmt(dirtyReport.peakDbfs, 2)} dBFS, rms ${fmt(dirtyReport.rmsDbfs, 2)} dBFS`)
+  check('a poisoned buffer is not the silent report', dirtyReport.centroidHz > 0 && dirtyReport.harmonics.length > 0,
+    `centroid ${dirtyReport.centroidHz}, harmonics ${dirtyReport.harmonics.length}`)
+  check('poison reads as silence (same report as the zeroed buffer)', JSON.stringify(dirtyReport) === JSON.stringify(zeroedReport),
+    'reports differ')
+  check('peak and rms stay finite around the poison', Number.isFinite(dirtyReport.peakDbfs) && Number.isFinite(dirtyReport.rmsDbfs) &&
+    dirtyReport.peakDbfs === zeroedReport.peakDbfs && dirtyReport.rmsDbfs === zeroedReport.rmsDbfs,
+  `${dirtyReport.peakDbfs}/${dirtyReport.rmsDbfs}`)
+  check('flatness is measured rather than zeroed', dirtyReport.flatness === zeroedReport.flatness && dirtyReport.flatness >= 0,
+    String(dirtyReport.flatness))
+  // Flatness is only meaningfully non-zero on a broadband signal (a 1/n stack
+  // rounds to 0.0000 by nature, not because of the poison), so the "not zero"
+  // half of this contract is checked on noise.
+  const dirtyNoise = Float32Array.from(white)
+  const zeroedNoise = Float32Array.from(white)
+  for (const index of [0, 1000, 40000]) {
+    dirtyNoise[index] = index === 0 ? NaN : index === 1000 ? Infinity : -Infinity
+    zeroedNoise[index] = 0
+  }
+  const dirtyNoiseReport = analyzeSound(dirtyNoise, RATE)
+  const zeroedNoiseReport = analyzeSound(zeroedNoise, RATE)
+  console.log(`poisoned noise: centroid ${fmt(dirtyNoiseReport.centroidHz, 0)} Hz, flatness ${dirtyNoiseReport.flatness}, ` +
+    `noisiness ${dirtyNoiseReport.noisiness}, peak ${fmt(dirtyNoiseReport.peakDbfs, 2)} dBFS`)
+  check('poisoned noise keeps a real centroid and flatness', dirtyNoiseReport.centroidHz > 0 && dirtyNoiseReport.flatness > 0.3,
+    `centroid ${dirtyNoiseReport.centroidHz}, flatness ${dirtyNoiseReport.flatness}`)
+  check('poisoned noise matches the zeroed buffer', JSON.stringify(dirtyNoiseReport) === JSON.stringify(zeroedNoiseReport))
+  const dirtyCentroid = analyzeSound((() => { const buffer = Float32Array.from(clean); buffer[3] = NaN; return buffer })(), RATE)
+  check('a single NaN does not hide the pitch', Math.abs(dirtyCentroid.f0.hz - 440) / 440 <= 0.01 && dirtyCentroid.f0.confidence > 0.5,
+    `${dirtyCentroid.f0.hz} Hz @ ${dirtyCentroid.f0.confidence}`)
+}
+
 /* ----------------------------------------------------------- tool layer -- */
 
 console.log('\n-- audio_analyze tool --')

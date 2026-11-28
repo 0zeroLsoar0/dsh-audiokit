@@ -854,10 +854,12 @@ function renderLayer (master, plan, sampleRate, cfg, rand, gain, offsetSamples, 
       voice.nasal = first.nasal
     }
 
-    // Consonant noise is its own buffer.
+    // Consonant noise is its own buffer. It carries the same velocity as the
+    // voice: scaling only the voiced path made a soft note keep a full-level
+    // consonant, so the syllable got *noisier* as the note got quieter.
     if (entry !== null && consonantSamples > 0) {
       const noise = renderConsonantNoise(entry, segments[0].target.f[1], consonantSamples, sampleRate, rand)
-      addInto(master, noise, noteStart + offsetSamples, 1)
+      addInto(master, noise, noteStart + offsetSamples, velocity)
     }
 
     let targetIndex = 0

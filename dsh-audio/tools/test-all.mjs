@@ -24,8 +24,14 @@
  * extra `[skip]` marker; no file name is special-cased, and a SKIP is never a
  * failure as long as the process exits 0.
  *
+ * A file that exits 0 without printing `OK:` or `SKIP:` is a failure, not a
+ * pass: a script that checks nothing would otherwise be counted as a passing
+ * test, hiding the checks it was supposed to make. Every executable file under
+ * `test/` must state its own verdict; reusable helpers belong in
+ * `test/support/`, which discovery does not scan.
+ *
  * Output is captured and capped: a passing file prints nothing but its `ok`
- * line, a failing file prints the tail of its stdout/stderr. A full 40-file run
+ * line, a failing file prints the tail of its stdout/stderr. A full-suite run
  * therefore stays a short list even though single tests are chatty.
  */
 
@@ -236,7 +242,9 @@ function durationText (ms) {
  * Decide what a finished child means.
  * A SKIP is a normal exit that printed a `SKIP:` line; it stays `ok` and only
  * gets an extra marker, because whether a machine has ffmpeg/network is not a
- * code defect.
+ * code defect. An exit 0 with neither marker is not a pass: the file may be a
+ * helper module or a script that asserts nothing, and counting it as `ok`
+ * would silently shorten the suite.
  */
 function classify (result) {
   if (result.timedOut) return { status: 'FAIL', kind: `timeout after ${options.timeoutMs} ms`, skip: false }
@@ -245,7 +253,15 @@ function classify (result) {
     const detail = result.signal === null ? `exit code ${result.code}` : `killed by signal ${result.signal}`
     return { status: 'FAIL', kind: detail, skip: false }
   }
-  const skip = /(^|\n)\s*SKIP:/.test(result.stdout + result.stderr)
+  const output = result.stdout + result.stderr
+  const skip = /(^|\n)\s*SKIP:/.test(output)
+  if (!skip && !/(^|\n)\s*OK:/.test(output)) {
+    return {
+      status: 'FAIL',
+      kind: 'exited 0 but printed neither "OK:" nor "SKIP:" (a file that checks nothing is not a passing test)',
+      skip: false
+    }
+  }
   return { status: 'ok', kind: '', skip }
 }
 

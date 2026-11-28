@@ -37,7 +37,8 @@
  */
 
 import { execFile, execFileSync } from 'node:child_process'
-import { mkdir, stat, unlink } from 'node:fs/promises'
+import { randomBytes } from 'node:crypto'
+import { chmod, mkdir, realpath, rename, stat, unlink } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path'
 import { findFfmpeg as findFfmpegCached } from './providers-edge.js'
@@ -156,6 +157,170 @@ function optionalInteger (caller, key, value, fallback, min, max) {
 /** True when a value is a usable absolute/relative path string. */
 function pathText (value) {
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : null
+}
+
+/* ---- safe output paths ---- */
+
+/** Output extension → the ffmpeg muxer that writes that container. */
+const CONTAINER_MUXERS = Object.freeze({
+  mp4: 'mp4',
+  m4v: 'mp4',
+  mov: 'mov',
+  mkv: 'matroska',
+  webm: 'webm'
+})
+
+/**
+ * Resolve a path to its canonical form for identity comparisons.
+ *
+ * `realpath` collapses symlinks, junctions and Windows' short (8.3) spellings, so
+ * two names for one file compare equal. A path that does not exist yet cannot be
+ * anyone's input, so its directory is canonicalised instead and the leaf kept —
+ * that still catches the case where the parent is a link.
+ * @param {string} path - relative or absolute path.
+ * @returns {Promise<string>} a canonical absolute path.
+ */
+async function canonicalPath (path) {
+  const absolute = resolve(path)
+  try {
+    return await realpath(absolute)
+  } catch {
+    try {
+      return join(await realpath(dirname(absolute)), basename(absolute))
+    } catch {
+      return absolute
+    }
+  }
+}
+
+/** Compare two canonical paths with the platform's filename case rules. */
+function sameCanonicalPath (left, right) {
+  return process.platform === 'win32'
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right
+}
+
+/**
+ * True when two paths name the same file, by canonical path or by inode.
+ *
+ * The inode check is what catches hard links, which `realpath` cannot see; it is
+ * skipped where the filesystem reports no usable inode (some Windows volumes
+ * report 0).
+ * @param {string} left - first path.
+ * @param {string} right - second path.
+ * @returns {Promise<boolean>} true when both paths are one file.
+ */
+async function namesSameFile (left, right) {
+  if (sameCanonicalPath(await canonicalPath(left), await canonicalPath(right))) return true
+  let leftStat
+  let rightStat
+  try {
+    [leftStat, rightStat] = await Promise.all([stat(left, { bigint: true }), stat(right, { bigint: true })])
+  } catch {
+    return false
+  }
+  if (leftStat.ino === 0n || rightStat.ino === 0n) return false
+  return leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino
+}
+
+/**
+ * Refuse an output path that is also one of the operation's inputs.
+ *
+ * This is the data-loss guard. ffmpeg runs with `-y`, and a failed encode used to
+ * be cleaned up by unlinking the *target* path — so an output that pointed at an
+ * input would truncate the source while it was being decoded and then delete it
+ * when the encode failed. The check runs before any binary is located or spawned,
+ * so a refused call cannot even start ffmpeg.
+ * @param {string} caller - function name for the error message.
+ * @param {string} label - name of the output argument (`out` / `outPath`).
+ * @param {string} outputPath - resolved output path.
+ * @param {Record<string, string|undefined>} inputs - named input paths.
+ * @throws {Error} `OUTPUT_IS_INPUT` when `outputPath` is one of `inputs`.
+ */
+async function refuseOutputOverInput (caller, label, outputPath, inputs) {
+  for (const [key, input] of Object.entries(inputs)) {
+    if (pathText(input) === null) continue
+    if (!(await namesSameFile(outputPath, input))) continue
+    const error = new Error(
+      `${caller}: ${label} must differ from the input ${key} (${basename(input)}); ` +
+      'writing the output over a file ffmpeg is reading would destroy the source — choose another ' +
+      `${label} path`
+    )
+    error.code = 'OUTPUT_IS_INPUT'
+    throw error
+  }
+}
+
+/**
+ * The temporary path a mux/extract writes to before renaming the finished file
+ * into place.
+ *
+ * It lives in the target's own directory on purpose: `rename` is atomic only
+ * within one filesystem (and on Windows it only replaces an existing file on the
+ * same volume), so a temp directory would degrade the final step into a copy. The
+ * name is dot-prefixed — a leftover from a hard crash reads as a temp file, not as
+ * a deliverable — and carries the pid plus 8 random bytes, so two concurrent
+ * writes to one target can never collide.
+ * @param {string} outputPath - the final path.
+ * @returns {string} `.<name>.<pid>-<rand>.tmp` in `outputPath`'s directory.
+ */
+export function temporaryOutputPath (outputPath) {
+  const target = requiredPath('temporaryOutputPath', 'outputPath', outputPath)
+  const absolute = resolve(target)
+  const suffix = randomBytes(8).toString('hex')
+  return join(dirname(absolute), `.${basename(absolute)}.${process.pid}-${suffix}.tmp`)
+}
+
+/** The ffmpeg muxer name for a plan/output pair, or null when it is unknowable. */
+function outputMuxer (plan, outputPath) {
+  const declared = typeof plan.container === 'string' ? plan.container.trim().toLowerCase() : ''
+  if (Object.values(CONTAINER_MUXERS).includes(declared)) return declared
+  const extension = extname(outputPath).replace(/^\./, '').toLowerCase()
+  return CONTAINER_MUXERS[extension] ?? null
+}
+
+/**
+ * Copy an existing target's permission bits onto the finished temp file.
+ *
+ * `rename` replaces the directory entry, so without this an overwrite would
+ * silently adopt whatever mode ffmpeg gave the temp file. A missing target is the
+ * normal first-write case and is not an error; Windows only has the read-only bit
+ * to preserve.
+ */
+async function inheritTargetMode (tempPath, outputPath) {
+  try {
+    const info = await stat(outputPath)
+    if (info.isFile()) await chmod(tempPath, info.mode & 0o777)
+  } catch { /* no existing target to inherit from */ }
+}
+
+/**
+ * Atomically move the finished temp file onto the target path.
+ *
+ * This is the only step that touches the caller's `out`: either the old file is
+ * still there (the rename failed and only the temp is removed) or the whole new
+ * file replaces it — never a truncated or half-written file at the deliverable's
+ * path.
+ * @param {string} caller - function name for the error message.
+ * @param {string} tempPath - completed temp file.
+ * @param {string} outputPath - final path to publish to.
+ * @throws {Error} `RENAME_FAILED` when the target cannot be replaced.
+ */
+async function publishTempOutput (caller, tempPath, outputPath) {
+  try {
+    await inheritTargetMode(tempPath, outputPath)
+    await rename(tempPath, outputPath)
+  } catch (failure) {
+    await unlink(tempPath).catch(() => {})
+    const reason = failure?.code ?? failure?.message ?? 'rename failed'
+    const error = new Error(
+      `${caller}: could not replace ${outputPath} with the finished file (${reason}); ` +
+      'the existing file was left untouched'
+    )
+    error.code = 'RENAME_FAILED'
+    error.cause = failure
+    throw error
+  }
 }
 
 /**
@@ -833,8 +998,15 @@ async function measureAudioPeak (ffmpegPath, path, options = {}) {
  * Runs ffmpeg with a hard timeout (120 s by default), never streams media to the
  * caller, and turns a non-zero exit into an error that quotes the last stderr
  * lines — the difference between "mux failed" and "exit 1: Stream map '0:a:0'
- * matches no streams". On failure any half-written output is removed, so a
- * broken deliverable is never left at the target path.
+ * matches no streams".
+ *
+ * Writes are staged: ffmpeg writes `.<name>.<pid>-<rand>.tmp` in the target's
+ * directory and only a successful encode is renamed onto the target. The caller's
+ * `out` is therefore never opened for writing and never unlinked by this module —
+ * a failed mux leaves an existing deliverable exactly as it was and removes only
+ * the temp file this call created. An `out` that is one of the inputs is refused
+ * before ffmpeg is located or spawned, because `-y` would otherwise truncate the
+ * source while it is being read.
  * @param {object} plan - the object `planMux` returned.
  * @param {{ out?: string, ffmpegPath?: string, timeoutMs?: number,
  *   measurePeak?: boolean }} [options] - `out` overrides the plan's path;
@@ -845,18 +1017,24 @@ async function measureAudioPeak (ffmpegPath, path, options = {}) {
  *   media: object|null, measured: boolean, audioPeakDbfs: number|null,
  *   warnings: string[], estimated: object
  * }>}
- * @throws when ffmpeg is absent, the output path is missing, or ffmpeg fails.
+ * @throws when the output path is missing, `out` is an input, ffmpeg is absent,
+ *   or ffmpeg fails.
  */
 export async function runMux (plan, options = {}) {
   if (plan === null || typeof plan !== 'object' || !Array.isArray(plan.args)) {
     throw new Error('runMux: needs a plan object from planMux (with an args array)')
   }
-  const ffmpegPath = requireFfmpeg({ ffmpegPath: options.ffmpegPath })
   const requested = pathText(options.out) ?? pathText(plan.outputPath)
   if (requested === null) {
     throw new Error('runMux: no output path; pass options.out or set out when planning')
   }
   const outputPath = resolve(requested)
+  // Data-loss guard, deliberately before ffmpeg discovery: an output that is also
+  // an input must fail without spawning anything, not after the source is gone.
+  await refuseOutputOverInput('runMux', 'out', outputPath, {
+    video: plan.inputs?.video,
+    audio: plan.inputs?.audio
+  })
   // The plan chose an audio codec and muxer flags for one container; a different
   // extension here would silently ask ffmpeg for something the plan did not
   // build for (aac into webm, for example), so refuse instead of half-muxing.
@@ -870,9 +1048,24 @@ export async function runMux (plan, options = {}) {
       `(${plan.container ?? 'unknown'} container, ${plan.audioCodec ?? 'unknown'} audio); call planMux with the new out`
     )
   }
+  const ffmpegPath = requireFfmpeg({ ffmpegPath: options.ffmpegPath })
+  // The temp file ends in `.tmp`, so ffmpeg can no longer infer the muxer from the
+  // extension; state it explicitly (the plan already chose the codecs for it)
+  // instead of letting ffmpeg guess a container the plan did not build for.
+  const muxer = outputMuxer(plan, outputPath)
+  if (muxer === null) {
+    throw new Error(
+      `runMux: cannot tell which container ${basename(outputPath)} is meant to be; ` +
+      'plan the mux with planMux so the muxer is known'
+    )
+  }
   await mkdir(dirname(outputPath), { recursive: true })
 
-  const args = [...plan.args, outputPath]
+  // Same directory as the target, so the final rename is an atomic replace rather
+  // than a cross-volume copy; random and pid-stamped, so concurrent writers to one
+  // target cannot collide.
+  const tempPath = temporaryOutputPath(outputPath)
+  const args = [...plan.args, '-f', muxer, tempPath]
   const command = formatCommand(ffmpegPath, args)
   const timeoutMs = optionalInteger('runMux', 'timeoutMs', options.timeoutMs, MEDIA_LIMITS.defaultTimeoutMs, 1000, 3600000)
 
@@ -880,7 +1073,10 @@ export async function runMux (plan, options = {}) {
   try {
     result = await runProcess(ffmpegPath, args, { timeoutMs })
   } catch (failure) {
-    await unlink(outputPath).catch(() => {})
+    // Only the temp file this call created is removed. The caller's `out` is never
+    // unlinked: it may be an old deliverable, and a failed encode must leave it
+    // untouched.
+    await unlink(tempPath).catch(() => {})
     const hint = plan.estimated?.mode === 'mix'
       ? 'if the video has no original audio track, plan the mux with mode replace'
       : ''
@@ -889,10 +1085,16 @@ export async function runMux (plan, options = {}) {
 
   let bytes = 0
   try {
-    bytes = (await stat(outputPath)).size
+    bytes = (await stat(tempPath)).size
   } catch {
-    throw new Error(`runMux: ffmpeg reported success but ${outputPath} was not written`)
+    await unlink(tempPath).catch(() => {})
+    throw new Error(`runMux: ffmpeg reported success but ${basename(outputPath)} was not written`)
   }
+
+  // Publish only after ffmpeg exited 0 and the finished file has a size: from here
+  // on every remaining step tolerates failure, so a successful rename cannot be
+  // followed by an error that would leave the caller unsure what is at `out`.
+  await publishTempOutput('runMux', tempPath, outputPath)
 
   // The probe is the only proof the file is playable; when ffprobe is missing
   // the plan's own timeline is reported as an estimate rather than a fact.
@@ -1097,6 +1299,11 @@ function extractionHint (stderr) {
  * law, so a mono cue that `planMux` upmixed to stereo (-3.01 dB per channel)
  * measures 3 dB below its rendered amplitude here — the stereo deliverable holds
  * the same total power, and the downmix cannot clip.
+ *
+ * Like `runMux`, the extraction is staged: ffmpeg writes a temp file beside the
+ * target and only a successful encode is renamed onto it. An `outPath` that is the
+ * source is refused before ffmpeg runs, and a failure removes only the temp file —
+ * an existing wav at `outPath` is never deleted.
  * @param {string} path - media file with audio.
  * @param {string} outPath - target `.wav`; its directory is created.
  * @param {{ sampleRate?: number, channels?: 1|2, ffmpegPath?: string,
@@ -1105,18 +1312,23 @@ function extractionHint (stderr) {
  *   outputPath: string, bytes: number, durationSeconds: number|null,
  *   sampleRate: number, channels: number, command: string, stderrTail: string
  * }>}
- * @throws when ffmpeg is absent, the source has no audio, or ffmpeg fails.
+ * @throws when `outPath` is the source, ffmpeg is absent, the source has no audio,
+ *   or ffmpeg fails.
  */
 export async function extractAudio (path, outPath, options = {}) {
   const source = requiredPath('extractAudio', 'path', path)
   const destination = requiredPath('extractAudio', 'outPath', outPath)
   const absoluteSource = isAbsolute(source) ? source : resolve(source)
   const absoluteOut = resolve(destination)
+  // Data-loss guard, before ffmpeg discovery: `-y` would truncate the source while
+  // it is being read, and the failure cleanup must never be able to delete it.
+  await refuseOutputOverInput('extractAudio', 'outPath', absoluteOut, { source: absoluteSource })
   const ffmpegPath = requireFfmpeg({ ffmpegPath: options.ffmpegPath })
   const sampleRate = optionalInteger('extractAudio', 'sampleRate', options.sampleRate, 48000, MEDIA_LIMITS.minSampleRate, MEDIA_LIMITS.maxSampleRate)
   const channels = Number(options.channels) === 2 ? 2 : 1
   await mkdir(dirname(absoluteOut), { recursive: true })
 
+  const tempPath = temporaryOutputPath(absoluteOut)
   const args = [
     '-hide_banner', '-nostdin', '-loglevel', 'error', '-y',
     '-i', absoluteSource,
@@ -1125,16 +1337,26 @@ export async function extractAudio (path, outPath, options = {}) {
     '-ar', String(sampleRate),
     '-c:a', 'pcm_s16le',
     '-f', 'wav',
-    absoluteOut
+    tempPath
   ]
   const command = formatCommand(ffmpegPath, args)
   let result
   try {
     result = await runProcess(ffmpegPath, args, { timeoutMs: options.timeoutMs ?? MEDIA_LIMITS.defaultTimeoutMs })
   } catch (failure) {
-    await unlink(absoluteOut).catch(() => {})
+    // Only this call's temp file is removed; an old wav at `outPath` stays.
+    await unlink(tempPath).catch(() => {})
     throw processError(`extractAudio (${basename(absoluteSource)})`, failure, extractionHint(failure?.stderr))
   }
+
+  let bytes = 0
+  try {
+    bytes = (await stat(tempPath)).size
+  } catch {
+    await unlink(tempPath).catch(() => {})
+    throw new Error(`extractAudio: ffmpeg reported success but ${basename(absoluteOut)} was not written`)
+  }
+  await publishTempOutput('extractAudio', tempPath, absoluteOut)
 
   // Report the file's real duration from the wav header rather than trusting the
   // arithmetic: a mismatched rate here would desynchronise everything downstream.
@@ -1148,7 +1370,7 @@ export async function extractAudio (path, outPath, options = {}) {
 
   return {
     outputPath: absoluteOut,
-    bytes: (await stat(absoluteOut)).size,
+    bytes,
     durationSeconds,
     sampleRate: finalRate,
     channels,

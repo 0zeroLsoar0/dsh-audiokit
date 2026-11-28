@@ -16,9 +16,11 @@
  *     aperture and energy move on a 30-60 ms time constant across every shape
  *     change — while the label itself switches once, and one-frame chatter is
  *     removed.
- *   - Scheduling is musical: one syllable per half beat up to 120 bpm (312 ms at
- *     96 bpm, close to conversational Mandarin), one per beat above it so a fast
- *     cue does not push the mouth past five shapes a second.
+ *   - Scheduling is musical: one syllable per half beat (312 ms at 96 bpm, close
+ *     to conversational Mandarin), held at a 190 ms floor so a fast cue does not
+ *     push the mouth past five shapes a second. The slot is one continuous,
+ *     monotone formula of bpm — a tempo branch at 120 bpm used to make the very
+ *     next bpm 49 % slower.
  *   - Deterministic: the same request always returns byte-identical frames. No
  *     clock, no randomness, no locale-sensitive formatting.
  *
@@ -261,10 +263,15 @@ function isLetterOrDigit (char) {
   return /[\p{L}\p{N}]/u.test(char)
 }
 
-/** Most frequent: half a beat is the natural syllable slot, as documented. */
+/**
+ * Syllable slot: half a beat, with a 190 ms floor so a fast cue keeps one
+ * visible shape per syllable instead of flickering. The floor is a constant
+ * rather than a tempo branch: a `bpm <= 120 ? beat/2 : beat*0.75` branch made
+ * 121 bpm 49 % *slower* than 120, so the slot is non-increasing in bpm here.
+ */
 function syllableSeconds (bpm) {
   const beat = 60 / bpm
-  const seconds = bpm <= 120 ? beat / 2 : beat * 0.75
+  const seconds = Math.max(beat / 2, 0.19)
   return clamp(seconds, 0.12, 1.5)
 }
 

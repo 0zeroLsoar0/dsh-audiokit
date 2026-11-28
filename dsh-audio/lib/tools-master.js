@@ -29,7 +29,7 @@ import {
 import { PRESETS } from './dsp.js'
 import { analyzeLoudness, truePeak } from './lufs.js'
 import { masterChain, masterPresets } from './master.js'
-import { CHANNEL_COUNTS, encodeAnyWav, fitChannels, layoutFor } from './multichannel.js'
+import { CHANNEL_COUNTS, encodeAnyWav, fitChannels, layoutFor, loudnessChannels } from './multichannel.js'
 import { decodeWav } from './wav.js'
 
 const PRESET_NAMES = Object.keys(PRESETS)
@@ -97,15 +97,14 @@ function foldToMono (channels) {
 
 /**
  * Analyse a channel list the way the master chain does: LFE excluded from the
- * loudness sum, the worst channel supplying the true peak (the meter already
- * reports the maximum over the channels it is given).
+ * loudness sum, BS.1770-4 surround weights applied, the worst channel supplying
+ * the true peak (the meter already reports the maximum over the channels it is
+ * given). The channel decision comes from `multichannel.loudnessChannels`, the
+ * same helper `lib/master.js` and `audio_loudness` use.
  */
 function analyseChannels (channels, sampleRate) {
-  const layout = layoutFor(channels.length)
-  const measured = layout.hasLfe ? channels.filter((_, index) => index !== layout.lfeIndex) : channels
-  return measured.length === 1
-    ? analyzeLoudness(measured[0], sampleRate)
-    : analyzeLoudness(measured[0], sampleRate, { channels: measured })
+  const { measured, weights } = loudnessChannels(channels)
+  return analyzeLoudness(measured[0], sampleRate, { channels: measured, weights })
 }
 
 /** `mono`, `stereo`, or `6-ch 5.1`. */

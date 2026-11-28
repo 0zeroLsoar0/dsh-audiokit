@@ -93,7 +93,7 @@ function cueSchema () {
 export function registerMouthTools (ctx) {
   ctx.tools.register({
     name: 'audio_mouth',
-    description: 'Build a mouth track from text alone (a caption, a typewriter line, a silent comic): the same per-frame viseme/openness/energy shape audio_lipsync returns, so one page can drive both. Schedules one syllable per half beat (one per beat above 120 bpm), closes the mouth on punctuation, and writes json/srt/css/ae when `out` is given. Use it when there is no voice audio yet; use audio_lipsync when there is.',
+    description: 'Build a mouth track from text alone (a caption, a typewriter line, a silent comic): the same per-frame viseme/openness/energy shape audio_lipsync returns, so one page can drive both. Schedules one syllable per half beat, with a 190 ms floor so fast tempos stay legible (the slot never gets longer at a faster bpm), closes the mouth on punctuation, and writes json/srt/css/ae when `out` is given. Use it when there is no voice audio yet; use audio_lipsync when there is.',
     parameters: {
       type: 'object',
       properties: {

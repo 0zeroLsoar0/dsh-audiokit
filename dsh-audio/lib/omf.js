@@ -1,5 +1,5 @@
 /**
- * OMF (OMFI v2) â€?a documented skeleton, not an exporter.
+ * OMF (OMFI v2) â€”a documented skeleton, not an exporter.
  *
  * OMF Interchange is Avid's predecessor to AAF, and it is still the format some
  * Pro Tools workflows ask for. It shares the container with AAF (an MS-CFB
@@ -14,14 +14,14 @@
  * result and in `docs/INTEROP.zh.md`: a container with the stream an OMFI file
  * starts with, holding a machine-readable manifest of the objects an OMFI
  * writer would have to produce, plus an explicit marker that this is not an OMF
- * document. Avid will not open it, and the file itself says so in ASCII â€?the
+ * document. Avid will not open it, and the file itself says so in ASCII â€”the
  * alternative, emitting plausible-looking OMFI objects whose class layouts were
  * guessed, would produce a file that fails later and hides the reason.
  *
  * What a real OMFI v2 writer needs, in the order it would be built:
  *
  * 1. the 1024-byte OMFI header record (magic, version, byte order, object
- *    table entries) â€?format known, byte layout to be transcribed from the
+ *    table entries) â€”format known, byte layout to be transcribed from the
  *    specification;
  * 2. the Class A/B object streams (`OMFI:C...` / `OMFI:B...`), each with a
  *    length-prefixed big-endian property table;
@@ -31,8 +31,8 @@
  *    sample rates, and a media file alongside the project.
  *
  * Estimated effort from the AAF work in this plugin: the container is done
- * (`lib/cfb.js`), and the object writer is comparable to `lib/aaf.js` â€?roughly
- * 400â€?00 lines plus a test â€?but without a reference implementation to check
+ * (`lib/cfb.js`), and the object writer is comparable to `lib/aaf.js` â€”roughly
+ * 400â€”00 lines plus a test â€”but without a reference implementation to check
  * bytes against, "it opens in Avid" can only be proven on a machine with Avid
  * installed. That is the honest blocker, and it is why this ships as a skeleton.
  */

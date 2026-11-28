@@ -202,6 +202,118 @@ export function measure (samples, sampleRate) {
   }
 }
 
+/**
+ * Every-channel measurements, for a file that is not mono.
+ *
+ * `measure` folds a file to one buffer, and that fold lies in the two cases a
+ * deliverable actually hits: a clipped channel averaged with a silent one stops
+ * reporting clipping (1.2 and 0 average to 0.6), and an out-of-phase stereo pair
+ * averages to digital silence. So the numbers that describe a *file* are taken
+ * across all of its channels:
+ *
+ * - peak, clipping count and DC offset are the **maximum** over the channels
+ *   (a file is as clipped as its worst channel, and as DC-shifted);
+ * - RMS is the **power average** (`sqrt(sum of squares / all samples)`), which
+ *   is what the file actually delivers as sound and matches `measure` exactly
+ *   for a mono file;
+ * - the waveform-derived metrics `measure` also returns (onset count, spectrum,
+ *   loop seam) come from the channel with the highest peak, because that is the
+ *   channel a listener hears.
+ *
+ * @param {Float32Array[]} channels - one buffer per channel (WAVE order).
+ * @param {number} sampleRate - Hz.
+ * @returns {object} the shape `measure` returns, plus `channelCount` and, when
+ *   there is more than one channel, `perChannel` and `analysisChannel`.
+ */
+export function measureChannels (channels, sampleRate) {
+  if (!Array.isArray(channels) || channels.length === 0) throw new Error('measureChannels needs at least one channel buffer')
+  for (const channel of channels) {
+    if (channel === null || channel === undefined || typeof channel.length !== 'number') {
+      throw new Error('measureChannels needs a sample buffer for every channel')
+    }
+  }
+  const frames = Math.min(...channels.map((channel) => channel.length))
+  if (frames === 0) return { ...measure(new Float32Array(0), sampleRate), channelCount: channels.length }
+
+  const db = (value) => (value > 0 ? Number((20 * Math.log10(value)).toFixed(2)) : -120)
+  const perChannel = []
+  let peak = 0
+  let peakChannel = 0
+  let clipping = 0
+  let worstDc = 0
+  let sumSquaresAll = 0
+  for (let index = 0; index < channels.length; index += 1) {
+    const channel = channels[index]
+    let channelPeak = 0
+    let channelClipped = 0
+    let channelSum = 0
+    let channelSquares = 0
+    for (let i = 0; i < frames; i += 1) {
+      const value = channel[i]
+      const magnitude = Math.abs(value)
+      if (magnitude > channelPeak) channelPeak = magnitude
+      if (magnitude >= 0.999) channelClipped += 1
+      channelSum += value
+      channelSquares += value * value
+    }
+    const dc = channelSum / frames
+    if (channelPeak > peak) {
+      peak = channelPeak
+      peakChannel = index
+    }
+    if (channelClipped > clipping) clipping = channelClipped
+    if (Math.abs(dc) > Math.abs(worstDc)) worstDc = dc
+    sumSquaresAll += channelSquares
+    perChannel.push({
+      peakDbfs: db(channelPeak),
+      rmsDbfs: db(Math.sqrt(channelSquares / frames)),
+      clipping: channelClipped,
+      dcOffset: Number(dc.toFixed(5))
+    })
+  }
+
+  // The power average: a mono file comes out bit-identical to `measure`.
+  const rms = Math.sqrt(sumSquaresAll / (frames * channels.length))
+  const base = measure(channels[peakChannel], sampleRate)
+  const metrics = {
+    ...base,
+    peakDbfs: db(peak),
+    rmsDbfs: db(rms),
+    crestDb: Number((20 * Math.log10(Math.max(peak, 1e-6) / Math.max(rms, 1e-6))).toFixed(2)),
+    dcOffset: Number(worstDc.toFixed(5)),
+    clipping,
+    channelCount: channels.length
+  }
+  if (channels.length > 1) {
+    metrics.perChannel = perChannel
+    metrics.analysisChannel = peakChannel
+  }
+  return metrics
+}
+
+/**
+ * Per-frame maximum magnitude across the channels: the envelope a peak meter
+ * follows, and the signal that says whether a file is "almost silent" without
+ * letting an out-of-phase pair cancel itself.
+ *
+ * @param {Float32Array[]} channels - one buffer per channel.
+ * @returns {Float32Array} per-frame absolute peak.
+ */
+export function peakEnvelope (channels) {
+  if (!Array.isArray(channels) || channels.length === 0) throw new Error('peakEnvelope needs at least one channel buffer')
+  const frames = Math.min(...channels.map((channel) => channel.length))
+  const out = new Float32Array(frames)
+  for (let i = 0; i < frames; i += 1) {
+    let magnitude = 0
+    for (const channel of channels) {
+      const value = Math.abs(channel[i])
+      if (value > magnitude) magnitude = value
+    }
+    out[i] = magnitude
+  }
+  return out
+}
+
 /* ------------------------------------------------------------- rendering -- */
 
 function frameCount (seconds, sampleRate) {
@@ -383,21 +495,32 @@ export function renderPattern (request) {
     return progress
   }
 
+  // Train spacing is `span / count`, not `span / (count - 1)`: `count` events
+  // placed across the span leaves one gap after the last one, so the last event
+  // starts *inside* the file instead of exactly at its end (where the trim below
+  // used to cut it off completely, making `events` a lie). The clamp is only a
+  // guard for a curve that pushes the last event to the very edge.
+  const lastGap = Math.min(0.02, span / 4)
+  const latestStart = Math.max(0, span - lastGap)
+
   let events = 0
   if (kind === 'riser') {
+    // The riser is one continuous sweep, so its own knobs are the ones that
+    // matter: `tone`/`tension` keep their historical defaults and `params`
+    // overrides them (it used to be ignored entirely).
     const rendered = PRESETS.riser.render(
-      resolveParams('riser', { tone: request.tone ?? 0.6, tension: request.tension ?? 0.7 }),
+      resolveParams('riser', { tone: request.tone ?? 0.6, tension: request.tension ?? 0.7, ...(request.params ?? {}) }),
       frameCount(span, sampleRate), sampleRate, rand)
     addInto(master, rendered, 0, 1)
     events = 1
   } else {
-    const stamp = new Float32Array(frames + Math.round(spec.defaultDuration * sampleRate) + sampleRate)
+    const eventFrames = frameCount(spec.defaultDuration, sampleRate)
     for (let index = 0; index < count; index += 1) {
-      const progress = count === 1 ? 0 : index / (count - 1)
+      const progress = count === 1 ? 0 : index / count
       let at = kind === 'scatter'
-        ? rand() * span
+        ? rand() * latestStart
         : position(progress) * span
-      at = clamp(at + (rand() - 0.5) * jitter * (span / Math.max(count, 1)) * 0.9, 0, span)
+      at = clamp(at + (rand() - 0.5) * jitter * (span / Math.max(count, 1)) * 0.9, 0, latestStart)
       const pitchFrom = Number.isFinite(request.pitchFrom) ? request.pitchFrom : undefined
       const pitchTo = Number.isFinite(request.pitchTo) ? request.pitchTo : undefined
       const eventParams = { ...base }
@@ -405,7 +528,12 @@ export function renderPattern (request) {
         const startPitch = pitchFrom ?? base.pitch ?? 0.5
         const endPitch = pitchTo ?? startPitch
         const pitch = lerp(startPitch, endPitch, progress)
-        eventParams.pitch = clamp(pitch, 0, 1)
+        // The pitch domain is the preset's own, not a hardcoded 0..1: `impact`
+        // and `whoosh` take a 0.5..2 frequency multiplier while `tick` and
+        // `chime` take a 0..1 tone knob. Clamping everything to 0..1 froze every
+        // multiplier sweep at 1 and made pitchFrom/pitchTo a no-op there.
+        const pitchRange = spec.params?.pitch ?? [0, 1]
+        eventParams.pitch = clamp(pitch, pitchRange[0], pitchRange[1])
       }
       if (accentEvery > 0) {
         const gain = index % accentEvery === 0 ? 1 : 0.62
@@ -413,7 +541,7 @@ export function renderPattern (request) {
           if (eventParams[key] !== undefined) eventParams[key] = clamp(eventParams[key] * gain, 0, 1)
         }
       }
-      const one = spec.render(eventParams, frameCount(spec.defaultDuration, sampleRate), sampleRate, rand)
+      const one = spec.render(eventParams, eventFrames, sampleRate, rand)
       addInto(master, one, Math.round(at * sampleRate), 1)
       events += 1
     }
@@ -587,8 +715,19 @@ export async function writeFileAtomic (target, bytes) {
   }
 }
 
-/** Read a wav file and decode it to mono. */
-export async function readTrack (path) {
+/**
+ * Read a wav file and decode it into its true channels.
+ *
+ * This is the channel-preserving read: `readTrack` deliberately folds to mono
+ * for the synthesis/mix path, which loses exactly the information a measurement
+ * needs (one clipped channel, an out-of-phase stereo pair). A measurement tool
+ * reads through here instead, and decides for itself what to do with the
+ * channels.
+ *
+ * @param {string} path - file to read.
+ * @returns {Promise<{ channels: Float32Array[], sampleRate: number, channelCount: number, bitDepth: number }>}
+ */
+export async function readChannels (path) {
   let bytes
   try {
     bytes = await readFile(path)
@@ -601,14 +740,36 @@ export async function readTrack (path) {
   } catch (error) {
     throw new Error(`cannot decode ${path}: ${error.message}`)
   }
+  return {
+    channels: decoded.channels,
+    sampleRate: decoded.sampleRate,
+    channelCount: decoded.channels.length,
+    bitDepth: decoded.bitDepth
+  }
+}
+
+/** Read a wav file and decode it to one mono buffer (multi-channel is averaged). */
+export async function readTrack (path) {
+  const decoded = await readChannels(path)
   const samples = decoded.channels.length === 1
     ? decoded.channels[0]
     : averageChannels(decoded.channels)
   return { samples, sampleRate: decoded.sampleRate, channels: decoded.channels.length, bitDepth: decoded.bitDepth }
 }
 
-function averageChannels (channels) {
-  const frames = channels[0].length
+/**
+ * Average a channel list into one mono buffer.
+ *
+ * This is a *fold for processing* (mix the material into one track), not a
+ * measurement: averaging a clipped channel with a silent one hides the clipping,
+ * and averaging an out-of-phase pair hides the sound. Measurement goes through
+ * `measureChannels` / `peakEnvelope` instead.
+ *
+ * @param {Float32Array[]} channels - one buffer per channel.
+ * @returns {Float32Array} mono fold.
+ */
+export function averageChannels (channels) {
+  const frames = Math.min(...channels.map((channel) => channel.length))
   const out = new Float32Array(frames)
   for (let i = 0; i < frames; i += 1) {
     let sum = 0

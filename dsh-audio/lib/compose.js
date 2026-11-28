@@ -1460,6 +1460,12 @@ function sortNotes (notes, beatsPerBar) {
   return notes.sort((a, b) => (a.bar * beatsPerBar + a.beat) - (b.bar * beatsPerBar + b.beat) || a.midi - b.midi)
 }
 
+/** Coerce a request number, falling back when the value is missing/not numeric. */
+function finiteOr (value, fallback) {
+  const number = Number(value)
+  return Number.isFinite(number) ? number : fallback
+}
+
 /**
  * Compose a score from a request.
  *
@@ -1482,9 +1488,11 @@ export function composeScore (request = {}) {
   }
   const keyName = typeof request.key === 'string' && KEYS[request.key] !== undefined ? request.key : genre.key
   const keyPc = KEYS[keyName]
-  const bars = clamp(Math.round(Number(request.bars ?? 16)), 1, 96)
+  // A non-numeric `bars`/`bpm` used to become NaN and then `new Array(NaN)`
+  // (a crash) or a score whose beatMap was all NaN; fall back like `intensity`.
+  const bars = clamp(Math.round(finiteOr(request.bars ?? 16, 16)), 1, 96)
   const beatsPerBar = 4
-  const bpm = clamp(Math.round(Number(request.bpm ?? genre.bpm)), 40, 220)
+  const bpm = clamp(Math.round(finiteOr(request.bpm ?? genre.bpm, genre.bpm)), 40, 220)
   const seed = normaliseSeed(request.seed ?? 1)
   const intensity = clamp(Number.isFinite(Number(request.intensity)) ? Number(request.intensity) : 0.6, 0, 1)
   const loop = request.loop === true

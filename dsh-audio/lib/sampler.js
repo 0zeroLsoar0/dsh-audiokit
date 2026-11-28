@@ -765,6 +765,9 @@ export function renderSampler (request = {}) {
   let minSemitones = Infinity
   let maxSemitones = -Infinity
   const unmappedNotes = []
+  const unmatchedVelocityNotes = []
+  let keyMisses = 0
+  let velocityMisses = 0
   const picks = []
 
   for (let index = 0; index < notes.length; index += 1) {
@@ -772,7 +775,23 @@ export function renderSampler (request = {}) {
     if (!(note.velocity > 0)) continue
     const picked = pickZone(groups, zones, note, { roundRobin, seed })
     if (picked === null) {
-      if (unmappedNotes.length < REPORT_UNMAPPED_LINES) unmappedNotes.push({ midi: note.midi, velocity: round(note.velocity, 3) })
+      // Two different misses, and a caller acting on the report needs to tell
+      // them apart: a key that no zone reaches is a mapping hole, while a key
+      // that is mapped but whose velocity falls between the bands means the
+      // layers do not cover the whole 0..1 range. The second used to be skipped
+      // silently and then described as "outside the keymap", which sent the
+      // caller to fix the wrong thing.
+      const mappedKey = zones.some((zone) => note.midi >= zone.lowMidi && note.midi <= zone.highMidi)
+      if (mappedKey) {
+        velocityMisses += 1
+        if (unmatchedVelocityNotes.length < REPORT_UNMAPPED_LINES) {
+          unmatchedVelocityNotes.push({ midi: note.midi, velocity: round(note.velocity, 3) })
+          warnings.push(`sampler: note ${midiToName(note.midi)} (midi ${note.midi}) at velocity ${round(note.velocity, 3)} matched no velocity band; widen velocityLo/velocityHi or add a zone that covers it`)
+        }
+      } else {
+        keyMisses += 1
+        if (unmappedNotes.length < REPORT_UNMAPPED_LINES) unmappedNotes.push({ midi: note.midi, velocity: round(note.velocity, 3) })
+      }
       continue
     }
     const zone = zones[picked.index]
@@ -825,6 +844,10 @@ export function renderSampler (request = {}) {
   }
 
   if (noteCount === 0) {
+    if (velocityMisses > 0 && keyMisses === 0) {
+      const bands = [...new Set(zones.map((zone) => `${round(zone.velocityLo, 2)}–${round(zone.velocityHi, 2)}`))].slice(0, 8)
+      throw new Error(`sampler: none of the ${notes.length} note(s) matched a velocity band (zones cover ${bands.join(', ')}); widen velocityLo/velocityHi or add a zone that covers the missing range`)
+    }
     const lowMidi = Number.isFinite(keymap.lowMidi) ? keymap.lowMidi : Math.min(...zones.map((zone) => zone.lowMidi))
     const highMidi = Number.isFinite(keymap.highMidi) ? keymap.highMidi : Math.max(...zones.map((zone) => zone.highMidi))
     throw new Error(`sampler: none of the ${notes.length} note(s) is covered by the keymap (keys ${midiToName(lowMidi)}–${midiToName(highMidi)}); extend lowMidi/highMidi or add a zone`)
@@ -866,6 +889,8 @@ export function renderSampler (request = {}) {
       loopedNotes,
       loopWraps,
       unmappedNotes,
+      unmatchedVelocityNotes,
+      unmatchedVelocityCount: velocityMisses,
       picks,
       zoneHits,
       bpm,

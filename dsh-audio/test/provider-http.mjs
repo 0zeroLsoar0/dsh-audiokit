@@ -3,7 +3,7 @@
  *
  * `test/tts-mock.mjs` runs the adapters against a mock created inside the test
  * module; this file runs them through the actual `fetch` / `WebSocket` code
- * paths against the reusable servers in `./fake-provider.mjs`, and asserts on
+ * paths against the reusable servers in `./support/fake-provider.mjs`, and asserts on
  * both sides of the wire: what the adapter sent (auth header, model, voice,
  * exact text, base64 audio) and what it returned (frames, sample rate,
  * duration, stitched offsets, error text).
@@ -37,7 +37,7 @@ import { join } from 'node:path'
 import { describeAudio, speak, toWav } from '../lib/providers.js'
 import { registerTtsTool, splitScript, toSrt } from '../lib/tts.js'
 import { decodeWav } from '../lib/wav.js'
-import { startFakeProvider } from './fake-provider.mjs'
+import { startFakeProvider } from './support/fake-provider.mjs'
 
 /* ---- test harness ---- */
 

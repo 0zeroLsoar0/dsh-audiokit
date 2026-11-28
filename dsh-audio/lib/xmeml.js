@@ -13,10 +13,16 @@
  * What is carried faithfully:
  *
  * - clip order, position and duration, quantised to the sequence frame rate;
- * - the media path as a `file://` URL (Premiere links by `<pathurl>`);
+ * - the media path as a `file://` URL (Premiere links by `<pathurl>`). A plain
+ *   OS path is converted with `pathToFileURL`, so Windows backslashes, spaces
+ *   and non-ASCII file names arrive percent-encoded instead of raw;
  * - the clip name, and a `<comment>` when the cue name differs from the file;
  * - audio gain through the standard `Audio Levels` filter, whose `level`
- *   parameter is a linear multiplier (1.0 = unity);
+ *   parameter is a linear multiplier (1.0 = unity). UNIT TO BE VERIFIED: the
+ *   linear multiplier is the documented meaning of the `audiolevels` effect id,
+ *   but this writer has not been checked against an xmeml exported by a real
+ *   FCP7 (or by Premiere), so do not "fix" the conversion on a guess; compare
+ *   the `<value>` against a reference document first;
  * - per-clip source in/out, so a trimmed item stays trimmed.
  *
  * What is not: fades. FCP7 XML expresses a fade as an `<transitionitem>` with a
@@ -30,6 +36,8 @@
  * for, and a sound designer should use OTIO or AAF when the trim matters.
  */
 
+import { basename } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { dbToGain } from './dsp.js'
 
 /** Sequence frame rates this writer accepts, mapped to their `timebase` integer. */
@@ -46,6 +54,10 @@ const FRAME_RATES = Object.freeze({
 /** Video geometry written when the caller does not supply one (Resolve wants it). */
 const DEFAULT_VIDEO = Object.freeze({ width: 1920, height: 1080 })
 
+/** Gain bounds shared with the EDL and RPP writers (`MIX_GAIN_LIMITS_DB`). */
+const MIN_GAIN_DB = -120
+const MAX_GAIN_DB = 24
+
 /** XML document prologue every FCP7 XML import expects. */
 const XML_PROLOGUE = '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE xmeml>\n'
 
@@ -59,6 +71,33 @@ function describeValue (value) {
 
 function fail (caller, message) {
   throw new Error(`${caller}: ${message}`)
+}
+
+/** Read an optional number, rejecting values that have no meaning (`NaN`). */
+function readNumber (caller, label, value, fallback) {
+  if (value === undefined || value === null) return fallback
+  if (typeof value !== 'number' && typeof value !== 'string') {
+    fail(caller, `${label} must be a number, got ${describeValue(value)}`)
+  }
+  if (typeof value === 'string' && value.trim() === '') {
+    fail(caller, `${label} must be a number, got an empty string`)
+  }
+  const number = Number(value)
+  if (!Number.isFinite(number)) fail(caller, `${label} must be a finite number, got ${describeValue(value)}`)
+  return number
+}
+
+/**
+ * Read an optional number inside `[min, max]`.
+ *
+ * Gain goes through this before it reaches `dbToGain`, so a `NaN` or an
+ * out-of-range level is a readable error instead of `<value>NaN</value>` in a
+ * document the editor then refuses to import.
+ */
+function readRange (caller, label, value, fallback, min, max) {
+  const number = readNumber(caller, label, value, fallback)
+  if (number < min || number > max) fail(caller, `${label} must be between ${min} and ${max}, got ${number}`)
+  return number
 }
 
 /** Collapse control characters: XML 1.0 cannot carry them at all. */
@@ -84,6 +123,45 @@ function numberText (value, digits = 6) {
   const rounded = Math.round(value * 10 ** digits) / 10 ** digits
   if (rounded === 0) return '0'
   return String(rounded)
+}
+
+/** Basename of a path written with either separator, for `<file><name>`. */
+function pathBasename (path) {
+  return basename(String(path).replace(/\\/g, '/'))
+}
+
+/** Basename of a URL's pathname, decoded; the fallback when there is no path. */
+function urlBasename (url, fallback) {
+  try {
+    return decodeURIComponent(pathBasename(new URL(url).pathname)) || fallback
+  } catch {
+    return fallback
+  }
+}
+
+/**
+ * The `<pathurl>` value for a media reference.
+ *
+ * Premiere and Resolve resolve a clip by `<pathurl>`, and it has to be a URL: a
+ * raw OS path (Windows backslashes, an unencoded space, a Chinese file name) is
+ * not one, and the relink fails without a usable error. `pathToFileURL` turns
+ * the separators into `/` and percent-encodes everything a URL cannot carry. A
+ * relative path is resolved against the process working directory, which is the
+ * only base a pure writer can assume; the tool layer passes an absolute `url`
+ * (built from the session's absolute media path) and that value is trusted.
+ */
+function mediaUrl (path, url) {
+  if (url !== '') return url
+  if (path === '') return ''
+  if (/^(?:file|https?):/i.test(path)) return path
+  return pathToFileURL(path).href
+}
+
+/** The `<file><name>` value: the media file's basename, never a whole path. */
+function mediaName (path, url, fallback) {
+  if (path !== '') return pathBasename(path)
+  if (url !== '') return urlBasename(url, fallback)
+  return fallback
 }
 
 /** Spellings accepted for the sequence frame rate, mapped to a table key. */
@@ -211,7 +289,7 @@ export function exportXmeml (request = {}) {
     if (!Number.isFinite(duration) || duration <= 0) fail(caller, `${label} duration must be greater than 0, got ${describeValue(cue.duration)}`)
     const path = singleLineText(cue.path)
     const url = singleLineText(cue.url)
-    const name = singleLineText(cue.name) || (path === '' ? `Cue ${index + 1}` : path.split('/').pop().replace(/\.[^.]+$/, ''))
+    const name = singleLineText(cue.name) || (path === '' ? `Cue ${index + 1}` : pathBasename(path).replace(/\.[^.]+$/, ''))
     const startFrame = framesOf(at, rate.fps)
     const endFrame = Math.max(startFrame + 1, framesOf(at + duration, rate.fps))
     return {
@@ -219,12 +297,14 @@ export function exportXmeml (request = {}) {
       name,
       path,
       url,
+      pathUrl: mediaUrl(path, url),
+      mediaName: mediaName(path, url, name),
       at,
       duration,
       startFrame,
       endFrame,
       durationFrames: endFrame - startFrame,
-      gainDb: Number(cue.gainDb ?? 0),
+      gainDb: readRange(caller, `${label} gainDb`, cue.gainDb, 0, MIN_GAIN_DB, MAX_GAIN_DB),
       fadeIn: Number(cue.fadeIn ?? 0),
       fadeOut: Number(cue.fadeOut ?? 0)
     }
@@ -322,10 +402,9 @@ export function exportXmeml (request = {}) {
       lines.push('            <in>0</in>')
       lines.push(`            <out>${entry.durationFrames}</out>`)
       lines.push(`            <file id="file-${fileId}">`)
-      const baseName = entry.path === '' ? entry.name : entry.path.split('/').pop()
+      const baseName = entry.mediaName
       lines.push(`              <name>${xmlText(baseName)}</name>`)
-      const targetUrl = entry.url !== '' ? entry.url : entry.path
-      if (targetUrl !== '') lines.push(`              <pathurl>${xmlText(targetUrl)}</pathurl>`)
+      if (entry.pathUrl !== '') lines.push(`              <pathurl>${xmlText(entry.pathUrl)}</pathurl>`)
       lines.push(rateBlock(rate, '              '))
       lines.push(`              <duration>${entry.durationFrames}</duration>`)
       lines.push('              <timecode>')

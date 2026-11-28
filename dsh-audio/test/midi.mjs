@@ -457,5 +457,5 @@ console.log(`known-byte layout: writer == hand-built (${HAND_BYTES.length} bytes
 console.log(`compose roundtrip: ${score.tracks.length} tracks / ${scoreTicks.length} notes, worst timing delta ${worstStart}/${worstDuration} tick, tempo error ${num(tempoError, 5)} BPM`)
 console.log(`sung import: ${measuredNotes}/${plan.notes.length} notes within ±40 cents (worst ${num(worstCents, 1)} cents), rms ${num(sungMetrics.rmsDbfs)} dBFS`)
 console.log(`performance: 1000 notes exported in ${num(perfMilliseconds, 2)} ms (budget 50 ms)`)
-console.log(failures === 0 ? 'ALL CHECKS PASSED' : `${failures} CHECK(S) FAILED`)
+console.log(failures === 0 ? 'OK: ALL CHECKS PASSED' : `${failures} CHECK(S) FAILED`)
 if (failures > 0) process.exitCode = 1

@@ -26,7 +26,7 @@ import {
   secondsToTimecode,
   timecodeToSeconds
 } from '../lib/daw.js'
-import { registerDawTools } from '../lib/tools-daw.js'
+import { registerDawTools, verifyEdl } from '../lib/tools-daw.js'
 import { encodeWav } from '../lib/wav.js'
 
 const outDir = new URL('./out/daw/', import.meta.url)
@@ -147,6 +147,30 @@ for (const fps of [24, 25, 30, 29.97]) {
   check(`${fps}: timeline length`, Math.abs(result.durationSeconds - CUES[CUES.length - 1].at - CUES[CUES.length - 1].duration) <= 1 / info.fps,
     `${result.durationSeconds} vs 3.25`)
 }
+
+console.log('\n-- edl: event numbers follow the timeline, not the input order --')
+// The bug this pins: the writer numbered events with the *input* index, so a
+// cue list that arrived out of order produced 002, 001, 003 — a sequence a
+// CMX3600 reader rejects (or silently plays out of order). The shuffled list is
+// the sorted list permuted, so the two exports must be byte-identical.
+const SHUFFLED = [
+  { name: 'last', path: 'assets/audio/third.wav', at: 2, duration: 0.5 },
+  { name: 'first', path: 'assets/audio/first.wav', at: 0, duration: 0.5 },
+  { name: 'middle', path: 'assets/audio/second.wav', at: 1, duration: 0.5 }
+]
+const SORTED = [SHUFFLED[1], SHUFFLED[2], SHUFFLED[0]]
+const shuffledEdl = exportEdl({ cues: SHUFFLED, frameRate: 24 })
+const shuffledEvents = parseEdl(shuffledEdl.text).events
+const shuffledNumbers = shuffledEvents.map((event) => event.number)
+const shuffledLineNumbers = shuffledEdl.text.split('\n').filter((line) => /^\d{3}\s/.test(line)).map((line) => line.slice(0, 3))
+console.log(`  ${shuffledEvents.map((event) => `${event.number} ${event.clipName}`).join('  ')}`)
+check('shuffled cues: three events', shuffledEvents.length === 3, String(shuffledEvents.length))
+check('shuffled cues: parsed event numbers are exactly 1,2,3', shuffledNumbers.join(',') === '1,2,3', JSON.stringify(shuffledNumbers))
+check('shuffled cues: the file numbers its lines 001,002,003', shuffledLineNumbers.join(',') === '001,002,003', JSON.stringify(shuffledLineNumbers))
+check('shuffled cues: the events are in timeline order', shuffledEvents.map((event) => event.clipName).join(',') === 'first.wav,second.wav,third.wav',
+  JSON.stringify(shuffledEvents.map((event) => event.clipName)))
+check('shuffled cues: input order does not change the bytes', shuffledEdl.text === exportEdl({ cues: SORTED, frameRate: 24 }).text)
+check('shuffled cues: no warnings from a clean set', shuffledEdl.warnings.length === 0, JSON.stringify(shuffledEdl.warnings))
 
 console.log('\n-- edl: 24 vs 25 fps --')
 const at24 = parseEdl(exportEdl({ cues: CUES, frameRate: 24 }).text)
@@ -483,6 +507,41 @@ check('tool edl: frame rate label', toolEdl.frameRateLabel === '25 fps non-drop'
 check('tool edl: text says what an editor sees', /A video editor sees 3 cut\(s\)/.test(toolEdl.text), toolEdl.text)
 const toolEdlText = await readFile(toolEdl.path, 'utf8')
 check('tool edl: written text is the exported edl', exportEdl({ cues: CUES, frameRate: 25 }).text === toolEdlText)
+
+console.log('\n-- tool: shuffled cues go through the tool and its read-back guard --')
+const toolShuffled = await call({ format: 'edl', frameRate: 24, cues: SHUFFLED })
+const toolShuffledText = await readFile(toolShuffled.path, 'utf8')
+const toolShuffledNumbers = parseEdl(toolShuffledText).events.map((event) => event.number)
+check('tool edl: shuffled cues are numbered 1,2,3 on disk', toolShuffledNumbers.join(',') === '1,2,3', JSON.stringify(toolShuffledNumbers))
+check('tool edl: shuffled cues verified by the tool', toolShuffled.verified.events === 3, JSON.stringify(toolShuffled.verified))
+
+// verifyEdl is the read-back guard the tool runs on every EDL it writes. Give it
+// the exact output the old bug produced — two event numbers swapped — and prove
+// it refuses, then prove it still accepts what the fixed writer produces.
+const misnumberedLines = toolShuffledText.split('\n')
+const eventLineIndexes = misnumberedLines
+  .map((line, index) => (/^\d{3}\s/.test(line) ? index : -1))
+  .filter((index) => index >= 0)
+const firstEventLine = misnumberedLines[eventLineIndexes[0]]
+const secondEventLine = misnumberedLines[eventLineIndexes[1]]
+misnumberedLines[eventLineIndexes[0]] = secondEventLine.slice(0, 3) + firstEventLine.slice(3)
+misnumberedLines[eventLineIndexes[1]] = firstEventLine.slice(0, 3) + secondEventLine.slice(3)
+let misnumberedError = null
+try {
+  verifyEdl(misnumberedLines.join('\n'), SHUFFLED, 24)
+} catch (error) {
+  misnumberedError = error.message
+}
+console.log(`  verifyEdl said: ${misnumberedError}`)
+check('verifyEdl rejects a 002,001,003 sequence', misnumberedError !== null && /must run 1\.\.3 in file order/.test(misnumberedError), String(misnumberedError))
+let writerOutputAccepted = false
+try {
+  verifyEdl(toolShuffledText, SHUFFLED, 24)
+  writerOutputAccepted = true
+} catch (error) {
+  console.log(`  verifyEdl unexpectedly rejected the writer output: ${error.message}`)
+}
+check('verifyEdl accepts the fixed writer output', writerOutputAccepted)
 
 const toolCsv = await call({ format: 'csv', cues: [{ name: CSV_NAME, path: 'sfx/hit.wav', at: 0, duration: 1 }] })
 check('tool csv: quoted name survives', (await readFile(toolCsv.path, 'utf8')).includes('"hit, ""big"" one"'))

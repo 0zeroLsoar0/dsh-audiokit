@@ -12,8 +12,10 @@
 import { readFile, stat } from 'node:fs/promises'
 import { relative } from 'node:path'
 import {
+  averageChannels,
   finalize,
   measure,
+  measureChannels,
   renderPreset,
   resolvePath,
   toWavBytes,
@@ -21,6 +23,7 @@ import {
 } from './audio.js'
 import { PRESETS } from './dsp.js'
 import { analyzeLoudness, planGain } from './lufs.js'
+import { layoutFor, loudnessChannels } from './multichannel.js'
 import { decodeWav } from './wav.js'
 
 const PRESET_NAMES = Object.keys(PRESETS)
@@ -72,17 +75,6 @@ function signed (value, digits = 1) {
 
 function sizeLabel (bytes) {
   return bytes >= 1024 * 1024 ? `${fmt(bytes / 1024 / 1024, 2)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`
-}
-
-function averageChannels (channels) {
-  const frames = channels[0].length
-  const mixed = new Float32Array(frames)
-  for (let i = 0; i < frames; i += 1) {
-    let sum = 0
-    for (const channel of channels) sum += channel[i]
-    mixed[i] = sum / channels.length
-  }
-  return mixed
 }
 
 /** Loudness fields every result carries; finite numbers only (see GATE_FLOOR_LUFS). */
@@ -155,7 +147,7 @@ function targetLine (plan) {
 export function registerLoudnessTools (ctx) {
   ctx.tools.register({
     name: 'audio_loudness',
-    description: 'Measure broadcast loudness (ITU-R BS.1770-4 LUFS), short-term and momentary maxima, loudness range (EBU Tech 3342) and 4x-oversampled true peak (dBTP) of a .wav file or an inline render spec, and optionally write a true-peak-safe, gain-corrected copy toward a target loudness (-14 LUFS web/streaming, -16 podcast, -23 broadcast). Use it instead of audio_probe when the question is "will this sound as loud as the other audio?", not "is it clipping?".',
+    description: 'Measure broadcast loudness (ITU-R BS.1770-4 LUFS), short-term and momentary maxima, loudness range (EBU Tech 3342) and 4x-oversampled true peak (dBTP) of a .wav file or an inline render spec, and optionally write a true-peak-safe, gain-corrected copy toward a target loudness (-14 LUFS web/streaming, -16 podcast, -23 broadcast). A 4/6/8-channel file is measured the way BS.1770-4 specifies and the same way audio_master measures it: LFE excluded, surround channels weighted +1.5 dB (×1.41). Use it instead of audio_probe when the question is "will this sound as loud as the other audio?", not "is it clipping?".',
     parameters: {
       type: 'object',
       properties: {
@@ -226,13 +218,23 @@ export function registerLoudnessTools (ctx) {
         sourceBytes = bytes.length
       }
 
-      const analysis = channels.length === 1
-        ? analyzeLoudness(channels[0], sampleRate)
-        : analyzeLoudness(channels[0], sampleRate, { channels })
+      // One channel decision for every rate/count: LFE excluded, surround
+      // channels weighted as BS.1770-4 specifies. `audio_master` uses the same
+      // helper, so the two tools report the same LUFS for the same file.
+      const loudnessInput = loudnessChannels(channels)
+      const analysis = analyzeLoudness(loudnessInput.measured[0], sampleRate, {
+        channels: loudnessInput.measured,
+        weights: loudnessInput.weights
+      })
       const sourceMetrics = {
-        ...measure(mono, sampleRate),
+        // Every channel, so a stereo file's `clipping` and `peak` are the file's,
+        // not a mono fold's.
+        ...measureChannels(channels, sampleRate),
         sampleRate,
         channelCount: channels.length,
+        lfeExcluded: loudnessInput.lfeExcluded,
+        loudnessChannels: loudnessInput.measured.length,
+        channelWeights: analysis.channelWeights,
         ...loudnessMetrics(analysis)
       }
 
@@ -288,6 +290,10 @@ export function registerLoudnessTools (ctx) {
       // --- bounded human summary -------------------------------------------
       const lines = []
       lines.push(measureLine('Measured', cwd, { path: sourcePath, bytes: sourceBytes, sampleRate }, analysis, sourceMetrics))
+      if (channels.length > 2) {
+        const surroundWeight = Math.max(...analysis.channelWeights)
+        lines.push(`  ${layoutFor(channels.length).id}：LUFS 在 ${loudnessInput.measured.length} 个非 LFE 声道上测量，环绕声道权重 ×${fmt(surroundWeight, 2)}（与 audio_master 同一口径）`)
+      }
       if (plan !== null) {
         lines.push(targetLine(plan))
         if (outPath === undefined) lines.push('Pass `out` to write the gain-corrected copy.')

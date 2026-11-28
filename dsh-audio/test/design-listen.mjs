@@ -31,6 +31,11 @@ console.log('file'.padEnd(30), 'dur'.padStart(5), 'peak'.padStart(6), 'rms'.padS
 
 let totalBytes = 0
 let totalSeconds = 0
+let failures = 0
+function fail (label, detail = '') {
+  failures += 1
+  console.log(`  FAIL ${label} ${detail}`)
+}
 for (const id of ids) {
   const design = designSound({ recipe: id, seed, variant })
   const bytes = toWavBytes(design.samples, design.sampleRate)
@@ -39,6 +44,14 @@ for (const id of ids) {
   const metrics = measure(design.samples, design.sampleRate)
   totalBytes += bytes.length
   totalSeconds += metrics.durationSeconds
+  // Minimal sanity check: this script is for listening, but a silent, empty or
+  // clipped render is not worth listening to, and the test runner should not
+  // count a run that produced one as a pass.
+  if (!(design.samples.length > 0)) fail(`${id}: rendered samples`, String(design.samples.length))
+  if (!(bytes.length > 44)) fail(`${id}: wav holds a header and samples`, `${bytes.length} bytes`)
+  if (!(metrics.durationSeconds > 0)) fail(`${id}: duration is positive`, String(metrics.durationSeconds))
+  if (!Number.isFinite(metrics.peakDbfs) || metrics.peakDbfs > 0.1) fail(`${id}: peak is a finite level at or below 0 dBFS`, String(metrics.peakDbfs))
+  if (!Number.isFinite(metrics.rmsDbfs) || metrics.rmsDbfs <= -60) fail(`${id}: render is audible, not silence`, String(metrics.rmsDbfs))
   console.log(
     name.padEnd(30),
     metrics.durationSeconds.toFixed(2).padStart(5),
@@ -54,3 +67,7 @@ const megabytes = totalBytes / (1024 * 1024)
 console.log(`\n${ids.length} files, ${totalSeconds.toFixed(1)}s of audio, ${megabytes.toFixed(1)} MB, written to:`)
 console.log(`  ${outDir}`)
 console.log('Play them in order: the vocabulary is sorted from doors/blasts to UI ticks, so the level and weight contrast is audible across the set.')
+console.log(failures === 0
+  ? `OK: wrote ${ids.length} design files (${totalSeconds.toFixed(1)}s, ${megabytes.toFixed(1)} MB), every render non-empty, audible and in range`
+  : `FAILED: ${failures} sanity check(s)`)
+if (failures > 0) process.exitCode = 1

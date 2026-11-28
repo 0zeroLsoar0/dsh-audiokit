@@ -15,13 +15,13 @@ dsh-audiokit 是一个为 HTML 动画设计的声音处理插件，提供可供 
 
 ## 工具分组
 
-本插件提供 30 个工具，分类如下：
+本插件提供 31 个工具，分类如下：
 
-*   **造声 (9)**：包含 38 个预设的 `audio_synth`、自定义图谱 `audio_synth_graph`、规则铺设 `audio_pattern`、38 种分层配方 `audio_design`、8 种风格和声 `audio_compose`、MIDI 读写 `audio_midi`、采样器 `audio_sampler`、实时合成 `audio_live`、16 种交互音效 `audio_react`。
+*   **造声 (10)**：包含 38 个预设的 `audio_synth`、自定义图谱 `audio_synth_graph`、规则铺设 `audio_pattern`、38 种分层配方 `audio_design`、8 种风格和声 `audio_compose`、MIDI 读写 `audio_midi`、采样器 `audio_sampler`、接入外部纯音频生成模型的 `audio_generate`、实时合成 `audio_live`、16 种交互音效 `audio_react`。
 *   **人声 (5)**：提供 `audio_tts`（支持 MiniMax、OpenAI 接口、Edge）、`audio_voices`、逐帧口型 `audio_lipsync`、无音频口型 `audio_mouth`、风格化唱腔 `audio_sing`。
 *   **对画面 (4)**：包括 BPM 与节拍网格测量 `audio_beats`、生成 Cue 表与播放器 `audio_bind`、视频混流及切点处理 `audio_mux`、导出 EDL/Reaper/CSV/labels/OpenTimelineIO/FCP7 XML 的 `audio_daw`。
 *   **混音母带交付 (8)**：包括多轨合一 `audio_mix`、含压缩与侧链的总线 `audio_bus`、多段压缩与限制 `audio_master`、分轨处理 `audio_stems`、音频转换 `audio_convert`、变速变调 `audio_stretch`、多声道处理 `audio_spatial`、响度度量 `audio_loudness`。
-*   **验收 (4)**：度量工具 `audio_probe`、交付质检 `audio_check`、频谱分析 `audio_analyze`、快照回归 `audio_regress`。
+*   **验收 (4)**：度量工具 `audio_probe`、交付质检 `audio_check`（含本地声学自检，不依赖外部模型）、频谱分析 `audio_analyze`、快照回归 `audio_regress`。
 
 ## 快速开始
 
@@ -49,7 +49,9 @@ audio_check({ paths: ['out/mix.wav'], cues: [{ at: 0.82, src: 'assets/audio/slam
 *   **确定性**：同一请求产出相同的字节，文件名基于内容哈希。
 *   **无外部依赖**：仅使用 Node.js 内置模块。
 *   **离线使用**：除 TTS 服务与语义检查外，工具均可离线运行。
-*   **测试覆盖**：提供 49 个测试文件，可通过单条命令运行全量测试。
+*   **本地自检**：`audio_check` 内置确定性声学自检（峰值、削波、DC、起音、音色族区间、循环接缝），不依赖外部多模态模型。
+*   **可手动编辑**：浏览器打开 `/dsh-audio/editor`，对波形拖动 cue、改增益/淡入淡出、按 BPM 吸附、试听，再导出 cue 表。
+*   **测试覆盖**：提供 57 个测试文件，可通过单条命令运行全量测试。
 
 ## 限制说明
 

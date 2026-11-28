@@ -83,6 +83,36 @@ check('frames finite', spoken.frames.every((frame) =>
 check('viseme is known', spoken.frames.every((frame) => VISEMES.includes(frame.viseme)))
 check('source is text', spoken.source === 'text')
 
+/* --------------------------------------------------------- tempo: slot ---- */
+
+// The syllable slot used to branch at 120 bpm (`beat/2` below, `beat*0.75`
+// above), so 121 bpm was 49 % slower than 120. It is now one continuous
+// formula: half a beat with a 190 ms floor, non-increasing in tempo. The track
+// is one syllable plus the closing pause, so its duration is proportional to
+// the slot and a fixed text at the same fps measures the slot directly.
+console.log('-- tempo: the syllable slot is monotone in bpm --')
+{
+  const tempos = [100, 120, 121, 150, 180]
+  const rows = tempos.map((bpm) => {
+    const track = mouthFromText({ text: 'ma', bpm, fps: 240 })
+    return { bpm, duration: track.durationSeconds, frames: track.frames.length }
+  })
+  for (const row of rows) {
+    console.log(`  ${String(row.bpm).padStart(3)} bpm: ${row.frames} frame(s), ${row.duration.toFixed(4)} s for one syllable + closing rest`)
+  }
+  let monotone = true
+  for (let index = 1; index < rows.length; index += 1) {
+    if (rows[index].duration > rows[index - 1].duration + 1e-9) monotone = false
+  }
+  const step = rows[2].duration / rows[1].duration
+  const fasterStep = rows[1].duration / rows[3].duration
+  console.log(`  121/120 duration ${step.toFixed(4)} (<= 1), 120/150 duration ${fasterStep.toFixed(4)} (want 1.25)`)
+  check('longer bpm never lengthens the syllable', monotone, rows.map((row) => row.duration.toFixed(4)).join(' > '))
+  check('121 bpm is not slower than 120 bpm', step <= 1 + 1e-9, step.toFixed(4))
+  check('the 120->121 step is continuous (< 2 %)', step > 0.98, step.toFixed(4))
+  check('half-beat scaling still holds between 120 and 150 bpm', Math.abs(fasterStep - 1.25) < 0.02, fasterStep.toFixed(4))
+}
+
 /* ------------------------------------------------- text: frame geometry -- */
 
 console.log('-- text: frame geometry --')

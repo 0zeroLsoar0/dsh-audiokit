@@ -478,6 +478,53 @@ console.log('-- consonant inventory renders --')
   }
 }
 
+/* ------------------------------------------------------- 7b. velocity ---- */
+
+// Velocity has to scale the whole syllable. The voiced path always did
+// (`amp *= velocity`); the consonant noise used to be added at a fixed gain 1,
+// so a quiet note kept a full-level consonant and the syllable got *noisier* as
+// it got quieter. Two notes are rendered in one pass so the master peak
+// normalisation — which would cancel the difference across two renders — is a
+// common factor, and each note is measured in its own windows.
+console.log('\n-- velocity scales the consonant as well as the vowel --')
+{
+  const velocityPlan = singPlan({
+    bpm: 120,
+    notes: [
+      { midi: 60, dur: 1, syllable: 'sa', velocity: 1 },
+      { midi: 60, dur: 1, syllable: 'sa', velocity: 0.1, beat: 1 }
+    ]
+  })
+  const rendered = renderSing(velocityPlan, { seed: 7 })
+  const peakBetween = (samples, rate, from, to) => {
+    let peak = 0
+    const start = Math.max(0, Math.round(from * rate))
+    const end = Math.min(samples.length, Math.round(to * rate))
+    for (let i = start; i < end; i += 1) peak = Math.max(peak, Math.abs(samples[i]))
+    return peak
+  }
+  const rows = rendered.syllableTimings.map((timing, index) => {
+    const consonant = peakBetween(rendered.samples, rendered.sampleRate, timing.start, timing.vowelStart)
+    const vowel = peakBetween(rendered.samples, rendered.sampleRate, timing.vowelStart + 0.03, timing.vowelStart + 0.15)
+    return {
+      velocity: velocityPlan.notes[index].velocity,
+      consonantDb: 20 * Math.log10(Math.max(consonant, 1e-12)),
+      vowelDb: 20 * Math.log10(Math.max(vowel, 1e-12))
+    }
+  })
+  for (const row of rows) {
+    console.log(`  velocity ${fmt(row.velocity, 2)}: consonant ${fmt(row.consonantDb, 2)} dBFS, vowel ${fmt(row.vowelDb, 2)} dBFS, vowel/consonant ${fmt(row.vowelDb - row.consonantDb, 2)} dB`)
+  }
+  const consonantDrop = rows[0].consonantDb - rows[1].consonantDb
+  const vowelDrop = rows[0].vowelDb - rows[1].vowelDb
+  const loudRatio = rows[0].vowelDb - rows[0].consonantDb
+  const softRatio = rows[1].vowelDb - rows[1].consonantDb
+  console.log(`  velocity 1.0 -> 0.1 drops the vowel ${fmt(vowelDrop, 2)} dB and the consonant ${fmt(consonantDrop, 2)} dB; vowel/consonant changes by ${fmt(Math.abs(loudRatio - softRatio), 2)} dB`)
+  check('velocity 0.1 drops the consonant by at least 18 dB', consonantDrop >= 18, `${fmt(consonantDrop, 2)} dB`)
+  check('velocity 0.1 drops the vowel by about the same amount', Math.abs(vowelDrop - consonantDrop) <= 2.5, `${fmt(vowelDrop, 2)} vs ${fmt(consonantDrop, 2)} dB`)
+  check('the vowel/consonant balance is velocity independent', Math.abs(loudRatio - softRatio) <= 2.5, `${fmt(loudRatio, 2)} vs ${fmt(softRatio, 2)} dB`)
+}
+
 /* ------------------------------------------------------------- 8. hygiene -- */
 
 console.log('\n-- hygiene: NaN, clipping, DC, timing --')

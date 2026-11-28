@@ -29,16 +29,20 @@
  * 10. failures: missing file, missing binary, bad mode/container/offset, and
  *     the `audio_mux` tool reporting each of them readably;
  * 11. the `audio_mux` tool itself: all four actions through a fake ctx, and a
- *     repeated inline render converging on one deterministic wav path.
+ *     repeated inline render converging on one deterministic wav path;
+ * 12. safe writes: an `out` that is an input is refused before ffmpeg runs, a
+ *     failed mux/extract leaves an existing deliverable byte-identical with no
+ *     temp file left over, and a successful encode renames a same-directory temp
+ *     into place (the old output is replaced, the temp disappears).
  *
  * Exit 0 when every check passes; 1 on the first real failure, with the numbers
  * printed above it. Skips with `SKIP:` + exit 0 when ffmpeg is genuinely absent.
  */
 
 import { execFile } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import { measure, readTrack } from '../lib/audio.js'
 import { decodeWav, encodeWav } from '../lib/wav.js'
@@ -52,7 +56,8 @@ import {
   findFfprobe,
   planMux,
   probeMedia,
-  runMux
+  runMux,
+  temporaryOutputPath
 } from '../lib/video.js'
 
 const execFileAsync = promisify(execFile)
@@ -71,9 +76,13 @@ const WORK = await mkdtemp(join(tmpdir(), 'dsh-video-test-'))
 const TAU = Math.PI * 2
 let rawCounter = 0
 let failures = 0
+let passes = 0
 
 function check (label, condition, detail = '') {
-  if (condition) return
+  if (condition) {
+    passes += 1
+    return
+  }
   failures += 1
   console.log(`  FAIL ${label}${detail === '' ? '' : ` (${detail})`}`)
 }
@@ -546,11 +555,133 @@ await expectThrows('tool rejects a bad mode', () => call({ action: 'mux', video:
 await expectThrows('tool refuses a video without audio to extract', () => call({ action: 'extract', path: silentVideo }), /no audio track/i)
 await expectThrows('tool explains a probe on an audio-only file for mux', () => call({ action: 'mux', video: cueShort, audio: cueShort }), /no video stream/i)
 
+/* ---- 12. safe writes ---- */
+
+console.log('\n-- safe writes --')
+
+// The temp file must be beside its target (rename is only atomic inside one
+// directory/volume) and identifiable as this process's (pid) and this call's
+// (random suffix). Both properties are checked on the exported path helper.
+const tempBeside = temporaryOutputPath(join(WORK, 'rename-target.mp4'))
+check('temp path sits in the target directory', dirname(tempBeside) === WORK, tempBeside)
+check('temp path carries the pid', basename(tempBeside).includes(`.${process.pid}-`), basename(tempBeside))
+check('temp path is dot-prefixed, tagged and ends .tmp', /^\.[^\\/]+\.\d+-[0-9a-f]{16}\.tmp$/.test(basename(tempBeside)), basename(tempBeside))
+check('two calls make two temp paths', temporaryOutputPath(join(WORK, 'rename-target.mp4')) !== tempBeside)
+
+/** Temp files left behind for one target, if any (they live in its directory). */
+async function tempLeftovers (target) {
+  const prefix = `.${basename(target)}.`
+  return (await readdir(WORK)).filter((name) => name.startsWith(prefix) && name.endsWith('.tmp'))
+}
+
+const inputBefore = await readFile(baseVideo)
+const inputPlan = planMux({
+  video: baseVideo,
+  audio: cueShort,
+  videoDurationSeconds: baseProbe.durationSeconds,
+  videoHasAudio: true,
+  out: baseVideo
+})
+// A bogus ffmpegPath proves the refusal runs before ffmpeg is even located: had
+// the guard run after discovery, the error would be "was not found".
+await expectThrows(
+  'mux refuses an out that is its input video',
+  () => runMux(inputPlan, { ffmpegPath: 'C:/nope/ffmpeg.exe' }),
+  /must differ from the input video/i
+)
+check('the input video survives a refused in-place mux', (await readFile(baseVideo)).equals(inputBefore))
+await expectThrows(
+  'mux sees through a dotted path to the same input',
+  () => runMux(replacePlan, { out: join(WORK, 'nested', '..', 'base.mp4') }),
+  /must differ from the input video/i
+)
+await expectThrows(
+  'mux refuses an out that is its input audio',
+  () => runMux(shortPlan, { out: cueShort }),
+  /must differ from the input audio/i
+)
+await expectThrows(
+  'extract refuses an outPath that is its source',
+  () => extractAudio(baseVideo, baseVideo, { ffmpegPath: 'C:/nope/ffmpeg.exe' }),
+  /must differ from the input source/i
+)
+check('the source survives a refused in-place extract', (await readFile(baseVideo)).equals(inputBefore))
+
+// The same guard through the model-facing tool, i.e. the call shape that used to
+// lose a file: `audio_mux({ action: 'mux', video: 'clip.mp4', out: 'clip.mp4' })`.
+await expectThrows(
+  'tool refuses an out that is its input video',
+  () => call({ action: 'mux', video: baseVideo, audio: cueShort, out: baseVideo }),
+  /must differ from the input video/i
+)
+await expectThrows(
+  'tool refuses an extract outPath that is its source',
+  () => call({ action: 'extract', path: baseVideo, out: baseVideo }),
+  /must differ from the input source/i
+)
+check('the input video still survives the tool calls', (await readFile(baseVideo)).equals(inputBefore))
+
+// A real ffmpeg failure with a pre-existing deliverable at `out`: the old file
+// has to be byte-identical afterwards and no temp file may be left behind. The
+// audio input is deliberately not media, so ffmpeg fails before writing anything.
+const guardedOut = join(WORK, 'guarded.mp4')
+await writeFile(guardedOut, Buffer.from('this is the previous deliverable, not media'))
+const guardedBefore = await readFile(guardedOut)
+const corruptAudio = join(WORK, 'corrupt.wav')
+await writeFile(corruptAudio, Buffer.from('not a wav at all'))
+const corruptPlan = planMux({
+  video: baseVideo,
+  audio: corruptAudio,
+  videoDurationSeconds: baseProbe.durationSeconds,
+  videoHasAudio: true,
+  out: guardedOut
+})
+await expectThrows('a mux that ffmpeg cannot decode fails', () => runMux(corruptPlan), /runMux failed/i)
+check('a failed mux leaves the old output byte-identical', (await readFile(guardedOut)).equals(guardedBefore))
+check('a failed mux leaves no temp file', (await tempLeftovers(guardedOut)).length === 0, JSON.stringify(await tempLeftovers(guardedOut)))
+
+// The same failure shape for extract: old wav untouched, no temp left.
+const guardedWav = join(WORK, 'guarded.wav')
+await writeFile(guardedWav, Buffer.from('keep this wav'))
+const guardedWavBefore = await readFile(guardedWav)
+const corruptVideo = join(WORK, 'corrupt.mp4')
+await writeFile(corruptVideo, Buffer.from('not media either'))
+await expectThrows('an extract ffmpeg cannot decode fails', () => extractAudio(corruptVideo, guardedWav), /extractAudio .* failed/i)
+check('a failed extract leaves the old wav byte-identical', (await readFile(guardedWav)).equals(guardedWavBefore))
+check('a failed extract leaves no temp file', (await tempLeftovers(guardedWav)).length === 0, JSON.stringify(await tempLeftovers(guardedWav)))
+
+// Success path: the temp is renamed onto an existing target, which rename is
+// allowed to replace; afterwards the target is the new media and no temp remains.
+const overwriteOut = join(WORK, 'overwrite.mp4')
+await writeFile(overwriteOut, Buffer.from('stale deliverable'))
+const overwritePlan = planMux({
+  video: baseVideo,
+  audio: cueShort,
+  videoDurationSeconds: baseProbe.durationSeconds,
+  videoHasAudio: true,
+  audioDurationSeconds: 0.4,
+  out: overwriteOut
+})
+const overwritten = await runMux(overwritePlan)
+const overwrittenProbe = await probeMedia(overwriteOut)
+console.log(`  overwrite: ${overwritten.bytes} B, ${fmt(overwrittenProbe.durationSeconds)}s, audioTracks ${overwrittenProbe.audioTracks}, temp leftovers ${JSON.stringify(await tempLeftovers(overwriteOut))}`)
+check('a successful mux replaces the old output', overwritten.bytes > 1000 && Math.abs(overwrittenProbe.durationSeconds - 3) < 0.1, `${overwritten.bytes} B / ${overwrittenProbe.durationSeconds}s`)
+check('a successful mux reports the target path', overwritten.outputPath === overwriteOut, overwritten.outputPath)
+check('a successful mux leaves no temp file', (await tempLeftovers(overwriteOut)).length === 0, JSON.stringify(await tempLeftovers(overwriteOut)))
+
+const overwriteWav = join(WORK, 'overwrite.wav')
+await writeFile(overwriteWav, Buffer.from('stale wav'))
+const reExtracted = await extractAudio(baseVideo, overwriteWav, { sampleRate: 48000 })
+const reExtractedWav = decodeWav(await readFile(overwriteWav))
+console.log(`  extract overwrite: ${reExtracted.bytes} B, ${reExtractedWav.sampleRate} Hz, temp leftovers ${JSON.stringify(await tempLeftovers(overwriteWav))}`)
+check('a successful extract replaces the old wav', reExtracted.bytes > 1000 && reExtractedWav.sampleRate === 48000, `${reExtracted.bytes} B / ${reExtractedWav.sampleRate} Hz`)
+check('a successful extract leaves no temp file', (await tempLeftovers(overwriteWav)).length === 0, JSON.stringify(await tempLeftovers(overwriteWav)))
+
 /* ---- result ---- */
 
 if (failures === 0) {
   await rm(WORK, { recursive: true, force: true }).catch(() => {})
-  console.log('\nOK: video bridge behaves (ffmpeg mux/probe/cuts/extract measured on generated media)')
+  console.log(`\nOK: video bridge behaves (ffmpeg mux/probe/cuts/extract measured on generated media; ${passes} checks passed)`)
 } else {
   console.log(`\nwork directory kept for inspection: ${WORK}`)
   console.log(`FAILED: ${failures} check(s)`)

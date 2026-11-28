@@ -6,7 +6,8 @@
  * container** holding a **generated-subset AAF object graph** — a header, a
  * dictionary of the data/container definitions it uses, a content storage with
  * one composition mob (a timeline of lanes), one master mob and one source mob
- * per clip, PCM descriptors, and the audio itself embedded as raw PCM frames.
+ * per clip, PCM descriptors, and the audio itself embedded as raw PCM frames
+ * owned by the source mob that describes them.
  * Every property is encoded in AAF's stored-object form (a `properties` stream
  * of `pid / format / size` records over built-in AAF property ids) and every
  * class is an AAF class identifier taken from the specification's registration.
@@ -683,9 +684,16 @@ function readClip (caller, entry, index, projectRate) {
  *       Mobs-1901{0}                    CompositionMob  = the timeline
  *       Mobs-1901{1..n}                 MasterMob       = one per clip
  *       Mobs-1901{…}                    SourceMob       = one per clip, with a PCMDescriptor
- *       EssenceData-1902{i}             embedded PCM frames
+ *       EssenceData-1902{i}             embedded PCM frames, MobID → the SourceMob
  *   properties, referenced properties
  * ```
+ *
+ * The reference chain is one line, with both ends owned by the same SourceMob:
+ * the composition names a MasterMob, the master names the SourceMob, the source
+ * mob's own slot names itself at the full media length, and the EssenceData
+ * names the SourceMob that carries the descriptor. `parseAaf` asserts exactly
+ * that chain (see `validateAafGraph`), so a write whose mob ids disagree with
+ * its samples fails its own read-back.
  *
  * @param {object} request
  * @param {Array<object>} request.cues - `[{ name, at, duration, path?, pcm?, gainDb?, fadeIn?, fadeOut? }]`.
@@ -775,9 +783,11 @@ export function exportAaf (request = {}) {
       name: 'Source',
       editRate: sourceRate,
       origin: 0,
-      // The source clip inside the source mob is the origin of the essence:
-      // zero length of its own, no mob to point at.
-      segment: sourceClip({ length: 0, sourceMobId: Buffer.alloc(32), sourceSlotId: 0, start: 0 })
+      // The source mob's own slot describes the media it owns: a clip of the
+      // full media length that names this same mob, so both ends of the chain
+      // (descriptor → essence and timeline → master → source) meet at one mob
+      // instead of at an all-zero UMID.
+      segment: sourceClip({ length: sourceFrames, sourceMobId, sourceSlotId: 1, start: 0 })
     })
     const sourceMob = createObject(AAF_CLASS_IDS.SourceMob, [
       ...mobProperties({ mobId: sourceMobId, name: `${clip.name}.PHYS`, slots: [sourceSlot] }),
@@ -803,7 +813,11 @@ export function exportAaf (request = {}) {
 
     if (clip.pcm !== undefined && embed) {
       essenceItems.push(createObject(AAF_CLASS_IDS.EssenceData, [
-        dataProperty(PID.essenceDataMobId, masterMobId),
+        // EssenceData names the mob that owns it: the SourceMob carrying the
+        // PCMDescriptor, not the MasterMob the timeline references. A reader
+        // resolves descriptor → essence through this property, so pointing it at
+        // the master would leave the descriptor without its bytes.
+        dataProperty(PID.essenceDataMobId, sourceMobId),
         streamProperty(PID.essenceDataData, 'Data-2702', clip.pcm.data)
       ]))
     }
@@ -937,6 +951,15 @@ function prop (object, pid) {
  * classes are resolved from the CLSID of the storage, which is what makes the
  * round trip meaningful: the writer and the reader agree only if the class ids,
  * the property ids and the reference naming scheme are all correct.
+ *
+ * After decoding it asserts the essence-ownership chain (`validateAafGraph`):
+ * every reference resolves to a mob in the file, every SourceMob's slot length
+ * matches its descriptor, and the embedded bytes belong to the SourceMob that
+ * describes them. A file whose graph disagrees with itself is thrown out instead
+ * of returned as a parsed structure. That strictness makes this a validator of
+ * the writer's contract rather than a general AAF reader: a file that uses AAF's
+ * null-UMID convention for a source mob slot is refused, which is the point —
+ * this module only ever claims to parse what it wrote.
  *
  * @param {Buffer} buffer - the AAF file bytes.
  * @returns {object} the parsed structure.
@@ -1176,7 +1199,7 @@ export function parseAaf (buffer) {
     }
   }
 
-  return {
+  const parsed = {
     container: {
       version: container.version,
       sectorSize: container.sectorSize,
@@ -1192,6 +1215,152 @@ export function parseAaf (buffer) {
     content: { mobs, essenceData },
     timeline
   }
+  // A file whose mob ids and descriptors do not form one chain is not "parsed":
+  // it is a graph a reader would fail to resolve. Refuse it here so the writer's
+  // self-check cannot report a broken export as verified.
+  return validateAafGraph(parsed)
+}
+
+/* ------------------------------------------------------ graph validation -- */
+
+/** Hex form of the null UMID: 32 zero bytes, AAF's "no mob" value. */
+const ZERO_UMID_HEX = '0'.repeat(64)
+
+/** Human label for a mob in a validation error. */
+function describeMob (mob) {
+  const kind = mob.classId === AAF_CLASS_IDS.SourceMob
+    ? 'source mob'
+    : mob.classId === AAF_CLASS_IDS.MasterMob
+      ? 'master mob'
+      : mob.classId === AAF_CLASS_IDS.CompositionMob ? 'composition mob' : 'mob'
+  return `${kind} ${JSON.stringify(mob.name)}`
+}
+
+/** Every SourceClip inside a segment, outermost first, including sequences. */
+function collectSourceClips (segment, found = []) {
+  if (segment === null || segment === undefined) return found
+  if (segment.kind === 'sourceClip') found.push(segment)
+  if (Array.isArray(segment.components)) {
+    for (const component of segment.components) collectSourceClips(component, found)
+  }
+  return found
+}
+
+/**
+ * Assert the essence-ownership chain an exported AAF has to carry.
+ *
+ * The writer's contract — and what a reader resolves on import — is one chain
+ * with both ends on the same mob:
+ *
+ * ```
+ * CompositionMob slot ──SourceClip──▶ MasterMob    (one per cue)
+ * MasterMob slot      ──SourceClip──▶ SourceMob    (the media)
+ * SourceMob slot      ──SourceClip──▶ itself       (length = media frames)
+ * SourceMob.EssenceDescription ─────▶ PCMDescriptor (length = media frames)
+ * EssenceData.MobID   ──────────────▶ that SourceMob (the one with the descriptor)
+ * ```
+ *
+ * Two failures are possible in a hand-written subset and both are checked here:
+ * the EssenceData names a mob whose descriptor is elsewhere (essence with no
+ * owner), or a SourceMob slot is a placeholder of length 0 with an all-zero UMID
+ * (a chain that dead-ends). A null UMID is never legal in this file: it means
+ * "no mob", and every reference here is supposed to resolve.
+ *
+ * @param {object} parsed - the structure `parseAaf` produced.
+ * @returns {object} the same structure, so this can be used inline.
+ */
+export function validateAafGraph (parsed) {
+  const caller = 'aaf'
+  const content = parsed === null || typeof parsed !== 'object' ? undefined : parsed.content
+  if (content === undefined || !Array.isArray(content.mobs) || !Array.isArray(content.essenceData)) {
+    fail(caller, 'the graph has no mob / essence table to validate')
+  }
+  const mobs = content.mobs
+  const byId = new Map()
+  for (const mob of mobs) {
+    if (mob.mobId === null) fail(caller, `a mob named ${JSON.stringify(mob.name)} has no MobID property`)
+    if (mob.mobId === ZERO_UMID_HEX) fail(caller, `a mob named ${JSON.stringify(mob.name)} carries the null UMID (32 zero bytes)`)
+    if (byId.has(mob.mobId)) fail(caller, `two mobs share the UMID ${mob.mobId}`)
+    byId.set(mob.mobId, mob)
+  }
+
+  /** Resolve a clip's source mob id, refusing the null UMID and dangling ids. */
+  const requireOwner = (mobId, label) => {
+    if (mobId === null) fail(caller, `${label} has no source mob id`)
+    if (mobId === ZERO_UMID_HEX) fail(caller, `${label} points at the null UMID (32 zero bytes)`)
+    const owner = byId.get(mobId)
+    if (owner === undefined) fail(caller, `${label} points at mob ${mobId.slice(0, 16)}… which is not in the file`)
+    return owner
+  }
+
+  // 1. Every clip in every mob slot names a real, non-null mob.
+  for (const mob of mobs) {
+    for (const slot of mob.slots) {
+      for (const clip of collectSourceClips(slot.segment)) {
+        requireOwner(clip.sourceMobId, `${describeMob(mob)} slot ${slot.slotId} source clip`)
+      }
+    }
+  }
+
+  // 2. A SourceMob owns a descriptor, and its slot chain has the media length
+  //    and points back at the mob that owns that descriptor (itself).
+  const sourceMobs = mobs.filter((mob) => mob.classId === AAF_CLASS_IDS.SourceMob)
+  for (const mob of sourceMobs) {
+    const label = describeMob(mob)
+    if (mob.descriptor === null) fail(caller, `${label} has no PCMDescriptor`)
+    const length = mob.descriptor.length
+    if (length === null) fail(caller, `${label} descriptor has no length`)
+    if (mob.slots.length === 0) fail(caller, `${label} has no slot to describe its media`)
+    for (const slot of mob.slots) {
+      const clips = collectSourceClips(slot.segment)
+      if (clips.length === 0) fail(caller, `${label} slot ${slot.slotId} carries no source clip`)
+      for (const clip of clips) {
+        if (clip.length !== length) {
+          fail(caller, `${label} slot ${slot.slotId} source clip length ${clip.length} disagrees with descriptor length ${length}`)
+        }
+        const owner = requireOwner(clip.sourceMobId, `${label} slot ${slot.slotId} source clip`)
+        if (owner !== mob) {
+          fail(caller, `${label} slot ${slot.slotId} source clip points at ${describeMob(owner)} instead of the source mob itself`)
+        }
+      }
+    }
+  }
+
+  // 3. A MasterMob references a SourceMob that actually has a descriptor.
+  for (const mob of mobs.filter((candidate) => candidate.classId === AAF_CLASS_IDS.MasterMob)) {
+    const label = describeMob(mob)
+    const clips = mob.slots.flatMap((slot) => collectSourceClips(slot.segment))
+    if (clips.length === 0) fail(caller, `${label} has no source clip`)
+    for (const clip of clips) {
+      const owner = requireOwner(clip.sourceMobId, `${label} source clip`)
+      if (owner.descriptor === null) fail(caller, `${label} source clip points at ${describeMob(owner)}, which has no descriptor`)
+    }
+  }
+
+  // 4. The composition's timeline references the master mobs.
+  if (parsed.timeline === undefined) fail(caller, 'the graph has no timeline to validate')
+  for (const clip of parsed.timeline.tracks.flatMap((track) => track.clips)) {
+    const owner = requireOwner(clip.sourceMobId, `timeline clip ${JSON.stringify(clip.name)}`)
+    if (owner.classId !== AAF_CLASS_IDS.MasterMob) {
+      fail(caller, `timeline clip ${JSON.stringify(clip.name)} points at ${describeMob(owner)}, which is not a master mob`)
+    }
+  }
+
+  // 5. Essence belongs to the SourceMob that carries the descriptor, and its
+  //    byte count is the descriptor's frame count times its block alignment.
+  for (const item of content.essenceData) {
+    const owner = requireOwner(item.mobId, 'essence data')
+    if (owner.classId !== AAF_CLASS_IDS.SourceMob) {
+      fail(caller, `essence data names ${describeMob(owner)}, which is not a source mob (essence belongs to the mob with the descriptor)`)
+    }
+    if (owner.descriptor === null) fail(caller, `essence data names ${describeMob(owner)}, which has no descriptor`)
+    const { length, blockAlign } = owner.descriptor
+    if (length !== null && blockAlign !== null && item.bytes !== length * blockAlign) {
+      fail(caller, `essence data names ${describeMob(owner)} but holds ${item.bytes} bytes; its descriptor describes ${length} frame(s) of ${blockAlign} byte(s)`)
+    }
+  }
+
+  return parsed
 }
 
 /* ------------------------------------------------------------- parse utils -- */

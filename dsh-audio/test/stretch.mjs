@@ -14,6 +14,7 @@ import { join } from 'node:path'
 import { makeRng } from '../lib/dsp.js'
 import { decodeWav, encodeWav } from '../lib/wav.js'
 import { STRETCH_LIMITS, changeTempo, fitToDuration, pitchShift, timeStretch } from '../lib/stretch.js'
+import { legacyResampleTo } from './support/legacy-resample.mjs'
 import { registerStretchTools } from '../lib/tools-stretch.js'
 
 const RATE = 44100
@@ -330,6 +331,84 @@ console.log('\n-- pitch shift --')
   const expectedDown = 220 / Math.pow(2, 7 / 12)
   console.log(`  220 Hz -7 semitones -> ${num(measuredDown, 2)} Hz (want ${num(expectedDown, 2)})`)
   check('pitch down', Math.abs(measuredDown - expectedDown) <= expectedDown * 0.01, `measured ${num(measuredDown, 2)}`)
+}
+
+/* ---- 3b. upward pitch shift: the anti-alias window ---- */
+console.log('\n-- pitch shift up: mirror rejection versus the old resampler --')
+{
+  // `resampleTo` builds the window at `half` (the tap count) instead of at the
+  // fixed support, so on every upward shift the taps end where the Blackman
+  // taper is still at ~0.34. The truncated kernel loses stopband attenuation
+  // and folds the top band of the stretched signal back into the output.
+  //
+  // A band-limited stimulus is what can *measure* that: white noise has real
+  // content everywhere, and after an octave up its own passband replicates into
+  // 11-22 kHz through the decimation itself, so a band total cannot tell signal
+  // from mirror. A noise-like multitone above the 11.025 kHz fold (written as
+  // sines, so it is exactly band-limited and deterministic) puts all of its
+  // energy where the correct kernel has to reject it: everything that appears
+  // below 10.5 kHz afterwards is the mirror the old kernel let through.
+  function bandNoise (loHz, hiHz, seconds, seed = 0x51ED7A1B) {
+    const rand = makeRng(seed)
+    const frames = Math.round(seconds * RATE)
+    const components = []
+    for (let hz = loHz; hz <= hiHz; hz += 400) components.push({ hz: hz + (rand() - 0.5) * 120, phase: rand() * Math.PI * 2 })
+    const amplitude = 0.6 / Math.sqrt(components.length)
+    const out = new Float32Array(frames)
+    for (let i = 0; i < frames; i += 1) {
+      let value = 0
+      for (const component of components) value += Math.sin(2 * Math.PI * component.hz * i / RATE + component.phase)
+      out[i] = value * amplitude
+    }
+    return out
+  }
+
+  /** Energy in [lo, hi) by direct DFT, in dB: a precise probe for "is the band empty?". */
+  function bandEnergyDb (samples, lo, hi, stepHz = 200) {
+    const start = Math.floor(samples.length * 0.2)
+    const count = Math.min(samples.length - start, Math.round(RATE * 0.8))
+    let energy = 0
+    for (let hz = lo; hz < hi; hz += stepHz) {
+      let real = 0
+      let imaginary = 0
+      const omega = 2 * Math.PI * hz / RATE
+      for (let i = 0; i < count; i += 1) {
+        const value = samples[start + i]
+        real += value * Math.cos(omega * i)
+        imaginary += value * Math.sin(omega * i)
+      }
+      const amplitude = 2 * Math.sqrt(real * real + imaginary * imaginary) / count
+      energy += amplitude * amplitude
+    }
+    return 10 * Math.log10(energy + 1e-24)
+  }
+
+  for (const [loHz, hiHz] of [[14000, 21000], [16000, 21000]]) {
+    const input = bandNoise(loHz, hiHz, 1.5)
+    // The stretch half of pitchShift is shared: only the resample stage differs.
+    const stretched = timeStretch(input, RATE, 2)
+    const shifted = pitchShift(input, RATE, 12)
+    const legacy = legacyResampleTo(stretched, input.length)
+    const mirrorOld = bandEnergyDb(legacy, 100, 10500)
+    const mirrorNew = bandEnergyDb(shifted, 100, 10500)
+    const improvement = mirrorOld - mirrorNew
+    console.log(`  ${String(loHz).padStart(5)}-${String(hiHz).padStart(5)} Hz +12 st: mirror energy 0-10.5 kHz ` +
+      `old ${num(mirrorOld, 1)} dB -> new ${num(mirrorNew, 1)} dB (${num(improvement, 1)} dB better)`)
+    check(`+12 st ${loHz}-${hiHz} Hz has a measurable mirror in the old kernel`, mirrorOld > -100, `${num(mirrorOld, 1)} dB`)
+    check(`+12 st ${loHz}-${hiHz} Hz mirror is at least 20 dB lower`, improvement >= 20, `${num(improvement, 1)} dB`)
+  }
+
+  // Passband control on full-band white noise: the 11-22 kHz band after an
+  // octave up is the shifted passband (not an alias product), so the fix has to
+  // leave its level alone rather than "lower" it.
+  const white = noiseBed(1.5)
+  const whiteStretched = timeStretch(white, RATE, 2)
+  const whiteLegacy = legacyResampleTo(whiteStretched, white.length)
+  const whiteShifted = pitchShift(white, RATE, 12)
+  const passbandOld = bandEnergyDb(whiteLegacy, 11025, 22050)
+  const passbandNew = bandEnergyDb(whiteShifted, 11025, 22050)
+  console.log(`  white noise control: output 11-22 kHz (the shifted passband) old ${num(passbandOld, 1)} dB -> new ${num(passbandNew, 1)} dB`)
+  check('white-noise passband level is unchanged', Math.abs(passbandNew - passbandOld) <= 1.5, `${num(passbandNew - passbandOld, 2)} dB`)
 }
 
 /* ---- 4. quality ---- */

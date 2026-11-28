@@ -14,7 +14,9 @@ import {
   finalize,
   hashSpec,
   measure,
+  measureChannels,
   mixTracks,
+  readChannels,
   readTrack,
   renderPattern,
   renderPreset,
@@ -163,16 +165,16 @@ export function registerTools (ctx) {
       type: 'object',
       properties: {
         preset: { type: 'string', enum: PRESET_NAMES, description: 'Preset repeated by the pattern.' },
-        kind: { type: 'string', enum: ['train', 'scatter', 'riser'], description: 'train=evenly spaced (curve reshapes spacing), scatter=random positions, riser=one continuous rising sweep.' },
-        from: { type: 'number', description: 'Start offset in seconds within the pattern file; defaults to 0.' },
-        to: { type: 'number', description: 'End of the span in seconds; defaults to 4. The span (to - from) is capped at 180 s.' },
+        kind: { type: 'string', enum: ['train', 'scatter', 'riser'], description: 'train=evenly spaced (curve reshapes spacing), scatter=random positions, riser=one continuous rising sweep (uses the riser synth and accepts `params.tone` / `params.tension`).' },
+        from: { type: 'number', description: 'Start of the span in seconds; defaults to 0. The output timeline still begins at 0 s, so `from` only moves the placement window and the file lasts `to - from` seconds.' },
+        to: { type: 'number', description: 'End of the span in seconds; defaults to 4. The span (to - from) is capped at 180 s and is the length of the written file.' },
         every: { type: 'number', description: 'Spacing between events in seconds; ignored when count is given.' },
-        count: { type: 'integer', description: 'Exact number of events instead of a spacing; capped at 20000.' },
+        count: { type: 'integer', description: 'Exact number of events instead of a spacing; capped at 20000. Every event is placed inside the span so `events` matches what the file plays.' },
         curve: { type: 'string', enum: ['linear', 'accelerando', 'ritardando', 'ease'], description: 'How spacing changes across the span. accelerando crowds events toward the end.' },
         jitter: { type: 'number', description: '0..1 timing randomness; keeps a train from sounding mechanical.' },
         accentEvery: { type: 'integer', description: 'Accent every Nth event (e.g. 4 for a 4/4 feel).' },
-        pitchFrom: { type: 'number', description: 'First event pitch knob (0..1); combined with pitchTo it glides across the span.' },
-        pitchTo: { type: 'number', description: 'Last event pitch knob (0..1).' },
+        pitchFrom: { type: 'number', description: 'Pitch of the first event, in the preset\'s own pitch domain: a 0..1 tone knob for tick/chime/zap/riser, a 0.5..2 frequency multiplier for impact/whoosh (and the other pitched presets). Combined with pitchTo it glides across the span.' },
+        pitchTo: { type: 'number', description: 'Pitch of the last event, same domain as pitchFrom.' },
         params: { type: 'object', additionalProperties: true, description: 'Base knobs for every event, same names as audio_synth.' },
         seed: { type: 'integer', description: 'Variation seed.' },
         sampleRate: { type: 'integer', description: 'Defaults to 44100.' },
@@ -229,7 +231,7 @@ export function registerTools (ctx) {
 
   ctx.tools.register({
     name: 'audio_mix',
-    description: 'Mix existing .wav files into one track with per-input gain, fades, peak normalisation and a limiter. Use it to assemble a finished cue from individually tweaked sounds, or to combine a bed with the hits that land on top of it.',
+    description: 'Mix existing .wav files into one track with per-input gain, fades, peak normalisation and a limiter. The output is always a mono file: every input is folded to one channel by averaging it (a 2/4/6/8-channel input loses its stereo image and its LFE), so use audio_bus or audio_master for a stereo/surround deliverable. Use it to assemble a finished cue from individually tweaked sounds, or to combine a bed with the hits that land on top of it.',
     parameters: {
       type: 'object',
       properties: {
@@ -274,14 +276,20 @@ export function registerTools (ctx) {
         peakDbfs: Number.isFinite(args.peakDbfs) ? args.peakDbfs : -1
       })
       const result = await finish(cwd, mixed.samples, mixed.sampleRate, args.out, 'mix', hash, { peakDbfs: args.peakDbfs ?? -1 })
+      // Say it in the result too: a caller that fed in stereo must not be
+      // surprised by a mono file.
+      const widestInput = Math.max(...tracks.map((track) => track.channels ?? 1))
+      const foldNote = widestInput > 1 ? [`mono output (${widestInput}-ch input folded by averaging)`] : ['mono output']
       return {
         path: result.target,
         relativePath: displayPath(cwd, result.target),
         bytes: result.bytes,
         inputs: paths.length,
+        channels: 1,
+        foldedFrom: widestInput,
         durationSeconds: result.metrics.durationSeconds,
         metrics: result.metrics,
-        text: summaryLine(`Mixed ${paths.length} track(s) into`, cwd, result.target, result.bytes, result.metrics)
+        text: summaryLine(`Mixed ${paths.length} track(s) into`, cwd, result.target, result.bytes, result.metrics, foldNote)
       }
     },
     output: {
@@ -292,7 +300,7 @@ export function registerTools (ctx) {
 
   ctx.tools.register({
     name: 'audio_probe',
-    description: 'Measure a .wav file: duration, sample rate, peak and RMS level, crest factor, DC offset, clipping, spectral centroid (brightness), onset count, and loop-seam level jump. Use it to verify a render, compare two takes numerically, or check that a loop will not thump.',
+    description: 'Measure a .wav file: duration, sample rate, peak and RMS level, crest factor, DC offset, clipping, spectral centroid (brightness), onset count, and loop-seam level jump. Every channel is measured, not a mono fold: peak, clipping and DC are the worst channel\'s and a stereo pair that cancels in mono still measures. Multi-channel files also report `perChannel` (peak/clipping/DC per channel). Use it to verify a render, compare two takes numerically, or check that a loop will not thump.',
     parameters: {
       type: 'object',
       properties: {
@@ -308,17 +316,35 @@ export function registerTools (ctx) {
       const cwd = sessionCwd(ctx, exec)
       const path = resolvePath(cwd, args.path)
       if (path === undefined) throw new Error('audio_probe needs a file path')
-      const track = await readTrack(path)
-      const metrics = { ...measure(track.samples, track.sampleRate), sampleRate: track.sampleRate }
+      // Read the real channels: `readTrack` folds to mono, and that fold is
+      // exactly what hides one-sided clipping and cancels an out-of-phase pair.
+      const decoded = await readChannels(path)
+      const metrics = {
+        ...measureChannels(decoded.channels, decoded.sampleRate),
+        sampleRate: decoded.sampleRate,
+        channelCount: decoded.channelCount
+      }
       const info = await stat(path)
       const notes = []
-      if (metrics.clipping > 0) notes.push('clipping')
+      const worstChannel = metrics.channelCount > 1 && metrics.perChannel !== undefined
+        ? metrics.perChannel.findIndex((channel) => channel.clipping === metrics.clipping)
+        : -1
+      if (metrics.clipping > 0) {
+        notes.push(worstChannel >= 0
+          ? `clipping on channel ${worstChannel + 1}/${metrics.channelCount} (${metrics.clipping} samples)`
+          : `clipping (${metrics.clipping} samples)`)
+      }
       if (metrics.loopSeam > 6) notes.push('loop seam will thump (render with loop:true)')
-      if (metrics.dcOffset > 0.02) notes.push('DC offset')
+      if (metrics.dcOffset > 0.02) notes.push(decoded.channelCount > 1 ? `DC offset (worst channel ${metrics.dcOffset})` : 'DC offset')
+      if (metrics.channelCount > 1 && metrics.peakDbfs <= -40) notes.push('all channels are almost silent')
       if (Number.isFinite(args.expectDuration) && Math.abs(metrics.durationSeconds - args.expectDuration) > 0.05) {
         notes.push(`duration ${fmt(metrics.durationSeconds, 2)}s != expected ${fmt(args.expectDuration, 2)}s`)
       }
+      const channelText = metrics.channelCount > 1
+        ? [`${metrics.channelCount} ch`, ...(metrics.perChannel ?? []).map((channel, index) => `ch${index + 1} ${fmt(channel.peakDbfs)} dBFS${channel.clipping > 0 ? ' CLIP' : ''}`)].join(' · ')
+        : 'mono'
       const text = summaryLine('Measured', cwd, path, info.size, metrics, [
+        channelText,
         `loop seam ${fmt(metrics.loopSeam)} dB`,
         notes.length > 0 ? `notes: ${notes.join(', ')}` : 'clean'
       ])
@@ -326,6 +352,7 @@ export function registerTools (ctx) {
         path,
         relativePath: displayPath(cwd, path),
         bytes: info.size,
+        channels: decoded.channelCount,
         metrics,
         notes,
         text

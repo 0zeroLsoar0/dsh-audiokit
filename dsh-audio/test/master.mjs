@@ -20,6 +20,7 @@
  * Run: node test/master.mjs
  */
 
+import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -495,6 +496,167 @@ console.log('\n-- determinism --')
   const untouched = Float32Array.from(quietMono)
   masterChain(untouched, RATE, { targetLufs: -14, ceilingDbtp: -1 })
   check('the caller buffer is not modified', untouched.every((value, index) => value === quietMono[index]))
+}
+
+/* ------------------------------------------------- refactor regression -- */
+
+console.log('\n-- refactor regression: the report and the samples are unchanged --')
+{
+  // `masterChain` used to keep every iteration's rendered channel list in
+  // `attempts` (180 s / 48 kHz stereo is ~69 MB per attempt, up to five of them
+  // for one used output) and now keeps scalar measurements, re-rendering the
+  // selected gain once at the end. That refactor must not move a single number
+  // or sample, so the values below were recorded from the implementation before
+  // the change and are compared exactly — numbers at their reported precision,
+  // samples by SHA-256 of their bytes.
+  //
+  // Recorded fixtures:
+  //   quietMono   -24 LUFS mono,   target -14, ceiling -1, 3 iterations
+  //   quietStereo -24 LUFS stereo, target -14, ceiling -1, 3 iterations
+  //   hotMono     -0.2 dBTP mono,  target  -6, ceiling -1, 2 iterations (capped)
+  const GOLDEN = {
+    quietMono: {
+      report: {
+        lufsBefore: -24,
+        truePeakBefore: -9.209,
+        gainReductionDb: 5.08,
+        bandGainReductionDb: [0.18, 1.12, 0.7],
+        compressorGainReductionDb: 1.12,
+        iterations: 3,
+        appliedGainDb: 12.56,
+        trimDb: 0,
+        lufsAfter: -14.034,
+        truePeakAfter: -1.239,
+        truePeakChannel: 0,
+        truePeakByChannelDbtp: [-1.239],
+        channelPeaksDbfs: [-1.3],
+        achievable: true,
+        shortfallLu: 0,
+        lufsErrorLu: -0.03,
+        limitedBy: 'target'
+      },
+      sha256: ['6956808a4188c68acd74010c288e9debb3bd039b96a7feb4bd0d5346d5c63da7']
+    },
+    quietStereo: {
+      report: {
+        lufsBefore: -24,
+        truePeakBefore: -8.496,
+        gainReductionDb: 7.5,
+        bandGainReductionDb: [0.28, 1.25, 0.76],
+        compressorGainReductionDb: 1.25,
+        iterations: 3,
+        appliedGainDb: 14.28,
+        trimDb: 0,
+        lufsAfter: -14.049,
+        truePeakAfter: -1.237,
+        truePeakChannel: null,
+        truePeakByChannelDbtp: null,
+        channelPeaksDbfs: [-1.3, -1.3],
+        achievable: true,
+        shortfallLu: 0,
+        lufsErrorLu: -0.05,
+        limitedBy: 'target'
+      },
+      sha256: [
+        '367513b8ac70d025fcbf4ab7ae2dd4195fdda6d7d83d3e82df4f6970b5c0496d',
+        'd9b451c5ae2d3fdb41b390589a2068142826fe054e3d90c9f262b1ae83b7e922'
+      ]
+    },
+    hotMono: {
+      report: {
+        lufsBefore: -14.991,
+        truePeakBefore: -0.2,
+        gainReductionDb: 11.85,
+        bandGainReductionDb: [2.1, 2.62, 1.51],
+        compressorGainReductionDb: 2.62,
+        iterations: 2,
+        appliedGainDb: 11.7,
+        trimDb: 0,
+        lufsAfter: -11.702,
+        truePeakAfter: -1.195,
+        truePeakChannel: 0,
+        truePeakByChannelDbtp: [-1.195],
+        channelPeaksDbfs: [-1.3],
+        achievable: false,
+        shortfallLu: 5.7,
+        lufsErrorLu: -5.7,
+        limitedBy: 'true-peak'
+      },
+      sha256: ['1496373cfc08ec8b5faba50262deea198de7cd639fcf729dbf858aed305f5fa3']
+    }
+  }
+
+  /** The subset of a master report the refactor is allowed to touch: it must not. */
+  function capturedReport (window) {
+    return {
+      report: {
+        lufsBefore: window.report.lufsBefore,
+        truePeakBefore: window.report.truePeakBefore,
+        gainReductionDb: window.report.gainReductionDb,
+        bandGainReductionDb: window.report.bands.map((band) => band.gainReductionDb),
+        compressorGainReductionDb: window.report.compressorGainReductionDb,
+        iterations: window.report.iterations,
+        appliedGainDb: window.report.appliedGainDb,
+        trimDb: window.report.trimDb,
+        lufsAfter: window.report.lufsAfter,
+        truePeakAfter: window.report.truePeakAfter,
+        truePeakChannel: window.report.truePeakChannel,
+        truePeakByChannelDbtp: window.report.truePeakByChannelDbtp,
+        channelPeaksDbfs: window.report.channelPeaksDbfs,
+        achievable: window.report.achievable,
+        shortfallLu: window.report.shortfallLu,
+        lufsErrorLu: window.report.lufsErrorLu,
+        limitedBy: window.report.limitedBy
+      }
+    }
+  }
+
+  /** Compare two report trees at the reported precision; returns the first mismatch. */
+  function firstDifference (expected, actual, path = 'report') {
+    if (typeof expected === 'number') {
+      return Number.isFinite(actual) && Math.abs(actual - expected) <= 1e-6 ? null : `${path}: ${expected} -> ${actual}`
+    }
+    if (expected === null) return actual === null ? null : `${path}: null -> ${actual}`
+    if (Array.isArray(expected)) {
+      if (!Array.isArray(actual) || actual.length !== expected.length) return `${path}: length ${actual?.length}`
+      for (let index = 0; index < expected.length; index += 1) {
+        const found = firstDifference(expected[index], actual[index], `${path}[${index}]`)
+        if (found !== null) return found
+      }
+      return null
+    }
+    if (expected !== null && typeof expected === 'object') {
+      for (const key of Object.keys(expected)) {
+        const found = firstDifference(expected[key], actual?.[key], `${path}.${key}`)
+        if (found !== null) return found
+      }
+      return null
+    }
+    return expected === actual ? null : `${path}: ${expected} -> ${actual}`
+  }
+
+  const sha256Of = (channels) => channels.map((channel) => createHash('sha256')
+    .update(Buffer.from(channel.buffer, channel.byteOffset, channel.byteLength)).digest('hex'))
+
+  for (const [name, input, options] of [
+    ['quietMono', quietMono, { targetLufs: -14, ceilingDbtp: -1 }],
+    ['quietStereo', quietStereo, { targetLufs: -14, ceilingDbtp: -1 }],
+    ['hotMono', hotMono, { targetLufs: -6, ceilingDbtp: -1 }]
+  ]) {
+    const golden = GOLDEN[name]
+    const chain = masterChain(input, RATE, options)
+    const channels = Array.isArray(chain.samples) ? chain.samples : [chain.samples]
+    const captured = capturedReport(chain)
+    const reportDifference = firstDifference(golden.report, captured.report)
+    const hashes = sha256Of(channels)
+    const samplesEqual = JSON.stringify(hashes) === JSON.stringify(golden.sha256)
+    console.log(`  ${name.padEnd(12)} iterations ${chain.report.iterations}, ${show(chain.report.lufsAfter, 3)} LUFS, ` +
+      `${show(chain.report.truePeakAfter, 3)} dBTP, gain ${show(chain.report.appliedGainDb, 2)} dB: ` +
+      `report ${reportDifference === null ? 'identical' : `DRIFT ${reportDifference}`}, samples ${samplesEqual ? 'bit-identical' : 'DIFFERENT'}`)
+    check(`${name}: report matches the pre-refactor numbers`, reportDifference === null, reportDifference ?? '')
+    check(`${name}: output samples are bit-identical to the pre-refactor output`, samplesEqual,
+      hashes.map((hash) => hash.slice(0, 12)).join(','))
+  }
 }
 
 /* ------------------------------------------------------------------ performance -- */

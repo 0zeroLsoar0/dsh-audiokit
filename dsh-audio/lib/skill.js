@@ -35,6 +35,7 @@ const CONTENT = `# 给 HTML 动画配音
 | 一条规则铺满一段时间 | \`audio_pattern\` | train/scatter/riser，一次调用几百个事件 |
 | 一个"东西"（门、玻璃、爆炸、魔法） | \`audio_design\` | 38 个配方，多层共享包络与混响 |
 | 手上有真实录音要用 | \`audio_sampler\` | 键位/力度分区、变调、循环、包络（插件不内置素材） |
+| 已接了外部音频生成模型 | \`audio_generate\` | prompt → wav 走配置好的 HTTP 端点；不配置不可用，结果不确定 |
 | 一段音乐 | \`audio_compose\` | 真和声 + 声部进行 + 鼓，返回节拍表 |
 | 旁白/台词 | \`audio_tts\` | MiniMax / OpenAI 兼容 / 免费 Edge |
 | 选音色 | \`audio_voices\` | 列出当前供应商可用的音色（不产出音频） |

@@ -23,8 +23,10 @@
  * loudest channel with `lib/lufs.js`'s meter (so the promise is about the file,
  * not about a mono downmix). The stereo width stage is bypassed for a surround
  * layout and says so, because a mid/side matrix is defined on one stereo pair.
- * Loudness is measured on the non-LFE channels, which is what BS.1770 counts;
- * the report states that and the count used.
+ * Loudness is measured on the non-LFE channels with the BS.1770-4 surround
+ * weights (Ls/Rs at +1.5 dB), exactly as `audio_loudness` measures it;
+ * `multichannel.loudnessChannels` is the shared decision and the report states
+ * the count used.
  *
  * Everything is pure and deterministic: the same samples, rate and options
  * produce identical output. No randomness, no state that survives a call.
@@ -32,7 +34,7 @@
 
 import { clamp, dbToGain } from './dsp.js'
 import { analyzeLoudness, truePeak } from './lufs.js'
-import { CHANNEL_COUNTS, layoutFor, linkStemGain } from './multichannel.js'
+import { CHANNEL_COUNTS, layoutFor, linkStemGain, loudnessChannels } from './multichannel.js'
 
 /* ---------------------------------------------------------------- constants -- */
 
@@ -177,33 +179,17 @@ function scaleChannels (channels, gain) {
 }
 
 /**
- * The channels a loudness measurement may use: LFE is excluded.
+ * Analyse a channel list with the shared meter.
  *
- * ITU-R BS.1770 does not include an LFE channel in the loudness measure — it is
- * an effects channel that plays up to 10 dB louder than its samples say — so
- * counting it would let a handful of effects drag the integrated figure and make
- * the master quieter than the requested target. (Surround channel *weighting* is
- * also not applied: `lib/lufs.js` sums the measured channels at equal weight,
- * which is the honest limitation of that meter and is stated in the report.)
- *
- * @param {Float32Array[]} channels - channel list in WAVE order.
- * @returns {{ measured: Float32Array[], lfeExcluded: boolean }} the channels to meter.
+ * `multichannel.loudnessChannels` is the one place that decides which channels
+ * a loudness measurement may use and how much each one counts: LFE is excluded
+ * (BS.1770 does not include it) and each surround channel carries the standard's
+ * +1.5 dB weight. `audio_loudness` takes the same decision from the same helper,
+ * so the two tools cannot report different LUFS for one file.
  */
-function loudnessChannels (channels) {
-  const layout = layoutFor(channels.length)
-  if (!layout.hasLfe) return { measured: channels, lfeExcluded: false }
-  return {
-    measured: channels.filter((_, index) => index !== layout.lfeIndex),
-    lfeExcluded: true
-  }
-}
-
-/** Analyse a channel list with the shared meter, LFE excluded and power summed. */
 function analyseChannels (channels, rate) {
-  const { measured } = loudnessChannels(channels)
-  return measured.length === 1
-    ? analyzeLoudness(measured[0], rate)
-    : analyzeLoudness(measured[0], rate, { channels: measured })
+  const { measured, weights } = loudnessChannels(channels)
+  return analyzeLoudness(measured[0], rate, { channels: measured, weights })
 }
 
 /**
@@ -1227,6 +1213,12 @@ function predictGainForTarget (envelope, rate, settings, lufsBefore, residual) {
  * says so instead of clipping: the output is the loudest attempt that respected
  * both the ceiling and the budget, and the report carries the shortfall.
  *
+ * Memory: an attempt is a handful of scalars (gain, LUFS, true peak, trim,
+ * gain reduction), not the rendered buffer. The winning gain is re-rendered
+ * once after the search, so a master holds one output buffer instead of
+ * `maxIterations` copies of it — the difference between ~69 MB and ~345 MB of
+ * attempt storage for the documented 180 s / 48 kHz stereo maximum.
+ *
  * @param {Float32Array|Float32Array[]} samples - mono buffer or one per channel.
  * @param {number} sampleRate - Hz.
  * @param {object} [options] - `{ targetLufs, ceilingDbtp, bands, width,
@@ -1326,7 +1318,11 @@ export function masterChain (samples, sampleRate, options = {}) {
   let achieved = false
 
   for (let round = 1; round <= settings.maxIterations; round += 1) {
-    const settled = settleGainUnderCap(envelope, rate, settings, gainDb)
+    // The planned gain is what the settle loop is fed; keeping it (a scalar) is
+    // what lets the chosen iteration be re-rendered bit-identically at the end
+    // instead of every iteration's samples being kept alive.
+    const plannedGainDb = gainDb
+    const settled = settleGainUnderCap(envelope, rate, settings, plannedGainDb)
     gainDb = settled.gainDb
     const limited = applyGainCurve(preMastered, settled.curve, dbToGain(gainDb))
     const analysis = analyseChannels(limited, rate)
@@ -1349,7 +1345,12 @@ export function masterChain (samples, sampleRate, options = {}) {
     const truePeakAfter = Number.isFinite(peakDbtp) ? peakDbtp + trimDb : Number.NEGATIVE_INFINITY
     const error = settings.targetLufs - lufsAfter
     const meanReductionDb = meanGainReductionDb(settled.curve)
+    // Only measurements and scalars are kept per iteration. A 180 s stereo
+    // deliverable is ~69 MB per channel list, so holding one per attempt was
+    // five copies of the whole output (hundreds of MB) to ultimately use one;
+    // the winning iteration is re-rendered from `plannedGainDb` after selection.
     attempts.push({
+      plannedGainDb,
       gainDb,
       lufs: lufsAfter,
       truePeak: truePeakAfter,
@@ -1360,8 +1361,7 @@ export function masterChain (samples, sampleRate, options = {}) {
       channelPeaksDbfs: samplePeaksDbfs(limited),
       trimDb,
       gainReductionDb: settled.gainReductionDb,
-      atCap: settled.atCap,
-      samples: limited
+      atCap: settled.atCap
     })
 
     if (Math.abs(error) <= TARGET_TOLERANCE_LU) {
@@ -1404,8 +1404,18 @@ export function masterChain (samples, sampleRate, options = {}) {
   const chosen = selectAttempt(attempts, settings.targetLufs)
   const hitTarget = Math.abs(chosen.lufs - settings.targetLufs) <= TARGET_TOLERANCE_LU
 
+  // Re-render the winning iteration. `settleGainUnderCap` is deterministic in
+  // (envelope, rate, settings, planned gain) and every attempt stored the exact
+  // planned gain it was called with, so this computes the same curve and the
+  // same trim the pass that produced `chosen`'s measurements computed: the
+  // samples are bit-identical to keeping each iteration's output, at one
+  // output's worth of memory instead of `iterations` copies.
+  const settledChosen = settleGainUnderCap(envelope, rate, settings, chosen.plannedGainDb)
+  const output = applyGainCurve(preMastered, settledChosen.curve, dbToGain(settledChosen.gainDb))
+  if (chosen.trimDb !== 0) scaleChannels(output, dbToGain(chosen.trimDb))
+
   return {
-    samples: restoreShape(chosen.samples, mono),
+    samples: restoreShape(output, mono),
     report: {
       ...baseReport,
       lufsAfter: round3(chosen.lufs),

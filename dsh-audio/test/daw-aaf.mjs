@@ -36,7 +36,8 @@ import {
   auidToText,
   decodePropertyStream,
   exportAaf,
-  parseAaf
+  parseAaf,
+  validateAafGraph
 } from '../lib/aaf.js'
 import {
   clsidToString,
@@ -72,6 +73,80 @@ function expectError (label, pattern, run) {
     check(label, pattern.test(error.message), error.message)
     console.log(`  ${label}: ${error.message}`)
   }
+}
+
+/** CFB directory entry values, named here so the tree checks read as the format. */
+const CFB_NO_ENTRY = 0xffffffff
+const CFB_COLOR_RED = 0
+const CFB_COLOR_BLACK = 1
+
+/** The root directory entry of a parsed container. */
+function rootDirectoryEntry (container) {
+  return container.directory.find((entry) => entry.kind === 'root')
+}
+
+/**
+ * Measure one storage's sibling tree from the raw directory entries.
+ *
+ * `readCompoundFile` flattens the sibling tree into `children` for callers that
+ * only need the names; this walks the raw `left` / `right` / `child` / `color`
+ * links instead, which is the only way to prove the tree is a red-black tree and
+ * not just a correctly ordered list. A NIL leaf counts as one black level, so
+ * equal black heights is the standard invariant.
+ *
+ * @param {object} container - result of `readCompoundFile`.
+ * @param {object} storageEntry - a raw directory entry with a `child` pointer.
+ * @returns {{nodes: number, depth: number, blackHeight: number, unbalanced: number,
+ *   redRed: number, rootBlack: boolean, cyclic: boolean, names: string[]}}
+ */
+function directoryTreeShape (container, storageEntry) {
+  const byId = new Map(container.directory.map((entry) => [entry.id, entry]))
+  const shape = { nodes: 0, depth: 0, blackHeight: 0, unbalanced: 0, redRed: 0, rootBlack: true, cyclic: false, names: [] }
+  if (storageEntry === undefined) return shape
+  if (storageEntry.child !== CFB_NO_ENTRY && byId.get(storageEntry.child)?.color !== CFB_COLOR_BLACK) {
+    shape.rootBlack = false
+  }
+  const seen = new Set()
+  const walk = (id, depth) => {
+    if (id === CFB_NO_ENTRY) return 1
+    if (seen.has(id)) {
+      shape.cyclic = true
+      return 1
+    }
+    seen.add(id)
+    const node = byId.get(id)
+    if (node === undefined) throw new Error(`directory points at entry ${id}, which does not exist`)
+    shape.nodes += 1
+    shape.depth = Math.max(shape.depth, depth)
+    const left = walk(node.left, depth + 1)
+    const right = walk(node.right, depth + 1)
+    if (left !== right) shape.unbalanced += 1
+    if (node.color === CFB_COLOR_RED) {
+      if (byId.get(node.left)?.color === CFB_COLOR_RED) shape.redRed += 1
+      if (byId.get(node.right)?.color === CFB_COLOR_RED) shape.redRed += 1
+    }
+    return (node.color === CFB_COLOR_BLACK ? 1 : 0) + left
+  }
+  shape.blackHeight = walk(storageEntry.child, 1)
+  const inOrder = (id) => {
+    if (id === CFB_NO_ENTRY) return
+    const node = byId.get(id)
+    inOrder(node.left)
+    shape.names.push(node.name)
+    inOrder(node.right)
+  }
+  inOrder(storageEntry.child)
+  return shape
+}
+
+/** Every SourceClip inside a parsed AAF segment, outermost first. */
+function sourceClipsIn (segment, found = []) {
+  if (segment === null || segment === undefined) return found
+  if (segment.kind === 'sourceClip') found.push(segment)
+  if (Array.isArray(segment.components)) {
+    for (const component of segment.components) sourceClipsIn(component, found)
+  }
+  return found
 }
 
 /* ------------------------------------------------------------------- input -- */
@@ -145,6 +220,31 @@ check('cfb: directory order is case insensitive', compareDirectoryNames('ABC', '
 check('cfb: clsid text round trip', clsidToString(Buffer.from([0xa5, 0x98, 0xb3, 0xb3, 0x90, 0x1c, 0xd4, 0x11, 0x80, 0x53, 0x08, 0x00, 0x36, 0x21, 0x08, 0x04])) === 'b3b398a5-1c90-11d4-8053-080036210804')
 await writeFile(new URL('container.cfb', outDir), cfb)
 
+console.log('\n-- cfb: the directory is a red-black tree, not a chain --')
+// Siblings are inserted in sorted order, the worst case for a binary search
+// tree. A tree that is only "ordered" (but not rebalanced) degrades to a chain
+// of depth n: correct bytes that every reader then searches linearly. These
+// checks are the invariants, not the ordering, which the round-trip section
+// already covers.
+for (const count of [1, 2, 3, 7, 15]) {
+  const names = Array.from({ length: count }, (_item, index) => `s${String(index).padStart(2, '0')}`)
+  const buffer = writeCompoundFile({ children: names.map((name) => ({ name, data: Buffer.from(name) })) })
+  const back = readCompoundFile(buffer)
+  const shape = directoryTreeShape(back, rootDirectoryEntry(back))
+  const bound = 2 * Math.log2(count) + 2
+  console.log(`  ${count} siblings: nodes ${shape.nodes}, depth ${shape.depth} (bound ${bound.toFixed(2)}), black height ${shape.blackHeight}`)
+  check(`cfb tree: ${count} sibling(s) read back`,
+    shape.nodes === count && !shape.cyclic && names.every((name) => findStream(back, `/${name}`)?.toString() === name),
+    `${shape.nodes} node(s), cyclic ${shape.cyclic}`)
+  check(`cfb tree: ${count} sibling(s) keep depth <= 2*log2(n)+2`, shape.depth <= bound, `${shape.depth} > ${bound.toFixed(2)}`)
+  check(`cfb tree: ${count} sibling(s) have equal black height`, shape.unbalanced === 0, `${shape.unbalanced} node(s) unbalanced`)
+  check(`cfb tree: ${count} sibling(s) have no red-red edge`, shape.redRed === 0, `${shape.redRed} red-red edge(s)`)
+  check(`cfb tree: ${count} sibling(s) keep a black root`, shape.rootBlack)
+  check(`cfb tree: ${count} sibling(s) stay in CFB order`,
+    shape.names.length === count && shape.names.every((name, index) => index === 0 || compareDirectoryNames(shape.names[index - 1], name) < 0),
+    JSON.stringify(shape.names))
+}
+
 console.log('\n-- cfb: errors are reported, not misparsed --')
 expectError('cfb: duplicate child names', /two children named/, () => writeCompoundFile({ children: [{ name: 'x', data: Buffer.from('a') }, { name: 'X', data: Buffer.from('b') }] }))
 expectError('cfb: stream that is also a storage', /both a stream and a storage/, () => writeCompoundFile({ children: [{ name: 'x', data: Buffer.from('a'), children: [{ name: 'y', data: Buffer.from('b') }] }] }))
@@ -207,13 +307,21 @@ check('aaf: descriptor frame length matches the PCM', sources.map((mob) => mob.d
   JSON.stringify(sources.map((mob) => mob.descriptor.length)))
 
 // Embedded samples have to be the samples that were handed in, byte for byte:
-// that is the difference between a real essence embed and a placeholder.
+// that is the difference between a real essence embed and a placeholder. The
+// essence belongs to the SourceMob — the mob that carries the PCMDescriptor — so
+// each blob is keyed by the source mob its MobID names, not by the master mob
+// the timeline references.
+const mobsById = new Map(aaf.content.mobs.map((mob) => [mob.mobId, mob]))
 const essenceByName = new Map()
+let essenceOwnedBySource = 0
 for (const item of aaf.content.essenceData) {
-  const master = aaf.content.mobs.find((mob) => mob.mobId === item.mobId)
-  essenceByName.set(master.name, item)
+  const owner = mobsById.get(item.mobId)
+  if (owner === undefined) continue
+  if (owner.classId === AAF_CLASS_IDS.SourceMob && owner.descriptor !== null) essenceOwnedBySource += 1
+  essenceByName.set(owner.name.replace(/\.PHYS$/, ''), item)
 }
 check('aaf: one essence blob per cue', aaf.content.essenceData.length === CUES.length, String(aaf.content.essenceData.length))
+check('aaf: every essence blob is owned by a descriptor-bearing source mob', essenceOwnedBySource === CUES.length, `${essenceOwnedBySource} of ${CUES.length}`)
 let pcmMatches = 0
 for (const cue of CUES) {
   const blob = essenceByName.get(cue.name)
@@ -222,6 +330,77 @@ for (const cue of CUES) {
 check('aaf: embedded PCM is byte-identical to the input', pcmMatches === CUES.length, `${pcmMatches} of ${CUES.length}`)
 check('aaf: essence stream is named Data-2702', aaf.content.essenceData.every((item) => item.dataStream === 'Data-2702'))
 check('aaf: essence sizes', aaf.content.essenceData.map((item) => item.bytes).join(',') === CUES.map((cue) => cue.pcm.data.length).join(','))
+
+/* ------------------------------------------ aaf: the ownership chain closes -- */
+
+console.log('\n-- aaf: the essence ownership chain closes --')
+// The chain the importer resolves: composition slot → MasterMob → slot → SourceMob
+// → its own slot (full media length) and → PCMDescriptor; EssenceData.MobID → the
+// same SourceMob. Both ends of the file meet on the mob that owns the descriptor,
+// and no reference is the all-zero "no mob" UMID.
+const NULL_UMID = '0'.repeat(64)
+const clipsOf = (mob) => mob.slots.flatMap((slot) => sourceClipsIn(slot.segment))
+const sourceSlotClips = sources.flatMap((mob) => clipsOf(mob).map((clip) => ({ mob, clip })))
+const masterSlotClips = masters.flatMap((mob) => clipsOf(mob).map((clip) => ({ mob, clip })))
+const timelineClips = aaf.timeline.tracks.flatMap((track) => track.clips)
+const everyClip = aaf.content.mobs.flatMap((mob) => clipsOf(mob))
+const references = {
+  sourceSlot: sourceSlotClips.length,
+  masterSlot: masterSlotClips.length,
+  timeline: timelineClips.length,
+  essence: aaf.content.essenceData.length
+}
+console.log(`  ${references.sourceSlot} source-slot, ${references.masterSlot} master-slot, ${references.timeline} timeline and ${references.essence} essence references resolved`)
+
+check('aaf chain: a source mob slot clip spans the whole media',
+  sourceSlotClips.length === sources.length && sourceSlotClips.every(({ mob, clip }) => clip.length === mob.descriptor.length),
+  JSON.stringify(sourceSlotClips.map(({ mob, clip }) => `${clip.length}/${mob.descriptor.length}`)))
+check('aaf chain: a source mob slot clip names the source mob itself',
+  sourceSlotClips.every(({ mob, clip }) => clip.sourceMobId === mob.mobId))
+check('aaf chain: a source mob keeps its descriptor on the same mob as the clip',
+  sources.every((mob) => mob.descriptor !== null && clipsOf(mob).length > 0))
+check('aaf chain: every master mob references a descriptor-bearing source mob',
+  masterSlotClips.length === masters.length && masterSlotClips.every(({ clip }) => {
+    const owner = mobsById.get(clip.sourceMobId)
+    return owner !== undefined && owner.classId === AAF_CLASS_IDS.SourceMob && owner.descriptor !== null
+  }),
+  `${masterSlotClips.length} master clip(s) for ${masters.length} master mob(s)`)
+const essenceMobIds = new Set(aaf.content.essenceData.map((item) => item.mobId))
+check('aaf chain: the master and the essence name the same source mobs',
+  masterSlotClips.length === masters.length && new Set(masterSlotClips.map(({ clip }) => clip.sourceMobId)).size === essenceMobIds.size &&
+    [...new Set(masterSlotClips.map(({ clip }) => clip.sourceMobId))].every((id) => essenceMobIds.has(id)))
+check('aaf chain: every timeline clip resolves to a master mob',
+  timelineClips.every((clip) => mobsById.get(clip.sourceMobId)?.classId === AAF_CLASS_IDS.MasterMob))
+check('aaf chain: no mob id is the null UMID',
+  aaf.content.mobs.every((mob) => mob.mobId !== null && mob.mobId !== NULL_UMID))
+check('aaf chain: no source clip carries the null UMID',
+  everyClip.every((clip) => clip.sourceMobId !== null && clip.sourceMobId !== NULL_UMID))
+check('aaf chain: every source clip reference resolves to a mob',
+  everyClip.every((clip) => mobsById.has(clip.sourceMobId)))
+check('aaf chain: descriptor length * block align equals the essence bytes',
+  aaf.content.essenceData.every((item) => {
+    const owner = mobsById.get(item.mobId)
+    return owner !== undefined && owner.descriptor !== null && item.bytes === owner.descriptor.length * owner.descriptor.blockAlign
+  }))
+check('aaf chain: validateAafGraph accepts the file as written', validateAafGraph(aaf) === aaf)
+
+// The parser has to reject a graph whose two ends disagree instead of returning
+// it: the mutations below are the exact defects the writer used to produce.
+const brokenEssence = structuredClone(aaf)
+brokenEssence.content.essenceData[0].mobId = masters[0].mobId
+expectError('aaf chain: essence owned by a master mob is refused', /not a source mob|has no descriptor/, () => validateAafGraph(brokenEssence))
+
+const brokenLength = structuredClone(aaf)
+brokenLength.content.mobs.find((mob) => mob.classId === AAF_CLASS_IDS.SourceMob).slots[0].segment.length += 1
+expectError('aaf chain: a source slot length that disagrees with the descriptor is refused', /disagrees with descriptor length/, () => validateAafGraph(brokenLength))
+
+const brokenUmid = structuredClone(aaf)
+brokenUmid.content.mobs[0].mobId = NULL_UMID
+expectError('aaf chain: a null UMID is refused', /null UMID/, () => validateAafGraph(brokenUmid))
+
+const brokenSource = structuredClone(aaf)
+brokenSource.content.mobs.find((mob) => mob.classId === AAF_CLASS_IDS.SourceMob).slots[0].segment.sourceMobId = 'ff'.repeat(32)
+expectError('aaf chain: a dangling source clip reference is refused', /not in the file/, () => validateAafGraph(brokenSource))
 
 /* --------------------------------------------------------- aaf: timeline -- */
 
@@ -263,6 +442,35 @@ for (const node of storageNodes) {
 }
 check('aaf: every storage has a registered AAF class id', unknownClasses === 0, `${unknownClasses} unknown`)
 check('aaf: the root uses the AAF root class', container.clsid === AAF_CLASS_IDS.Root)
+
+// The container is not a flat list: every storage's siblings are a red-black
+// tree. ContentStorage is the widest one in an AAF file (one entry per mob plus
+// the vector index streams), so it is where a directory that is only ordered —
+// not rebalanced — turns into the O(n) lookup a reader pays on every open.
+const contentEntry = container.directory.find((entry) => entry.name === 'Content-3b03' && entry.kind === 'storage')
+const contentShape = directoryTreeShape(container, contentEntry)
+const contentChildren = container.list.filter((node) => node.path.slice(0, node.path.lastIndexOf('/')) === '/Header-2/Content-3b03').length
+const contentBound = 2 * Math.log2(Math.max(1, contentShape.nodes)) + 2
+console.log(`  ContentStorage directory: ${contentShape.nodes} entries, depth ${contentShape.depth} (bound ${contentBound.toFixed(2)}), black height ${contentShape.blackHeight}`)
+check('aaf tree: ContentStorage directory holds every child exactly once',
+  contentShape.nodes === contentChildren && !contentShape.cyclic, `${contentShape.nodes} in tree, ${contentChildren} in list, cyclic ${contentShape.cyclic}`)
+check('aaf tree: ContentStorage directory is a balanced red-black tree',
+  contentShape.unbalanced === 0 && contentShape.redRed === 0 && contentShape.depth <= contentBound,
+  `unbalanced ${contentShape.unbalanced}, red-red ${contentShape.redRed}, depth ${contentShape.depth} > ${contentBound.toFixed(2)}`)
+
+// The same check at the size where the old writer degenerated hardest: 15 cues
+// put 49 entries (31 mobs, 15 essence blobs, the vector indexes and the
+// properties stream) under ContentStorage, and a chain of 49 is what a directory
+// lookup used to walk.
+const manyCues = Array.from({ length: 15 }, (_item, index) => ({ name: `mob${index}`, at: index * 0.25, duration: 0.08, pcm: pcm(0.08, 48000, 200 + index * 20) }))
+const manyContainer = readCompoundFile(exportAaf({ cues: manyCues }).buffer)
+const manyShape = directoryTreeShape(manyContainer, manyContainer.directory.find((entry) => entry.name === 'Content-3b03' && entry.kind === 'storage'))
+const manyBound = 2 * Math.log2(Math.max(1, manyShape.nodes)) + 2
+console.log(`  15 cues: ContentStorage ${manyShape.nodes} entries, depth ${manyShape.depth} (bound ${manyBound.toFixed(2)}), black height ${manyShape.blackHeight}`)
+check('aaf tree: ContentStorage with 15 cues keeps depth <= 2*log2(n)+2', manyShape.nodes > 40 && manyShape.depth <= manyBound,
+  `${manyShape.nodes} entries, depth ${manyShape.depth} > ${manyBound.toFixed(2)}`)
+check('aaf tree: ContentStorage with 15 cues has no red-red edge and equal black height',
+  manyShape.unbalanced === 0 && manyShape.redRed === 0, `unbalanced ${manyShape.unbalanced}, red-red ${manyShape.redRed}`)
 
 /** Find a node by path in the container tree. */
 function nodeAt (path) {

@@ -40,7 +40,7 @@ import {
   parseRpp,
   timecodeToSeconds
 } from './daw.js'
-import { parseAaf } from './aaf.js'
+import { AAF_CLASS_IDS, parseAaf } from './aaf.js'
 import { readCompoundFile } from './cfb.js'
 import { parseOtio } from './otio.js'
 import { parseXmeml } from './xmeml.js'
@@ -432,12 +432,19 @@ function pluginBug (detail) {
  * Parse an EDL back and prove it says what was asked.
  *
  * The checks are the ones a broken EDL would fail silently inside an NLE: an
- * event count that does not match the cue count, a record that goes backwards,
- * a zero-length source, a timecode that does not parse at the declared rate.
+ * event count that does not match the cue count, event numbers that are not the
+ * 1..N sequence CMX3600 requires and that the writers are supposed to produce
+ * (an out-of-order cue list used to be numbered by input order), a record that
+ * goes backwards, a zero-length source, a timecode that does not parse at the
+ * declared rate.
+ *
+ * Exported because the test suite calls it with a hand-misnumbered EDL to prove
+ * this assertion catches the number sequence the writer must never emit again;
+ * the tool path only ever sees the writer's own (now ordered) output.
  *
  * @returns {object} `{ events, lengthSeconds }` for the tool result.
  */
-function verifyEdl (text, entries, frameRate) {
+export function verifyEdl (text, entries, frameRate) {
   let parsed
   try {
     parsed = parseEdl(text)
@@ -447,7 +454,15 @@ function verifyEdl (text, entries, frameRate) {
   if (parsed.events.length !== entries.length) pluginBug(`it holds ${parsed.events.length} event(s) for ${entries.length} cue(s)`)
   let previousOut = -1
   let firstIn = -1
+  let expectedNumber = 1
   for (const event of parsed.events) {
+    // CMX3600 numbers events 1..N in file order. A gap or a repeat means the
+    // writer numbered by input order instead of timeline order, which some
+    // readers reject and the rest silently play in the wrong order.
+    if (event.number !== expectedNumber) {
+      pluginBug(`event ${expectedNumber} is numbered ${event.number}; CMX3600 events must run 1..${parsed.events.length} in file order`)
+    }
+    expectedNumber += 1
     let srcIn
     let srcOut
     let recIn
@@ -507,11 +522,22 @@ function verifyRpp (text, entries) {
   return { tracks: parsed.tracks.length, items }
 }
 
+/** Every SourceClip inside a segment, including the components of a sequence. */
+function collectAafSourceClips (segment, found = []) {
+  if (segment === null || segment === undefined) return found
+  if (segment.kind === 'sourceClip') found.push(segment)
+  if (Array.isArray(segment.components)) {
+    for (const component of segment.components) collectAafSourceClips(component, found)
+  }
+  return found
+}
+
 /**
  * Parse an AAF back and prove the container and the object graph say what was
  * asked: the CFB is valid, the root is the AAF root class, the header carries
- * the version and operational pattern, every cue has a mob, and the timeline
- * holds one clip per cue at the requested position.
+ * the version and operational pattern, every cue has a mob, the timeline holds
+ * one clip per cue at the requested position, and the essence/mob reference
+ * chain closes (timeline → master → source → descriptor → essence).
  *
  * @returns {object} `{ storages, streams, mobs, clips, embeddedBytes }` for the tool result.
  */
@@ -532,11 +558,29 @@ function verifyAaf (buffer, entries, embed) {
   if (embed !== true && embeddedBytes !== 0) pluginBug('it embeds PCM although embed was false')
   // Every timeline clip has to resolve to a master mob, or the reference graph is
   // broken even though the bytes parse.
-  const mobIds = new Set(parsed.content.mobs.map((mob) => mob.mobId))
+  const byId = new Map(parsed.content.mobs.filter((mob) => mob.mobId !== null).map((mob) => [mob.mobId, mob]))
   for (const track of parsed.timeline.tracks) {
     for (const clip of track.clips) {
-      if (!mobIds.has(clip.sourceMobId)) pluginBug(`clip ${JSON.stringify(clip.name)} points at mob ${String(clip.sourceMobId).slice(0, 16)}… which is not in the file`)
+      const target = byId.get(clip.sourceMobId)
+      if (target === undefined) pluginBug(`clip ${JSON.stringify(clip.name)} points at mob ${String(clip.sourceMobId).slice(0, 16)}… which is not in the file`)
+      if (target.classId !== AAF_CLASS_IDS.MasterMob) pluginBug(`clip ${JSON.stringify(clip.name)} points at mob ${JSON.stringify(target.name)}, which is not a master mob`)
     }
+  }
+  // The essence has to belong to the mob that describes it (the SourceMob), and
+  // every master mob has to resolve down to such a source mob. `parseAaf` asserts
+  // this chain too; repeating it here is what makes "verified" the tool's own
+  // claim rather than a side effect of the parser.
+  for (const master of parsed.content.mobs.filter((mob) => mob.classId === AAF_CLASS_IDS.MasterMob)) {
+    const sources = master.slots.flatMap((slot) => collectAafSourceClips(slot.segment))
+    if (!sources.some((clip) => byId.get(clip.sourceMobId)?.descriptor)) {
+      pluginBug(`master mob ${JSON.stringify(master.name)} does not resolve to a source mob with a PCM descriptor`)
+    }
+  }
+  for (const item of parsed.content.essenceData) {
+    const owner = item.mobId === null ? undefined : byId.get(item.mobId)
+    if (owner === undefined) pluginBug('an essence blob names a mob which is not in the file')
+    if (owner.classId !== AAF_CLASS_IDS.SourceMob) pluginBug(`an essence blob names mob ${JSON.stringify(owner.name)}, which is not a source mob`)
+    if (owner.descriptor === null) pluginBug(`an essence blob names mob ${JSON.stringify(owner.name)}, which has no PCM descriptor`)
   }
   return {
     storages: parsed.container.storages,

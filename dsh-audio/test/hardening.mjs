@@ -33,6 +33,7 @@ import { registerBindTools } from '../lib/tools-bind.js'
 import { registerComposeTools } from '../lib/tools-compose.js'
 import { registerConvertTools } from '../lib/tools-convert.js'
 import { registerDesignTools } from '../lib/tools-design.js'
+import { registerGenerateTools } from '../lib/tools-generate.js'
 import { registerLoudnessTools } from '../lib/tools-loudness.js'
 import { registerSingTools } from '../lib/tools-sing.js'
 import { registerStretchTools } from '../lib/tools-stretch.js'
@@ -302,6 +303,7 @@ registerTools(primary.ctx)
 registerTtsTool(primary.ctx, ttsConfig)
 registerVoicesTool(primary.ctx, ttsConfig)
 registerCheckTool(primary.ctx, {})
+registerGenerateTools(primary.ctx, {})
 registerConvertTools(primary.ctx)
 registerLoudnessTools(primary.ctx)
 registerDesignTools(primary.ctx)
@@ -339,7 +341,8 @@ section('1. registration and tool shape')
   const EXPECTED = [
     'audio_synth', 'audio_pattern', 'audio_mix', 'audio_probe', 'audio_tts', 'audio_voices',
     'audio_check', 'audio_convert', 'audio_loudness', 'audio_design', 'audio_lipsync',
-    'audio_beats', 'audio_bind', 'audio_regress', 'audio_compose', 'audio_sing', 'audio_stretch'
+    'audio_beats', 'audio_bind', 'audio_regress', 'audio_compose', 'audio_sing', 'audio_stretch',
+    'audio_generate'
   ]
   const names = [...primary.tools.keys()].sort()
   const missing = EXPECTED.filter((name) => !primary.tools.has(name))
@@ -414,7 +417,17 @@ section('2. bad arguments')
   await expectError('audio_check empty paths', 'audio_check', { paths: [] })
   await expectError('audio_check empty-cue work reports ok', 'audio_check', { cues: [] })
   await expectError('audio_check blank path report ok', 'audio_check', { paths: [''] })
-  await expectError('audio_check question without check config', 'audio_check', { paths: ['fixtures/ok.wav'], question: '像什么？' }, { registry: offline, match: /API_KEY|apiKey/ })
+  // The local self-check must never need a model: with no `config.check` a
+  // question is *skipped* (info note), not an error, and the file still gets a
+  // verdict plus the deterministic self-check block.
+  {
+    const outcome = await invoke('audio_check', { paths: ['fixtures/ok.wav'], question: '像什么？' }, offline)
+    if (!outcome.ok) bug('audio_check question without a model threw', String(outcome.error?.message ?? outcome.error))
+    else if (outcome.value.selfCheck === undefined || outcome.value.selfCheck === null) bug('audio_check question without a model has no self-check block', brief(outcome.value))
+    else if (outcome.value.opinion !== null) bug('audio_check invented an opinion with no model configured', String(outcome.value.opinion))
+    else if (outcome.value.verdict === 'fail') warn('audio_check fails a clean file when no model is configured', JSON.stringify(outcome.value.issues))
+    else ok('audio_check question without a model: local self-check only')
+  }
 
   // -- audio_convert --
   await expectError('audio_convert missing inputs', 'audio_convert', { op: 'convert' })

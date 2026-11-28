@@ -87,7 +87,21 @@ function amplitudeDb (amplitude) {
 
 /** Accept any array-like of samples; non-finite values read as silence. */
 function asSamples (input) {
-  if (input instanceof Float32Array) return input
+  if (input instanceof Float32Array) {
+    // The clean buffer is the common case and is used as-is; copying a
+    // multi-second cue to learn it contained nothing to fix would be waste. A
+    // single NaN, however, must be folded to silence first: one poison sample
+    // is enough to make the window energy non-finite, and every metric that
+    // depends on it then collapses to 0 through `round()`.
+    for (let i = 0; i < input.length; i += 1) {
+      if (!Number.isFinite(input[i])) {
+        const out = new Float32Array(input.length)
+        for (let j = 0; j < input.length; j += 1) out[j] = Number.isFinite(input[j]) ? input[j] : 0
+        return out
+      }
+    }
+    return input
+  }
   if (ArrayBuffer.isView(input)) {
     const out = new Float32Array(input.length)
     for (let i = 0; i < input.length; i += 1) out[i] = Number.isFinite(input[i]) ? input[i] : 0

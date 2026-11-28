@@ -529,6 +529,9 @@ function edlReel () {
  * times, so every boundary lands within half a frame of the requested position
  * and a contiguous cue set stays contiguous.
  *
+ * Event numbers are the sorted timeline positions (1..N in file order), so an
+ * unsorted cue list still produces the 001, 002, 003 sequence a reader expects.
+ *
  * @param {object} request
  * @param {Array<object>} request.cues - `[{ name, path, at, duration, gainDb?, fadeIn?, fadeOut? }]`.
  * @param {unknown} [request.frameRate] - 24 (default), 25, 30 or 29.97.
@@ -586,7 +589,13 @@ export function exportEdl (request = {}) {
   const lines = header.slice()
   let cursor = startFrame
 
-  for (const cue of entries) {
+  // The event number is the position on the *timeline*, not `cue.index`: the
+  // entries were sorted by `at`, so numbering by the input index would write
+  // 002, 001, 003 for a cue list that arrived out of order. CMX3600 numbers
+  // events 1..N in file order, and a reader that meets a gap or a repeat can
+  // reject the file or reorder the cuts. `verifyEdl` asserts the same invariant
+  // on the read-back side.
+  entries.forEach((cue, eventIndex) => {
     const requestedFrame = startFrame + secondsToFrames(cue.at, rate)
     // Quantise both *boundaries* rather than rounding the duration on its own:
     // 37.5 frames in and 18.75 frames long round to 38 + 19, which pushes the
@@ -616,7 +625,7 @@ export function exportEdl (request = {}) {
     const sourceOut = timecodeFromFrames(lengthFrames, rate)
     const recordIn = timecodeFromFrames(inFrame, rate)
     const recordOut = timecodeFromFrames(outFrame, rate)
-    const eventNumber = String(cue.index + 1).padStart(3, '0')
+    const eventNumber = String(eventIndex + 1).padStart(3, '0')
     // The column widths reproduce the canonical CMX3600 event line exactly
     // (3 digit number, 8 char reel, 5 char track, 8 char edit type, 4 timecodes).
     lines.push(`${eventNumber}  ${edlReel().padEnd(8)} ${trackType.padEnd(5)} ${'C'.padEnd(8)} ${sourceIn} ${sourceOut} ${recordIn} ${recordOut}`)
@@ -634,7 +643,7 @@ export function exportEdl (request = {}) {
       if (cue.fadeOut > 0) parts.push(`fade out ${numberText(cue.fadeOut, 3)} s`)
       lines.push(`* CUE LEVEL: ${parts.join(', ')} (apply in the DAW; CMX3600 cannot carry levels)`)
     }
-  }
+  })
 
   if (asciiLosses > 0) {
     warnings.push(`${asciiLosses} EDL field(s) contained non-ASCII characters and were written as "?" - CMX3600 is a byte-oriented ASCII format; the csv and rpp exports keep the original text`)

@@ -16,8 +16,12 @@
  * - Reader: version 3 and version 4 (4096-byte sectors), so a container written
  *   by another tool can be inspected. That is how the AAF writer is checked
  *   against a reference implementation instead of only against itself.
- * - Directory: one red-black tree per storage, built with the textbook insert,
+ * - Directory: one red-black tree per storage, built with the textbook insert
+ *   (recolour on the way up, rotations that move links but never colours),
  *   ordered by the CFB rule (shorter names first, then case-insensitive).
+ *   Names arrive in sorted order, which is the worst case for an unbalanced
+ *   tree, so the rebalancing is what keeps a storage with n children at
+ *   O(log n) depth instead of a chain of n.
  * - Determinism: no clock, no `Math.random`, no locale. Timestamps are written
  *   as zero — the format's own "no time recorded" value — so the same tree
  *   always produces the same bytes.
@@ -288,7 +292,20 @@ function flattenTree (root) {
  * tree hanging off the storage's `child` pointer. A reader that walks it
  * compares names with the CFB ordering rule, so the tree must be a correct
  * binary search tree *and* satisfy the red-black invariants (equal black
- * height, no red-red edge, black root) — which is what this insert does.
+ * height, no red-red edge, black root).
+ *
+ * The insert is the textbook one (CLRS): the new node is red, and the fix-up
+ * recolours the parent black and the grandparent red while climbing when the
+ * uncle is red, or rotates once or twice for the black-uncle case. A rotation
+ * only moves links and never changes a colour; the recolouring is what restores
+ * the black height.
+ *
+ * Why this matters: siblings are inserted in CFB order (ascending), which is the
+ * worst case for a plain binary search tree. An earlier version rotated and
+ * recoloured in the same step and never linked the promoted node back into its
+ * grandparent, so a storage with n children came out as a chain of depth n —
+ * a linear name lookup in every directory. The invariants asserted by the tests
+ * (black height, no red-red edge, bounded depth) are exactly what that broke.
  *
  * Nodes are inserted in CFB order, so the result depends only on the set of
  * names: that is part of what makes the written bytes stable.
@@ -309,42 +326,100 @@ function buildDirectoryTree (entries, parentId) {
   const before = (left, right) => compareDirectoryNames(left.entry.name, right.entry.name) < 0
   const isRed = (node) => node !== null && node.red === true
 
-  /** Rotate `node`'s right child up; returns the new subtree root. */
+  let root = null
+
+  /**
+   * Point the link that used to hold `previous` at `next`.
+   *
+   * A rotation happens below an arbitrary parent, so the promoted node has to be
+   * written back into that parent's left/right pointer — or into `root` when the
+   * rotated node was the root. Forgetting this is what detached subtrees.
+   */
+  const replaceChild = (parent, previous, next) => {
+    if (parent === null) root = next
+    else if (parent.left === previous) parent.left = next
+    else if (parent.right === previous) parent.right = next
+    else fail('cfb', 'a directory rotation lost its parent link')
+  }
+
+  /** Rotate `node`'s right child up; returns the new subtree root. Colour is kept. */
   const rotateLeft = (node) => {
     const next = node.right
     node.right = next.left
     if (next.left !== null) next.left.parent = node
     next.parent = node.parent
-    if (node.parent === null) node.parentless = true
+    replaceChild(next.parent, node, next)
     next.left = node
     node.parent = next
-    if (node.red === true) {
-      next.red = true
-      node.red = false
-    }
     return next
   }
 
-  /** Rotate `node`'s left child up; returns the new subtree root. */
+  /** Rotate `node`'s left child up; returns the new subtree root. Colour is kept. */
   const rotateRight = (node) => {
     const next = node.left
     node.left = next.right
     if (next.right !== null) next.right.parent = node
     next.parent = node.parent
+    replaceChild(next.parent, node, next)
     next.right = node
     node.parent = next
-    if (node.red === true) {
-      next.red = true
-      node.red = false
-    }
     return next
   }
 
-  let root = { entry: siblings[0], left: null, right: null, parent: null, red: false }
+  /** CLRS RB-INSERT-FIXUP: restore the red-black invariants after an insert. */
+  const insertFixup = (node) => {
+    while (node.parent !== null && node.parent.red === true) {
+      const parent = node.parent
+      const grand = parent.parent
+      // A red parent cannot be the root (the root is black between inserts), so
+      // the grandparent exists. The guard keeps the invariant explicit.
+      if (grand === null) break
+      if (parent === grand.left) {
+        const uncle = grand.right
+        if (isRed(uncle)) {
+          // Red uncle: recolour and climb; the rotation case cannot apply here.
+          parent.red = false
+          uncle.red = false
+          grand.red = true
+          node = grand
+          continue
+        }
+        if (node === parent.right) {
+          node = parent
+          rotateLeft(node)
+        }
+        node.parent.red = false
+        node.parent.parent.red = true
+        rotateRight(node.parent.parent)
+      } else {
+        const uncle = grand.left
+        if (isRed(uncle)) {
+          parent.red = false
+          uncle.red = false
+          grand.red = true
+          node = grand
+          continue
+        }
+        if (node === parent.left) {
+          node = parent
+          rotateRight(node)
+        }
+        node.parent.red = false
+        node.parent.parent.red = true
+        rotateLeft(node.parent.parent)
+      }
+    }
+    root.red = false
+  }
 
-  for (let index = 1; index < siblings.length; index += 1) {
-    const leaf = { entry: siblings[index], left: null, right: null, parent: null, red: true }
-    // Plain BST descend.
+  for (const entry of siblings) {
+    const leaf = { entry, left: null, right: null, parent: null, red: true }
+    if (root === null) {
+      root = leaf
+      root.red = false
+      continue
+    }
+    // Plain BST descend, then rebalance from the new leaf.
     let parent = null
     let current = root
     while (current !== null) {
@@ -354,59 +429,8 @@ function buildDirectoryTree (entries, parentId) {
     leaf.parent = parent
     if (before(leaf, parent)) parent.left = leaf
     else parent.right = leaf
-
-    // Red-black fix-up along the new node's ancestor chain.
-    let node = leaf
-    while (node.parent !== null && node.parent.red === true) {
-      const grand = node.parent.parent
-      if (grand === null) break
-      if (node.parent === grand.left) {
-        const uncle = grand.right
-        if (isRed(uncle)) {
-          node.parent.red = false
-          uncle.red = false
-          grand.red = true
-          node = grand
-          continue
-        }
-        if (node === node.parent.right) {
-          node = node.parent
-          const promoted = rotateLeft(node)
-          if (node.parent === null) root = promoted
-        }
-        node.parent.red = false
-        const greatGrand = node.parent.parent
-        node.parent.parent.red = true
-        const promoted = rotateRight(node.parent.parent)
-        if (greatGrand === null) root = promoted
-      } else {
-        const uncle = grand.left
-        if (isRed(uncle)) {
-          node.parent.red = false
-          uncle.red = false
-          grand.red = true
-          node = grand
-          continue
-        }
-        if (node === node.parent.left) {
-          node = node.parent
-          const promoted = rotateRight(node)
-          if (node.parent === null) root = promoted
-        }
-        node.parent.red = false
-        const greatGrand = node.parent.parent
-        node.parent.parent.red = true
-        const promoted = rotateLeft(node.parent.parent)
-        if (greatGrand === null) root = promoted
-      }
-      // Climb to the real root after a rotation that may have changed it.
-      while (root.parent !== null) root = root.parent
-    }
-    while (root.parent !== null) root = root.parent
-    root.red = false
+    insertFixup(leaf)
   }
-  while (root.parent !== null) root = root.parent
-  root.red = false
 
   // Serialise the links back onto the entries: left/right ids and colors, with
   // the tree root becoming the storage's `child` pointer.
@@ -625,7 +649,8 @@ export function writeCompoundFile (tree) {
  *
  * @param {Buffer} buffer - document bytes.
  * @returns {{ version: number, sectorSize: number, clsid: string, children: object[],
- *   list: object[], sectors: number, miniStreamCutoff: number, warnings: string[] }}
+ *   list: object[], directory: object[], sectors: number, miniStreamCutoff: number,
+ *   warnings: string[] }}
  */
 export function readCompoundFile (buffer) {
   if (!Buffer.isBuffer(buffer)) fail('cfb', `cannot read ${describeValue(buffer)}; pass a Buffer`)
@@ -840,6 +865,11 @@ export function readCompoundFile (buffer) {
     clsid: tree.clsid,
     children: tree.children,
     list,
+    // Raw directory entries with their own tree links (`left`, `right`, `child`)
+    // and colours. `list` and `children` are the friendly flattened view; this
+    // is the view a caller needs to check the red-black shape of the directory
+    // (depth, black height, red-red edges) instead of only its ordering.
+    directory: entries,
     warnings
   }
 }

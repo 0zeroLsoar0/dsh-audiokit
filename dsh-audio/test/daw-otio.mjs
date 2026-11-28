@@ -26,6 +26,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { exportOmf, OMF_CAPABILITIES } from '../lib/omf.js'
 import { exportOtio, parseOtio } from '../lib/otio.js'
 import { exportXmeml, parseXmeml } from '../lib/xmeml.js'
@@ -251,6 +252,45 @@ expectError('xmeml: unsupported frame rate', /unsupported frameRate "59.94"/, ()
 expectError('xmeml parse: empty', /cannot parse an empty/, () => parseXmeml(''))
 expectError('xmeml parse: not xmeml', /no <xmeml> element/, () => parseXmeml('<html></html>'))
 
+console.log('\n-- xmeml: a plain path becomes a file url (the relink fix) --')
+// A caller that gives only `path` used to get the OS path written raw into
+// <pathurl>: Windows backslashes, an unencoded space and a Chinese file name are
+// not a URL, and Premiere fails to relink without saying why. `pathToFileURL`
+// makes it a real URL; `<file><name>` must stay the basename, never the path.
+const encodedPath = 'assets/audio/explosion boom \u7206\u70b8.wav'
+const pathOnly = exportXmeml({ cues: [{ name: 'boom', path: encodedPath, at: 0, duration: 1 }], frameRate: 25 })
+const pathOnlyUrl = /<pathurl>([^<]*)<\/pathurl>/.exec(pathOnly.text)?.[1]
+const expectedPathUrl = pathToFileURL(encodedPath).href
+console.log(`  pathurl ${pathOnlyUrl}`)
+check('xmeml: path-only media writes a <pathurl>', pathOnlyUrl !== undefined, JSON.stringify(pathOnly.text.match(/<pathurl>[^<]*/) ?? pathOnly.text.slice(0, 120)))
+check('xmeml: pathurl is a file url', pathOnlyUrl !== undefined && pathOnlyUrl.startsWith('file:///'), String(pathOnlyUrl))
+check('xmeml: pathurl is pathToFileURL of the path', pathOnlyUrl === expectedPathUrl, `${pathOnlyUrl} vs ${expectedPathUrl}`)
+check('xmeml: pathurl percent-encodes the space and the CJK file name', pathOnlyUrl.includes('explosion%20boom%20%E7%88%86%E7%82%B8.wav'), String(pathOnlyUrl))
+check('xmeml: pathurl carries no raw space or backslash', !pathOnlyUrl.includes(' ') && !pathOnlyUrl.includes('\\'), String(pathOnlyUrl))
+check('xmeml: <file><name> is the basename', pathOnly.text.includes('<name>explosion boom \u7206\u70b8.wav</name>'),
+  JSON.stringify(pathOnly.text.match(/<file id="file-1">[\s\S]{0,120}/)?.[0]))
+check('xmeml: <file><name> is not the whole path', /<name>[^<]*<\/name>/.test(pathOnly.text) && !pathOnly.text.includes(`<name>assets/audio/`),
+  JSON.stringify(pathOnly.text.match(/<name>[^<]*<\/name>/g)))
+const windowsPath = exportXmeml({ cues: [{ name: 'win', path: 'C:\\media\\hit.wav', at: 0, duration: 1 }], frameRate: 25 })
+const windowsUrl = /<pathurl>([^<]*)<\/pathurl>/.exec(windowsPath.text)?.[1]
+check('xmeml: a windows path still names the file by its basename', windowsPath.text.includes('<name>hit.wav</name>'),
+  JSON.stringify(windowsPath.text.match(/<file id="file-1">[\s\S]{0,140}/)?.[0]))
+check('xmeml: a windows path is not written raw into the url', windowsUrl !== undefined && windowsUrl.startsWith('file:') && !windowsUrl.includes('\\'), String(windowsUrl))
+const explicitUrl = exportXmeml({ cues: [{ name: 'hit', path: 'sfx/hit.wav', url: 'file:///project/sfx/hit.wav', at: 0, duration: 1 }], frameRate: 25 })
+check('xmeml: an explicit url is written unchanged', explicitUrl.text.includes('<pathurl>file:///project/sfx/hit.wav</pathurl>'),
+  JSON.stringify(explicitUrl.text.match(/<pathurl>[^<]*/)?.[0]))
+
+console.log('\n-- xmeml: level validation --')
+// dbToGain(NaN) is NaN, and <value>NaN</value> is a document an editor refuses
+// to import with no useful message. A bad level has to be an error here.
+expectError('xmeml: NaN gain', /gainDb must be a finite number, got NaN/, () => exportXmeml({ cues: [{ name: 'x', path: 'a.wav', at: 0, duration: 1, gainDb: NaN }] }))
+expectError('xmeml: gain above the limit', /gainDb must be between -120 and 24/, () => exportXmeml({ cues: [{ name: 'x', path: 'a.wav', at: 0, duration: 1, gainDb: 99 }] }))
+expectError('xmeml: gain below the limit', /gainDb must be between -120 and 24/, () => exportXmeml({ cues: [{ name: 'x', path: 'a.wav', at: 0, duration: 1, gainDb: -200 }] }))
+expectError('xmeml: non-numeric gain', /gainDb must be a finite number/, () => exportXmeml({ cues: [{ name: 'x', path: 'a.wav', at: 0, duration: 1, gainDb: 'loud' }] }))
+const gained = exportXmeml({ cues: [{ name: 'x', path: 'a.wav', at: 0, duration: 1, gainDb: -6 }], frameRate: 25 })
+check('xmeml: the written level is a finite number', /<value>\d+(?:\.\d+)?<\/value>/.test(gained.text), JSON.stringify(gained.text.match(/<value>[^<]*/)?.[0]))
+check('xmeml: NaN never reaches the document', !gained.text.includes('NaN'))
+
 /* -------------------------------------------------------------------- omf -- */
 
 console.log('\n-- omf: the skeleton is honest --')
@@ -338,6 +378,10 @@ check('tool xmeml: default timebase is 25', toolXmeml.verified.timebase === 25, 
 const xmlOnDisk = await readFile(toolXmeml.path, 'utf8')
 check('tool xmeml: file on disk parses', parseXmeml(xmlOnDisk).tracks[0].clips.length === 1)
 check('tool xmeml: absolute path url on disk', /<pathurl>file:\/\/\/[^<]+<\/pathurl>/.test(xmlOnDisk), JSON.stringify(xmlOnDisk.match(/<pathurl>[^<]*/)?.[0]))
+// The tool layer hands the writer an absolute `url`; it must be written verbatim,
+// so adding the path-only fallback changed nothing for the tool's own output.
+const expectedToolUrl = pathToFileURL(join(cwd, 'sfx', 'hit.wav')).href
+check('tool xmeml: pathurl is exactly the media file url', xmlOnDisk.includes(`<pathurl>${expectedToolUrl}</pathurl>`), `${expectedToolUrl} vs ${JSON.stringify(xmlOnDisk.match(/<pathurl>[^<]*/)?.[0])}`)
 check('tool xmeml: gain filter on disk', /<effectid>audiolevels<\/effectid>/.test(xmlOnDisk))
 check('tool xmeml: verified frame rate label', /25 fps/.test(toolXmeml.text), toolXmeml.text)
 

@@ -91,10 +91,14 @@ npm view dsh-audio version        # -> 0.0.1, belongs to another package; do not
 node tools/test-all.mjs
 ```
 
-Expected final line: `45 file(s) · 45 ok · 0 failed · …` with one `ok` line per
-file (45 files at the time of writing; add the new file's line if one is added).
-`tools/test-all.mjs` runs one child process per file, capped output, exits
-non-zero on any failure.
+Expected final line: `57 file(s) · 57 ok · 0 failed · …` with one `ok` line per
+file (57 files at the time of writing; `node tools/test-all.mjs --list` prints
+the authoritative list and its final `<n> file(s)` count, so trust that number
+if this line has drifted). `tools/test-all.mjs` runs one child process per file,
+capped output, exits non-zero on any failure. A file that exits 0 without
+printing `OK:` or `SKIP:` is reported as a **failure**: every executable file
+under `test/` must state its own verdict, and reusable helpers live in
+`test/support/` (not discovered) instead of being counted as passing tests.
 
 - `npm test` runs the same command.
 - `npm run test:smoke` runs only `test/smoke.mjs`.
@@ -115,21 +119,27 @@ npm pack --dry-run
 # machine-readable: npm pack --dry-run --json
 ```
 
-This writes nothing. Expected result (measured on the 0.5.10 tree on 2026-11-22;
-the tree was still gaining `lib/` modules while this runbook was written, so the
-exact count can drift by a few files — trust the `total files` / `package size`
-lines npm prints, and check the *groups* below and the absence of residue):
+This writes nothing. Expected result (measured on the 0.5.10 tree on 2026-11-28;
+the tree keeps gaining `lib/` modules and tests while this runbook is written,
+so the exact counts drift — re-run `npm pack --dry-run --json` and trust the
+`entryCount` / `size` / `unpackedSize` it reports, and check the *groups* below
+and the absence of residue):
 
 - tarball name: **`dsh-audiokit-0.5.10.tgz`**
-- **124 files** (measured on the 0.5.10 tree on 2026-11-22), packed size
-  ≈ **876 KB**, unpacked ≈ **3.02 MB**
+- **154 files** (measured on 2026-11-28), packed size
+  ≈ **1.10 MB**, unpacked ≈ **3.83 MB**
 - root: `package.json`, `index.js`, `client.js`, `cordis.patch.yml`, `icon.svg`,
   `README.md`, `LICENSE`
-- `lib/`: every `.js` module (59 at the time of writing; grows with every new
+- `lib/`: every `.js` module (70 at the time of writing; grows with every new
   tool/module — all of them must be there, none may be missing)
 - `locale/`: `en.json`, `zh.json`
-- `docs/`: `DETAIL.md`, `DETAIL.zh.md`, `preview.svg`, `RELEASE.md` (this file)
-- `test/`: 45 `.mjs` files (one per file under `test/`)
+- `docs/`: every document under `docs/` (`CREATURES.zh.md`, `DETAIL.md`,
+  `DETAIL.zh.md`, `EDITOR.zh.md`, `GENERATE.zh.md`, `INTEROP.zh.md`,
+  `preview.svg`, `RELEASE.md`, `SCHEMA_DIET.zh.md`)
+- `test/`: 57 `.mjs` files (one per file the runner executes; `node
+  tools/test-all.mjs --list` is authoritative) plus
+  `test/support/fake-provider.mjs` and `test/support/legacy-resample.mjs`,
+  shared helpers the HTTP and resampler tests import
 - `tools/`: 7 `.mjs` files —
   `fetch-voicebank.mjs`, `preset-report.mjs`, `probe-minimax.mjs`,
   `sing-bank.mjs`, `stretch-demo.mjs`, `test-all.mjs`, `verify-html.mjs`

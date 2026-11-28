@@ -27,6 +27,11 @@ const TAU = Math.PI * 2
 /** The labels this module can emit, in a stable order. `none` is closed/rest. */
 export const VISEMES = ['AA', 'EH', 'EE', 'OH', 'OO', 'MM', 'FF', 'TH', 'SS', 'DD', 'none']
 
+/** Whitelist membership test, so every formatter uses the same set. */
+const VISEME_SET = new Set(VISEMES)
+/** A viseme is also used as a CSS class/selector fragment: no markup characters. */
+const SAFE_VISEME = /^[A-Za-z0-9_-]+$/
+
 /** Vowels, i.e. labels that require an open jaw. */
 const VOWELS = new Set(['AA', 'EH', 'EE', 'OH', 'OO'])
 
@@ -462,7 +467,7 @@ export function analyzeVisemes (samples, sampleRate, options = {}) {
     previousLevel = frame.level
   }
 
-  const minFrames = Math.max(1, Math.round(minDurationMs / 1000 * fps))
+  const minFrames = Math.max(1, Math.ceil(minDurationMs / 1000 * fps))
   const switchFrames = Math.max(2, Math.round((0.03 + hysteresis * 0.07) * fps))
   mergeShortRuns(labels, minFrames, SHORT_RUN_EXEMPT)
   despikeRuns(labels, switchFrames, SHORT_RUN_EXEMPT)
@@ -543,6 +548,46 @@ function timecode (seconds) {
 }
 
 /**
+ * Force every frame's `viseme` onto the module whitelist.
+ *
+ * The textual formats interpolate the label straight into an SRT cue or a CSS
+ * selector, so a hand-edited track (or one from another tool) could inject
+ * arbitrary text there. An unknown label becomes `none` — a closed mouth is the
+ * safe rendering of "shape not understood" — and the substitution is reported
+ * through `warnings` when the caller passes an array. Frames that are already
+ * valid are returned by reference, so an engine-generated track formats exactly
+ * as before.
+ *
+ * @param {Array<object>} frames - frame list, possibly from outside this module.
+ * @param {string[]} [warnings] - optional sink for a summary line.
+ * @returns {Array<object>} frames whose `viseme` is in `VISEMES`.
+ */
+function sanitiseFrames (frames, warnings) {
+  const list = Array.isArray(frames) ? frames : []
+  const clean = new Array(list.length)
+  const unknown = new Map()
+  let replaced = 0
+  for (let i = 0; i < list.length; i += 1) {
+    const frame = list[i] !== null && typeof list[i] === 'object' ? list[i] : { t: 0 }
+    const viseme = frame.viseme
+    if (typeof viseme === 'string' && VISEME_SET.has(viseme)) {
+      clean[i] = frame
+      continue
+    }
+    const label = typeof viseme === 'string' ? viseme : String(viseme)
+    const shown = label.length > 24 ? `${label.slice(0, 24)}…` : label
+    unknown.set(shown, (unknown.get(shown) ?? 0) + 1)
+    replaced += 1
+    clean[i] = { ...frame, viseme: 'none' }
+  }
+  if (replaced > 0 && Array.isArray(warnings)) {
+    const labels = [...unknown.entries()].map(([label, count]) => `${JSON.stringify(label)}×${count}`).join(', ')
+    warnings.push(`lipsync: ${replaced} frame(s) had a viseme outside the whitelist (${labels}); used "none"`)
+  }
+  return clean
+}
+
+/**
  * Render the track as SubRip cues, one cue per viseme run.
  *
  * Synthesis has no sentences to subtitle, so the "text" of each cue is the
@@ -550,12 +595,14 @@ function timecode (seconds) {
  * Silent gaps are omitted (absence of a cue already means closed mouth), which
  * is also what keeps the file small enough to ship next to a page.
  *
- * @param {Array<object>} frames - frames from `analyzeVisemes`.
- * @param {object} [options] - `fps`, `includeSilence` (default false).
+ * @param {Array<object>} frames - frames from `analyzeVisemes` (or any frame list;
+ *   labels outside `VISEMES` are replaced with `none`).
+ * @param {object} [options] - `fps`, `includeSilence` (default false), `warnings`
+ *   (array that receives a note when an unknown viseme was replaced).
  * @returns {string} SRT document.
  */
 export function visemeToSrt (frames, options = {}) {
-  const list = Array.isArray(frames) ? frames : []
+  const list = sanitiseFrames(frames, options.warnings)
   const fps = Number.isFinite(options.fps) ? options.fps : inferFps(list)
   const includeSilence = options.includeSilence === true
   const lines = []
@@ -598,6 +645,9 @@ function buildCssTrack (frames, meta) {
   const present = []
   for (const viseme of VISEMES) {
     if (viseme === 'none') continue
+    // The label becomes a class name and a keyframes name below; keep that
+    // filter even though `sanitiseFrames` already guarantees the whitelist.
+    if (!SAFE_VISEME.test(viseme)) continue
     if (runs.some((run) => run.viseme === viseme)) present.push(viseme)
   }
   for (const viseme of present) {
@@ -654,13 +704,15 @@ function buildAeTrack (frames) {
  * - `css`: an opacity-step + jaw-scale keyframe track, no `@property` needed.
  * - `ae`: After Effects text-keyframe paste, one `time<TAB>shape` line per change.
  *
- * @param {Array<object>} frames - frames from `analyzeVisemes`.
+ * @param {Array<object>} frames - frames from `analyzeVisemes` (or any frame list;
+ *   labels outside `VISEMES` are replaced with `none` before formatting).
  * @param {'json'|'srt'|'css'|'ae'} [format='json'] - target consumer.
- * @param {object} [options] - `fps`, `leadMs`, `duration`, `includeSilence`.
+ * @param {object} [options] - `fps`, `leadMs`, `duration`, `includeSilence`,
+ *   `warnings` (array that receives a note when an unknown viseme was replaced).
  * @returns {string} the formatted track.
  */
 export function visemeToTimeline (frames, format = 'json', options = {}) {
-  const list = Array.isArray(frames) ? frames : []
+  const list = sanitiseFrames(frames, options.warnings)
   const fps = Number.isFinite(options.fps) ? options.fps : inferFps(list)
   const duration = Number.isFinite(options.duration) ? options.duration : inferDuration(list, fps)
   const leadMs = Number.isFinite(options.leadMs) ? options.leadMs : 0

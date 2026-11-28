@@ -12,7 +12,10 @@
  *                             instead of hiding a missing decoder behind an error;
  *   POST /dsh-audio/voices  → ask the configured provider for its voices
  *                             (MiniMax account list or the Edge catalogue), and
- *                             fall back to the static shortlist with a marker;
+ *                             fall back to the static shortlist with a marker.
+ *                             The body must be an empty object: the provider row
+ *                             is read from the saved config only, so a request
+ *                             can never aim the saved API key at another host;
  *   POST /dsh-audio/validate → model self-check: probe the *saved* endpoint and
  *                             push one real sample through it, reporting
  *                             reachability, HTTP status, whether audio was
@@ -30,10 +33,31 @@
  * the settings page say the same fact in the reader's language without parsing
  * Chinese prose on the client (see `REASON_CODES`).
  *
+ * Request policy. Only the page this plugin ships may drive these endpoints,
+ * and a page can be hosted on any origin, so every POST has to prove it is
+ * same-origin: `Sec-Fetch-Site: same-origin` is the signal, and when a client
+ * omits that header the strict `Origin` (scheme + host + port) versus `Host`
+ * comparison decides; a missing `Origin` is refused rather than trusted. GET is
+ * not gated (it only reads the redacted view). Every POST that parses a body
+ * must declare `Content-Type: application/json` (415 otherwise), a body over
+ * `MAX_BODY` gets 413 before the socket is torn down, and a stalled upload is
+ * aborted after `BODY_TIMEOUT_MS`.
+ *
+ * Config values that end up on the wire are constrained, because the saved API
+ * key travels with them: `apiKeyEnv` may only name a key the adapters know
+ * (`API_KEY_ENVS`), `baseUrl` must be `https:` and must not point at loopback,
+ * a private or a link-local address, and `ffmpegPath` may only pin a binary in
+ * DSH's own tools directory or a `ffmpeg`/`ffprobe` found on `PATH`. A value
+ * stored before these checks existed is presented as unconfigured instead of
+ * being echoed back or used by `/voices` (see `presentSection`).
+ *
  * Routes are registered inside `ctx.inject(['webServer'], …)`: on a cold boot
  * this plugin can activate before the HTTP carrier is mounted.
  */
 
+import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { basename, isAbsolute, join, relative, resolve } from 'node:path'
 import { finalize, renderPreset, toWavBytes } from './audio.js'
 import {
   CHAT_AUDIO_DEFAULTS,
@@ -47,9 +71,32 @@ import {
 import { findFfmpeg } from './providers-edge.js'
 
 const MAX_BODY = 64 * 1024
+/** A client has this long to finish uploading a JSON body. */
+const BODY_TIMEOUT_MS = 10_000
 
 const TTS_FIELDS = ['provider', 'baseUrl', 'model', 'voice', 'speed', 'pitch', 'sampleRate', 'groupId', 'ffmpegPath', 'apiKey', 'apiKeyEnv']
 const CHECK_FIELDS = ['provider', 'baseUrl', 'model', 'apiKey', 'apiKeyEnv', 'autoValidate']
+/** Numeric fields, coerced by `pickFields`. */
+const TTS_NUMERIC = ['speed', 'pitch', 'sampleRate']
+
+/**
+ * The only environment variables an adapter will ever read a key from.
+ *
+ * `apiKeyEnv` names a process variable, so an unrestricted value is a way to
+ * make the plugin read a secret it was never meant to read (and send it as a
+ * bearer to the configured endpoint). These are the names the three adapters
+ * actually fall back to, so a whitelist costs nothing and closes that door.
+ */
+const API_KEY_ENVS = Object.freeze(['MINIMAX_API_KEY', 'DASHSCOPE_API_KEY', 'OPENAI_API_KEY'])
+
+/** DSH installs its own tools under this directory; only those may be pinned. */
+const FFMPEG_TOOLS_DIR = join(homedir(), '.dsh', 'tools', 'ffmpeg')
+
+/** Bare binary names `ffmpegPath` may refer to when they resolve through PATH. */
+const FFMPEG_COMMANDS = Object.freeze(['ffmpeg', 'ffmpeg.exe', 'ffprobe', 'ffprobe.exe'])
+
+/** Default ports, folded away before an `Origin`/`Host` comparison. */
+const DEFAULT_PORTS = { 'http:': '80', 'https:': '443' }
 
 /** Defaults used when the config leaves the env name empty. */
 const DEFAULT_ENV = { tts: 'MINIMAX_API_KEY', check: 'DASHSCOPE_API_KEY' }
@@ -97,50 +144,219 @@ const ANSWER_LIMIT = 300
 /** A provider error is displayable text, never a stack: keep one paragraph. */
 const ERROR_LIMIT = 500
 
-function sendJson (res, status, payload) {
+function sendJson (res, status, payload, extraHeaders = undefined) {
   const body = JSON.stringify(payload)
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
-    'Content-Length': Buffer.byteLength(body)
+    'Content-Length': Buffer.byteLength(body),
+    ...extraHeaders
   })
   res.end(body)
 }
 
-function readJson (req) {
+/**
+ * A failure with an HTTP meaning, thrown by the request/config readers.
+ *
+ * `status` picks the response line (400 malformed JSON, 408 timeout, 413 body
+ * too large, 415 wrong media type), `close` asks the reply to send
+ * `Connection: close` and then tear the socket down, and `reasonCode` / `field`
+ * are copied into the JSON body so a caller (and a test) can tell *which* rule
+ * rejected the request without parsing the Chinese message.
+ */
+class RequestError extends Error {
+  constructor (status, message, options = {}) {
+    super(message)
+    this.name = 'RequestError'
+    this.status = status
+    this.close = options.close === true
+    if (typeof options.reasonCode === 'string') this.reasonCode = options.reasonCode
+    if (typeof options.field === 'string') this.field = options.field
+  }
+}
+
+/** True for a value our own readers threw; anything else is an unexpected bug. */
+function isRequestError (error) {
+  return error instanceof RequestError
+}
+
+/**
+ * Answer with `error`'s status and keep the response shape every failure uses.
+ *
+ * The response is written *before* a `close` error destroys the request: with
+ * the fixed order (reply, then destroy) a 413 actually reaches the client
+ * instead of dying with the socket. The write is best-effort because the peer
+ * may already be gone (a timeout aborts the socket on purpose).
+ */
+function replyError (request, response, error) {
+  const status = isRequestError(error) ? error.status : 400
+  const payload = { ok: false, error: error?.message ?? String(error) }
+  if (typeof error?.reasonCode === 'string') payload.reasonCode = error.reasonCode
+  if (typeof error?.field === 'string') payload.field = error.field
+  try {
+    if (response?.headersSent !== true && response?.destroyed !== true && response?.writableEnded !== true) {
+      // The socket may already be gone (a timeout destroyed it); a write error
+      // on the response must not become an unhandled 'error' in the host.
+      if (typeof response?.on === 'function') response.once('error', () => {})
+      sendJson(response, status, payload, error?.close === true ? { Connection: 'close' } : undefined)
+    }
+  } catch { /* the peer is gone; there is nobody left to tell */ }
+  if (error?.close === true && typeof request?.destroy === 'function') {
+    const destroy = () => {
+      try { request.destroy() } catch { /* already destroyed */ }
+    }
+    // Tear the socket down only once the reply has been flushed to the OS:
+    // destroying first would discard the 413 the client is supposed to read.
+    // `finish` is what guarantees that; a stub response without events gets the
+    // immediate path (the ordering is asserted by test/security-settings.mjs).
+    if (typeof response?.once === 'function' && response.writableFinished !== true) response.once('finish', destroy)
+    else destroy()
+  }
+}
+
+/**
+ * Read a JSON request body with the request policy the endpoints document.
+ *
+ * Checks the media type first (a form-encoded or text body is not JSON, and
+ * accepting it would only turn a caller bug into a confusing 400), then streams
+ * the body with a hard size cap and an inactivity timeout. Over the cap it
+ * pauses the upload and rejects with a 413 that carries `close`, so the caller
+ * can reply and *then* destroy — the old code destroyed the socket first, which
+ * made the 400 unverifiable. A parse failure is its own `RequestError`, so it
+ * stays a 400 and never picks up a provider-style `reasonCode`.
+ *
+ * @param {import('node:http').IncomingMessage} request - the request to read.
+ * @returns {Promise<object>} the parsed body, `{}` when it was empty.
+ * @throws {RequestError} 408 / 413 / 415 / 400.
+ */
+function readJson (request) {
   return new Promise((resolve, reject) => {
+    // Observe stream errors from the very start. A request rejected for its
+    // media type is never consumed, and an unobserved 'error' when the peer
+    // hangs up would become an unhandled event in the host process.
+    request.on('error', () => {})
+
+    const mediaType = String(request.headers?.['content-type'] ?? '').split(';')[0].trim().toLowerCase()
+    if (mediaType !== 'application/json') {
+      reject(new RequestError(415, '请求必须使用 Content-Type: application/json'))
+      return
+    }
+
     const chunks = []
     let size = 0
-    req.on('data', (chunk) => {
+    let settled = false
+    let timer = null
+
+    const finish = (error, value) => {
+      if (settled) return
+      settled = true
+      if (timer !== null) clearTimeout(timer)
+      // Release the socket timeout the abort guard installed; the request may
+      // live on as a keep-alive connection after this body was read.
+      if (typeof request.setTimeout === 'function') {
+        try { request.setTimeout(0) } catch { /* no socket (test double or gone) */ }
+      }
+      if (error !== undefined) reject(error)
+      else resolve(value)
+    }
+
+    const abort = () => {
+      // Stop reading and let the reply path finish (`close: true`): the 408 is
+      // written first, and the socket is torn down once it has been flushed.
+      if (typeof request.pause === 'function') request.pause()
+      finish(new RequestError(408, `请求体读取超时（${BODY_TIMEOUT_MS} ms）`, { close: true }))
+    }
+
+    request.on('data', (chunk) => {
+      if (settled) return
       size += chunk.length
       if (size > MAX_BODY) {
-        reject(new Error('请求体过大'))
-        req.destroy()
+        // Stop consuming: the upload is over budget, and the caller is about to
+        // answer 413 and close the connection anyway.
+        if (typeof request.pause === 'function') request.pause()
+        finish(new RequestError(413, `请求体超过 ${MAX_BODY} 字节`, { close: true }))
         return
       }
       chunks.push(chunk)
     })
-    req.on('end', () => {
+    request.on('end', () => {
+      if (settled) return
       const raw = Buffer.concat(chunks).toString('utf8').trim()
-      if (raw.length === 0) return resolve({})
-      try { resolve(JSON.parse(raw)) } catch { reject(new Error('请求体不是合法 JSON')) }
+      if (raw.length === 0) {
+        finish(undefined, {})
+        return
+      }
+      try {
+        finish(undefined, JSON.parse(raw))
+      } catch {
+        finish(new RequestError(400, '请求体不是合法 JSON'))
+      }
     })
-    req.on('error', reject)
+    request.on('error', (error) => finish(new RequestError(400, `读取请求体失败：${error?.message ?? error}`)))
+
+    // Two guards: an inactivity timeout on a real socket, and a plain timer so a
+    // stub request (tests, a transport that has no `setTimeout`) still settles.
+    timer = setTimeout(abort, BODY_TIMEOUT_MS)
+    if (typeof timer.unref === 'function') timer.unref()
+    if (typeof request.setTimeout === 'function') request.setTimeout(BODY_TIMEOUT_MS, abort)
   })
 }
 
+/** The scheme a request arrived on, honouring a reverse proxy's header. */
+function requestProtocol (request) {
+  const forwarded = request.headers?.['x-forwarded-proto']
+  if (typeof forwarded === 'string' && forwarded.trim() !== '') {
+    return `${forwarded.split(',')[0].trim().toLowerCase().replace(/:$/, '')}:`
+  }
+  return request.socket?.encrypted === true ? 'https:' : 'http:'
+}
+
+/** `host[:port]` with the scheme's default port folded away. */
+function normalizeHost (value, protocol) {
+  const host = String(value ?? '').trim().toLowerCase()
+  if (host === '') return ''
+  const port = DEFAULT_PORTS[protocol] ?? ''
+  if (port !== '' && host.endsWith(`:${port}`)) return host.slice(0, -(port.length + 1))
+  return host
+}
+
 /**
- * Reject cross-site callers. `Sec-Fetch-Site` is the reliable signal; the
- * `Origin` equality check is deliberately gone because a reverse proxy or an
- * alias host (localhost vs 127.0.0.1) makes it false-positive and blocks the
- * save button.
+ * Refuse a request that cannot prove it came from this origin.
+ *
+ * `Sec-Fetch-Site` is the reliable signal when present, and only its strictest
+ * value passes: `same-site` is a *different* origin on the same site and must
+ * not drive config writes, and `none` is not the settings page either. When the
+ * header is absent (older client, proxy that strips it) the request falls back
+ * to the classic comparison of `Origin` against the request's own scheme and
+ * `Host`; a missing `Origin` is refused, because "no proof" is not "same
+ * origin". GET/HEAD only read the redacted view and are not gated.
  */
 function sameOriginOnly (request, response) {
-  const site = request.headers['sec-fetch-site']
-  if (site === undefined || site === 'none') return true
-  if (site === 'same-origin' || site === 'same-site') return true
+  if (request.method === 'GET' || request.method === 'HEAD') return true
+
+  const site = request.headers?.['sec-fetch-site']
+  if (typeof site === 'string' && site.length > 0) {
+    if (site === 'same-origin') return true
+    sendJson(response, 403, { ok: false, error: '只接受同源请求' })
+    return false
+  }
+
+  const origin = request.headers?.origin
+  const host = request.headers?.host
+  if (typeof origin === 'string' && origin.length > 0 && typeof host === 'string' && host.length > 0) {
+    try {
+      const parsed = new URL(origin)
+      const protocol = requestProtocol(request)
+      if (parsed.protocol === protocol && normalizeHost(parsed.host, protocol) === normalizeHost(host, protocol)) return true
+    } catch { /* a malformed Origin cannot match */ }
+  }
   sendJson(response, 403, { ok: false, error: '只接受同源请求' })
   return false
+}
+
+/** Own-property test: a value inherited from Object.prototype is not set. */
+function hasOwn (object, key) {
+  return object !== null && typeof object === 'object' && Object.prototype.hasOwnProperty.call(object, key)
 }
 
 /** Keep only known fields, and coerce the numeric ones. */
@@ -164,27 +380,265 @@ function pickFields (source, fields, numeric) {
   return out
 }
 
+/**
+ * The env var name a saved row may use, or '' when it is not on the whitelist.
+ *
+ * Read-side mirror of the save check: a row persisted before the whitelist
+ * existed must not make an adapter read an arbitrary process variable, so an
+ * unrecognised name is treated as "not configured" (the adapter then falls back
+ * to its own default variable) instead of being used or crashing the page.
+ */
+function usableEnvName (value) {
+  const name = typeof value === 'string' ? value.trim() : ''
+  return API_KEY_ENVS.includes(name) ? name : ''
+}
+
+/** Refuse an `apiKeyEnv` outside the whitelist; empty clears the field. */
+function assertApiKeyEnv (row) {
+  if (!hasOwn(row, 'apiKeyEnv')) return
+  const raw = row.apiKeyEnv
+  if (raw === null || raw === undefined) return
+  const name = String(raw).trim()
+  if (name === '' || API_KEY_ENVS.includes(name)) return
+  throw new RequestError(
+    400,
+    `apiKeyEnv 只允许 ${API_KEY_ENVS.join(' / ')}（收到 "${name.slice(0, 64)}"）`,
+    { reasonCode: 'invalid-api-key-env', field: 'apiKeyEnv' }
+  )
+}
+
+/** Strip the brackets WHATWG URLs keep around an IPv6 literal. */
+function bareHostname (hostname) {
+  return String(hostname ?? '').trim().toLowerCase().replace(/\.$/, '').replace(/^\[|\]$/g, '')
+}
+
+/**
+ * True for an address that is this machine, a private network or link-local.
+ *
+ * `URL` already canonicalises exotic IPv4 spellings (`0x7f000001`, `127.1`) and
+ * IPv4-mapped IPv6 (`::ffff:7f00:1`), so the dotted-quad and `fc`/`fe80` checks
+ * below see a normalised host. DNS names are matched only for `localhost`; a
+ * name that *resolves* to a private address cannot be seen without a lookup,
+ * and a lookup would make the save path network-bound.
+ */
+function isLocalOrPrivateHostname (hostname) {
+  const host = bareHostname(hostname)
+  if (host === '') return true
+  if (host === 'localhost' || host.endsWith('.localhost')) return true
+
+  const dotted = /^(?:::ffff:)?(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host)
+  if (dotted !== null) {
+    const [a, b] = [Number(dotted[1]), Number(dotted[2])]
+    return a === 0 || a === 127 || a === 10 ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 169 && b === 254) ||
+      (a === 100 && b >= 64 && b <= 127)
+  }
+  // WHATWG normalises `::ffff:127.0.0.1` to the hex form `::ffff:7f00:1`.
+  const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host)
+  if (mapped !== null) {
+    const high = Number.parseInt(mapped[1], 16)
+    const low = Number.parseInt(mapped[2], 16)
+    return isLocalOrPrivateHostname(`${(high >> 8) & 0xff}.${high & 0xff}.${(low >> 8) & 0xff}.${low & 0xff}`)
+  }
+
+  if (host === '::' || host === '::1') return true
+  // fc00::/7 (unique local) and fe80::/10 (link local).
+  if (/^f[cd][0-9a-f]{0,2}:/.test(host)) return true
+  if (/^fe[89ab][0-9a-f]?:/.test(host)) return true
+  return false
+}
+
+/**
+ * Whether a URL is a usable provider endpoint: absolute, `https:`, public.
+ * Never throws — read paths ask this about values stored before validation
+ * existed, and a malformed string must simply count as "not usable".
+ */
+function isAllowedBaseUrl (value) {
+  const raw = String(value ?? '').trim()
+  if (raw === '') return true
+  let parsed
+  try {
+    parsed = new URL(raw)
+  } catch {
+    return false
+  }
+  if (parsed.protocol !== 'https:') return false
+  return !isLocalOrPrivateHostname(parsed.hostname)
+}
+
+/** Refuse a `baseUrl` the saved key must never be sent to; empty is allowed. */
+function assertBaseUrl (row) {
+  if (!hasOwn(row, 'baseUrl')) return
+  const raw = row.baseUrl
+  if (raw === null || raw === undefined) return
+  const value = String(raw).trim()
+  if (value === '') return
+
+  let parsed
+  try {
+    parsed = new URL(value)
+  } catch {
+    throw new RequestError(
+      400,
+      `baseUrl 必须是完整的 URL（例如 https://api.example.com），收到 "${value.slice(0, 120)}"`,
+      { reasonCode: 'invalid-base-url', field: 'baseUrl' }
+    )
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new RequestError(
+      400,
+      `baseUrl 只允许 https://（收到 "${parsed.protocol}"）：API 密钥只会发往加密的公开端点`,
+      { reasonCode: 'invalid-base-url', field: 'baseUrl' }
+    )
+  }
+  if (isLocalOrPrivateHostname(parsed.hostname)) {
+    throw new RequestError(
+      400,
+      `baseUrl 不允许指向本机、内网或链路本地地址（${bareHostname(parsed.hostname)}）`,
+      { reasonCode: 'invalid-base-url', field: 'baseUrl' }
+    )
+  }
+}
+
+/** True when `candidate` is a path strictly inside `directory`. */
+function insideDirectory (directory, candidate) {
+  const rel = relative(directory, candidate)
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)
+}
+
+/** Find an executable on PATH without spawning a process (`where`/`which`). */
+function executableOnPath (name) {
+  const pathValue = process.env.PATH ?? process.env.Path ?? ''
+  const directories = String(pathValue).split(process.platform === 'win32' ? ';' : ':').filter((part) => part !== '')
+  if (directories.length === 0) return null
+  const extensions = process.platform === 'win32'
+    ? String(process.env.PATHEXT ?? '.EXE;.CMD;.BAT;.COM').split(';').filter((part) => part !== '')
+    : ['']
+  const lower = name.toLowerCase()
+  const candidates = extensions.some((extension) => lower.endsWith(extension.toLowerCase()))
+    ? [name]
+    : extensions.map((extension) => `${name}${extension}`)
+  for (const directory of directories) {
+    for (const candidate of candidates) {
+      try {
+        if (existsSync(join(directory, candidate))) return join(directory, candidate)
+      } catch { /* an unreadable PATH entry is just not a match */ }
+    }
+  }
+  return null
+}
+
+/**
+ * Normalise a user-supplied `ffmpegPath`, or null when it must be ignored.
+ *
+ * Only two shapes are accepted, because this value names a binary the plugin
+ * executes: a path inside DSH's own `~/.dsh/tools/ffmpeg` directory, or a bare
+ * `ffmpeg`/`ffprobe` that really resolves through `PATH`. Anything else is
+ * dropped and the provider's auto-detection applies — silently, since the field
+ * means "pin this decoder" and an unusable pin has a documented fallback.
+ * @returns {string|null} the value to store ('' means auto-detect), or null to ignore.
+ */
+function allowedFfmpegPath (value) {
+  const raw = typeof value === 'string' ? value.trim() : ''
+  if (raw === '') return ''
+  const name = basename(raw).toLowerCase()
+  const looksLikePath = isAbsolute(raw) || raw.includes('/') || raw.includes('\\') || raw.startsWith('~')
+
+  if (!looksLikePath) {
+    if (!FFMPEG_COMMANDS.includes(name)) return null
+    return executableOnPath(name) === null ? null : name
+  }
+
+  const expanded = raw.startsWith('~') ? join(homedir(), raw.slice(1)) : raw
+  const resolved = isAbsolute(expanded) ? resolve(expanded) : resolve(FFMPEG_TOOLS_DIR, expanded)
+  return insideDirectory(FFMPEG_TOOLS_DIR, resolved) ? resolved : null
+}
+
+/**
+ * Validate the patch a POST /config carries.
+ *
+ * All messages are user-facing: the page prints `error` verbatim. The dangerous
+ * fields carry a `reasonCode` (+ `field`) so a test or a caller can tell which
+ * rule fired; the numeric/provider checks keep their original wording (the
+ * settings page and its tests match on it).
+ */
 function validate (section) {
-  const tts = section.tts ?? {}
+  const tts = section?.tts ?? {}
+  const check = section?.check ?? {}
   if (tts.provider !== undefined && !['minimax', 'openai', 'custom', 'edge', 'none'].includes(tts.provider)) {
     throw new Error('供应商只能是 minimax / openai / custom / edge / none')
   }
   if (tts.speed !== undefined && (tts.speed < 0.5 || tts.speed > 2)) throw new Error('语速必须在 0.5–2.0 之间')
   if (tts.pitch !== undefined && (tts.pitch < -12 || tts.pitch > 12)) throw new Error('音调必须在 −12..12 半音之间')
   if (tts.sampleRate !== undefined && (tts.sampleRate < 8000 || tts.sampleRate > 48000)) throw new Error('采样率必须在 8000–48000 之间')
+  for (const row of [tts, check]) {
+    assertApiKeyEnv(row)
+    assertBaseUrl(row)
+  }
   return section
 }
 
-/** One section as the page sees it: values minus the key, plus key/env facts. */
+/**
+ * One section as the page sees it: values minus the key, plus key/env facts.
+ *
+ * Values this module now refuses to persist are shown as unconfigured instead
+ * of being echoed back: a `baseUrl`/`ffmpegPath` stored before the checks
+ * existed is dropped from the view (so the field renders empty and the user can
+ * replace it) and a non-whitelisted `apiKeyEnv` falls back to the provider's
+ * default variable. Nothing here throws — an old config must never break the
+ * settings page.
+ */
 function presentSection (section, defaultEnv) {
   const { apiKey, apiKeyEnv, ...rest } = section ?? {}
-  const envName = (typeof apiKeyEnv === 'string' && apiKeyEnv.trim().length > 0) ? apiKeyEnv.trim() : defaultEnv
+  const view = { ...rest }
+  if (typeof view.baseUrl === 'string' && view.baseUrl.trim() !== '' && !isAllowedBaseUrl(view.baseUrl)) delete view.baseUrl
+  if (typeof view.ffmpegPath === 'string' && view.ffmpegPath.trim() !== '' && allowedFfmpegPath(view.ffmpegPath) === null) delete view.ffmpegPath
+  const envName = usableEnvName(apiKeyEnv) || defaultEnv
   return {
-    ...rest,
+    ...view,
     keySet: typeof apiKey === 'string' && apiKey.trim().length > 0,
     envName,
     envPresent: typeof process.env[envName] === 'string' && process.env[envName].trim().length > 0
   }
+}
+
+/**
+ * The saved row as provider code may read it (`/test`, `/validate`).
+ *
+ * Only the key source is rewritten: a non-whitelisted `apiKeyEnv` is dropped so
+ * `requireKey` falls back to the adapter's documented variable, and the page's
+ * `envName`/`envPresent` facts agree with what the call will really do. The
+ * endpoint and decoder are left exactly as saved, because these two endpoints
+ * exist to exercise the configuration that is in effect.
+ */
+function providerSection (section) {
+  if (section === null || typeof section !== 'object') return {}
+  const stored = typeof section.apiKeyEnv === 'string' ? section.apiKeyEnv.trim() : ''
+  const usable = usableEnvName(stored)
+  if (usable === stored && usable !== '') return section
+  const next = { ...section }
+  // An empty `apiKeyEnv` means "use the adapter's default variable", which
+  // `requireKey` only does when the field is absent (`''` would short-circuit
+  // the fallback), so the empty string is removed rather than forwarded.
+  if (usable === '') delete next.apiKeyEnv
+  else next.apiKeyEnv = usable
+  return next
+}
+
+/**
+ * The saved row `/voices` may call out with.
+ *
+ * This endpoint's only job is to read the saved voice list, so a `baseUrl`
+ * persisted before validation existed is treated as unconfigured here: the
+ * lookup then uses the provider's own public default host instead of sending
+ * the saved key wherever that stale value points.
+ */
+function voiceLookupSection (section) {
+  const next = { ...providerSection(section) }
+  if (typeof next.baseUrl === 'string' && next.baseUrl.trim() !== '' && !isAllowedBaseUrl(next.baseUrl)) delete next.baseUrl
+  return next
 }
 
 /** A short chime used as the sample for "test the audio-understanding endpoint". */
@@ -318,6 +772,8 @@ function trimBaseUrl (url) {
  * `describeAudio` / `speak`, which fail with instructions when no key exists.
  * So this mirrors their row-then-environment lookup but returns '' instead of
  * throwing, and `requireKey` stays the only place that defines "missing key".
+ * A non-whitelisted `apiKeyEnv` (see `usableEnvName`) is ignored the same way
+ * the provider side now ignores it, so the probe and the real call agree.
  * @param {object} section - the saved provider row.
  * @param {string} defaultEnv - env var to fall back to for this section.
  * @returns {string} the key, or '' when none is configured.
@@ -325,9 +781,7 @@ function trimBaseUrl (url) {
 function probeKey (section, defaultEnv) {
   const inline = typeof section?.apiKey === 'string' ? section.apiKey.trim() : ''
   if (inline.length > 0) return inline
-  const envName = typeof section?.apiKeyEnv === 'string' && section.apiKeyEnv.trim().length > 0
-    ? section.apiKeyEnv.trim()
-    : defaultEnv
+  const envName = usableEnvName(section?.apiKeyEnv) || defaultEnv
   const value = process.env[envName]
   return typeof value === 'string' ? value.trim() : ''
 }
@@ -344,8 +798,7 @@ function probeKey (section, defaultEnv) {
  * @returns {string} the env var name, never empty.
  */
 function keyEnvName (section, fallbackEnv) {
-  const named = typeof section?.apiKeyEnv === 'string' ? section.apiKeyEnv.trim() : ''
-  return named.length > 0 ? named : fallbackEnv
+  return usableEnvName(section?.apiKeyEnv) || fallbackEnv
 }
 
 /** The env var a provider's `requireKey` falls back to. */
@@ -483,7 +936,12 @@ async function checkEndpoint (target, resolved, section) {
     const message = '配置里没有 baseUrl'
     return { reachable: false, status: 0, error: message, detail: message, reasonCode: 'no-base-url' }
   }
-  const probe = await probeEndpoint(resolved.baseUrl, probeKey(section, DEFAULT_ENV[target]))
+  // The probe presents the same key a real call would. The fallback therefore
+  // has to be the *provider's* variable (`defaultEnvFor`), not the section's
+  // generic default: for an openai/custom TTS row the speech adapter reads
+  // OPENAI_API_KEY, and probing with MINIMAX_API_KEY would report a key that the
+  // saved configuration never uses.
+  const probe = await probeEndpoint(resolved.baseUrl, probeKey(section, defaultEnvFor(target, resolved)))
   if (probe.reachable) return { reachable: true, status: probe.status, error: null }
   return { reachable: false, status: 0, error: probe.error, detail: probe.error, reasonCode: 'endpoint-unreachable' }
 }
@@ -496,8 +954,11 @@ async function checkEndpoint (target, resolved, section) {
  * @returns {boolean} whether the injection was registered.
  */
 export function registerSettingsRoute (ctx, config, version) {
+  // The page shows which environment variable a blank key field would read, so
+  // the default has to follow the provider: an openai/custom speech row reads
+  // OPENAI_API_KEY, not the MiniMax one.
   const snapshot = () => ({
-    tts: presentSection(config.tts, DEFAULT_ENV.tts),
+    tts: presentSection(config.tts, defaultEnvFor('tts', { provider: config.tts?.provider })),
     check: presentSection(config.check, DEFAULT_ENV.check)
   })
 
@@ -526,16 +987,27 @@ export function registerSettingsRoute (ctx, config, version) {
           return
         }
 
-        const tts = pickFields(body.tts, TTS_FIELDS, ['speed', 'pitch', 'sampleRate'])
+        const tts = pickFields(body.tts, TTS_FIELDS, TTS_NUMERIC)
         const check = pickFields(body.check, CHECK_FIELDS, [])
+        // `ffmpegPath` pins a binary the plugin executes, so only a trusted
+        // location is kept. An unusable pin is not an error the page has to
+        // translate: it is ignored and the row falls back to auto-detection
+        // (empty string), which is the documented meaning of the field.
+        if (hasOwn(tts, 'ffmpegPath')) {
+          const pinned = allowedFfmpegPath(tts.ffmpegPath)
+          tts.ffmpegPath = pinned === null ? '' : pinned
+        }
         // Merge into what is stored (not into the redacted view), so a field the
         // page never edited — including a stored key — survives the write.
         let saved = null
         await editor.edit(entry, (current) => {
-          // Rebuild from the schema-known fields only: a key the schema no longer
-          // declares (say, a removed field) must not survive in the stored row.
-          const nextTts = { ...pickFields(current.tts ?? {}, TTS_FIELDS, ['speed', 'pitch', 'sampleRate']), ...tts }
-          const nextCheck = { ...pickFields(current.check ?? {}, CHECK_FIELDS, []), ...check }
+          // Overlay only the keys the page submitted. Rebuilding from
+          // `TTS_FIELDS` used to delete every key the settings UI does not show
+          // (format, subtitle, subtitleType, volume, timeoutMs, outputFormat,
+          // endpoint, voiceListUrl, decodeAudio …) on each save; those values
+          // are not the page's to erase, so they are carried over untouched.
+          const nextTts = { ...(current?.tts ?? {}), ...tts }
+          const nextCheck = { ...(current?.check ?? {}), ...check }
           saved = { tts: nextTts, check: nextCheck }
           return { ...current, tts: nextTts, check: nextCheck }
         })
@@ -544,10 +1016,13 @@ export function registerSettingsRoute (ctx, config, version) {
           restarting: true,
           config: saved === null
             ? null
-            : { tts: presentSection(saved.tts, DEFAULT_ENV.tts), check: presentSection(saved.check, DEFAULT_ENV.check) }
+            : {
+                tts: presentSection(saved.tts, defaultEnvFor('tts', { provider: saved.tts?.provider })),
+                check: presentSection(saved.check, DEFAULT_ENV.check)
+              }
         })
       } catch (error) {
-        sendJson(response, 400, { ok: false, error: error?.message ?? String(error) })
+        replyError(request, response, error)
       }
     })
 
@@ -563,7 +1038,7 @@ export function registerSettingsRoute (ctx, config, version) {
         }
         const body = await readJson(request)
         const target = body.target === 'check' ? 'check' : 'tts'
-        const section = target === 'check' ? (config.check ?? {}) : (config.tts ?? {})
+        const section = providerSection(target === 'check' ? (config.check ?? {}) : (config.tts ?? {}))
         const provider = target === 'check' ? null : String(section.provider ?? 'minimax').toLowerCase()
         pending = {
           target,
@@ -572,12 +1047,12 @@ export function registerSettingsRoute (ctx, config, version) {
           keyMissing: isKeyMissing(target, { provider, supported: true }, section)
         }
 
-        if (target === 'tts' && (config.tts?.provider ?? 'minimax') === 'edge') {
+        if (target === 'tts' && (section.provider ?? 'minimax') === 'edge') {
           // Edge needs no key. Whether it works depends on the service handshake
           // and on a decoder (ffmpeg or config.decodeAudio) being present, so
           // report those facts instead of collapsing them into one error.
           try {
-            const result = await speak(config.tts ?? {}, '这是一次连接测试。')
+            const result = await speak(section, '这是一次连接测试。')
             finalize(result.samples, result.sampleRate, -3)
             const wav = toWavBytes(result.samples, result.sampleRate)
             sendJson(response, 200, {
@@ -588,7 +1063,7 @@ export function registerSettingsRoute (ctx, config, version) {
               protocolOk: true,
               reason: null,
               decoder: result.effective?.decoder ?? null,
-              ffmpegPath: findFfmpeg({ ffmpegPath: config.tts?.ffmpegPath }),
+              ffmpegPath: findFfmpeg({ ffmpegPath: section.ffmpegPath }),
               durationSeconds: Number((result.samples.length / result.sampleRate).toFixed(2)),
               sampleRate: result.sampleRate,
               effective: result.effective,
@@ -609,7 +1084,7 @@ export function registerSettingsRoute (ctx, config, version) {
               reasonCode: info.reasonCode ?? null,
               detail: info.detail,
               decoder: null,
-              ffmpegPath: findFfmpeg({ ffmpegPath: config.tts?.ffmpegPath }),
+              ffmpegPath: findFfmpeg({ ffmpegPath: section.ffmpegPath }),
               format: undecodable ? error.encoded?.format ?? null : null,
               encodedBytes: undecodable ? error.encoded?.bytes?.length ?? null : null,
               timestamps: undecodable && error.encoded?.timestamps ? error.encoded.timestamps.items.length : null,
@@ -623,7 +1098,7 @@ export function registerSettingsRoute (ctx, config, version) {
         }
 
         if (target === 'tts') {
-          const result = await speak(config.tts ?? {}, '这是一次连接测试。')
+          const result = await speak(section, '这是一次连接测试。')
           finalize(result.samples, result.sampleRate, -3)
           const wav = toWavBytes(result.samples, result.sampleRate)
           sendJson(response, 200, {
@@ -639,7 +1114,7 @@ export function registerSettingsRoute (ctx, config, version) {
         }
 
         const sample = sampleWav()
-        const answer = await describeAudio(config.check ?? {}, sample.wav, '这是什么声音？用一句话回答。')
+        const answer = await describeAudio(section, sample.wav, '这是什么声音？用一句话回答。')
         sendJson(response, 200, {
           ok: true,
           target,
@@ -648,9 +1123,13 @@ export function registerSettingsRoute (ctx, config, version) {
           wavBase64: sample.wav.toString('base64')
         })
       } catch (error) {
-        // A provider refusal is data the page shows: `error` keeps the original
-        // wording untruncated, and the reason fields say the same fact in a form
-        // the page can translate.
+        // A malformed request is an HTTP error; a provider refusal is data the
+        // page shows, with `error` keeping the original wording untruncated and
+        // the reason fields saying the same fact in a form the page can translate.
+        if (isRequestError(error)) {
+          replyError(request, response, error)
+          return
+        }
         const report = { ok: false, error: error?.message ?? String(error) }
         if (pending !== null) {
           const info = classifyFailure(error, pending)
@@ -672,7 +1151,22 @@ export function registerSettingsRoute (ctx, config, version) {
           return
         }
         const body = await readJson(request)
-        const ttsConfig = { ...(config.tts ?? {}), ...(body.tts ?? {}) }
+        // The provider row comes from the saved config and nowhere else. The
+        // page sends `{}`; a body that tries to override the row would be a way
+        // to point the saved API key — `listVoices` sends it as a bearer — at a
+        // host of the caller's choosing, so any non-empty body is refused.
+        const overrides = body !== null && typeof body === 'object' && !Array.isArray(body) ? Object.keys(body) : null
+        if (overrides === null || overrides.length > 0) {
+          const received = overrides === null ? '不是 JSON 对象' : overrides.slice(0, 8).join(', ')
+          sendJson(response, 400, {
+            ok: false,
+            error: `音色列表只读取已保存的配置，不接受请求体覆盖（收到：${received}）；页面应发送空对象 {}`
+          })
+          return
+        }
+        // A baseUrl persisted before the endpoint checks existed is treated as
+        // unconfigured here, so the saved key cannot be sent to that stale host.
+        const ttsConfig = voiceLookupSection(config.tts)
         const provider = String(ttsConfig.provider ?? 'minimax').toLowerCase()
         if (provider !== 'minimax' && provider !== 'edge') {
           sendJson(response, 200, { ok: true, source: 'static', provider, items: [], note: `provider ${provider} 不提供音色列表` })
@@ -692,7 +1186,7 @@ export function registerSettingsRoute (ctx, config, version) {
           })
         }
       } catch (error) {
-        sendJson(response, 400, { ok: false, error: error?.message ?? String(error) })
+        replyError(request, response, error)
       }
     })
 
@@ -724,7 +1218,7 @@ export function registerSettingsRoute (ctx, config, version) {
 
         // Only the saved row is consulted from here on: choosing the section is
         // the page's job, choosing an address is not.
-        const section = target === 'check' ? (config.check ?? {}) : (config.tts ?? {})
+        const section = providerSection(target === 'check' ? (config.check ?? {}) : (config.tts ?? {}))
         const resolved = resolveSelfCheckTarget(target, section)
         // Everything a failure needs to name its cause, resolved before the call
         // so a thrown value can still be classified against the saved row.
@@ -773,6 +1267,10 @@ export function registerSettingsRoute (ctx, config, version) {
       } catch (error) {
         // Only an unreadable request is an HTTP error; everything the provider
         // did or refused is data the page shows.
+        if (isRequestError(error)) {
+          replyError(request, response, error)
+          return
+        }
         const report = { ok: false, error: failureText(error) }
         if (pending !== null) {
           const info = classifyFailure(error, pending)

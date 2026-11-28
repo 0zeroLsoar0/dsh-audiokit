@@ -333,15 +333,19 @@ function samplePeakDbfs (samples) {
  * @param {number} sampleRate - sample rate in Hz.
  * @param {object} [options] - measurement options.
  * @param {Float32Array[]} [options.channels] - use these channels instead of
- *   `samples`; their K-weighted powers are summed (mono/stereo files; surround
- *   weighting is not applied).
+ *   `samples`; their K-weighted powers are summed. An LFE channel must not be
+ *   passed (callers get the right list, weights included, from
+ *   `multichannel.loudnessChannels`).
+ * @param {number[]} [options.weights] - per-channel weight applied to the
+ *   summed power, parallel to `options.channels`. BS.1770-4 uses 1.0 for L/R/C
+ *   and 1.41 for each surround channel; omitted means equal weight.
  * @param {boolean} [options.dualMono=true] - count a single-channel signal
  *   twice (playback on both speakers). Set false for strict single-channel.
  * @returns {{ integratedLufs: number, shortTermMaxLufs: number, loudnessRangeLu: number,
  *   truePeakDbtp: number, samplePeakDbfs: number, gatedBlocks: number, durationSeconds: number,
  *   momentaryMaxLufs: number, relativeGateLufs: number, blocksMeasured: number,
  *   shortTermBasis: 'short-term'|'momentary'|'whole-file', blockSeconds: number,
- *   hopSeconds: number, channelCount: number, dualMono: boolean }}
+ *   hopSeconds: number, channelCount: number, dualMono: boolean, channelWeights: number[] }}
  *   `integratedLufs` / `shortTermMaxLufs` / `truePeakDbtp` are -Infinity when
  *   nothing in the file clears the -70 LUFS gate (no NaN anywhere);
  *   `blocksMeasured` counts standard 400 ms blocks, so 0 means the file was
@@ -360,9 +364,24 @@ export function analyzeLoudness (samples, sampleRate, options = {}) {
       throw new Error('analyzeLoudness needs sample arrays for every channel')
     }
   }
+  const requestedWeights = Array.isArray(options.weights) && options.weights.length > 0 ? options.weights : null
+  if (requestedWeights !== null && requestedWeights.length !== channelList.length) {
+    throw new Error(`analyzeLoudness needs one weight per channel: ${requestedWeights.length} weight(s) for ${channelList.length} channel(s)`)
+  }
+  const weights = []
+  for (let index = 0; index < channelList.length; index += 1) {
+    const weight = requestedWeights === null ? 1 : Number(requestedWeights[index])
+    if (!Number.isFinite(weight) || weight < 0) {
+      throw new Error(`analyzeLoudness weights must be finite and non-negative, got ${requestedWeights?.[index]}`)
+    }
+    weights.push(weight)
+  }
   const frames = Math.min(...channelList.map((channel) => channel.length))
   const dualMono = options.dualMono !== false
   const channelWeight = channelList.length === 1 && dualMono ? DUAL_MONO_WEIGHT : 1
+  // One weight per channel: the dual-mono convention for a single channel times
+  // the caller's BS.1770 surround weighting.
+  const channelWeights = weights.map((weight) => channelWeight * weight)
 
   const hopFrames = Math.max(1, Math.round(rate * HOP_SECONDS))
   const blockFrames = hopFrames * BLOCK_HOPS
@@ -372,8 +391,9 @@ export function analyzeLoudness (samples, sampleRate, options = {}) {
   // Every statistic below is a sum of hops, so nothing else touches the samples.
   const hopEnergies = new Float64Array(hopCount)
   let wholeEnergy = 0
-  for (const channel of channelList) {
-    const slice = sliceChannel(channel, frames)
+  for (let channel = 0; channel < channelList.length; channel += 1) {
+    const weight = channelWeights[channel]
+    const slice = sliceChannel(channelList[channel], frames)
     const weighted = kWeight(slice, rate)
     let channelEnergy = 0
     let offset = 0
@@ -385,14 +405,14 @@ export function analyzeLoudness (samples, sampleRate, options = {}) {
         sum += value * value
       }
       channelEnergy += sum
-      hopEnergies[hop] += sum * channelWeight
+      hopEnergies[hop] += sum * weight
       offset = end
     }
     for (let i = offset; i < frames; i += 1) {
       const value = weighted[i]
       channelEnergy += value * value
     }
-    wholeEnergy += channelEnergy * channelWeight
+    wholeEnergy += channelEnergy * weight
   }
 
   // --- 400 ms blocks, 75 % overlap, absolute then relative gate --------------
@@ -496,7 +516,8 @@ export function analyzeLoudness (samples, sampleRate, options = {}) {
     blockSeconds: round3(blockFrames / rate),
     hopSeconds: round3(hopFrames / rate),
     channelCount: channelList.length,
-    dualMono: channelList.length === 1 && dualMono
+    dualMono: channelList.length === 1 && dualMono,
+    channelWeights: channelWeights.map((weight) => round3(weight))
   }
 }
 

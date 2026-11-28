@@ -16,8 +16,9 @@
  */
 
 import { existsSync } from 'node:fs'
-import { mkdir, rm } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 import {
   estimateF0,
   loadVoicebank,
@@ -41,6 +42,142 @@ function check (label, condition, detail = '') {
 }
 const cents = (measured, target) => (measured > 0 && target > 0 ? 1200 * Math.log2(measured / target) : 0)
 const fixed = (value, digits = 2) => Number(value.toFixed(digits))
+
+/* ---- 0. synthetic banks: loader behaviour, no external bank needed ------- */
+
+/*
+ * The optional bank is not part of the plugin, so the rest of this file skips
+ * when no bank is installed. The loader's own failure modes still have to be
+ * pinned down on a machine that has none, which is what this self-contained
+ * section does with tiny generated banks.
+ *
+ * - one corrupt wav must cost one syllable, not the whole bank;
+ * - preutterance is a source-time offset, so a 22.05 kHz bank must not have it
+ *   doubled by a 44.1 kHz render;
+ * - a non-UTF-8 oto.ini (the usual Shift-JIS) must keep distinct aliases
+ *   distinct instead of folding them all into U+FFFD.
+ */
+
+/** A cheap harmonic tone: enough for the pitch analysis, fast to write. */
+function toneSamples (hz, seconds, rate) {
+  const frames = Math.round(seconds * rate)
+  const samples = new Float32Array(frames)
+  for (let i = 0; i < frames; i += 1) {
+    const t = i / rate
+    samples[i] = 0.45 * Math.sin(2 * Math.PI * hz * t) + 0.18 * Math.sin(2 * Math.PI * 2 * hz * t)
+  }
+  return samples
+}
+
+async function writeToneWav (path, hz, seconds, rate) {
+  await writeFile(path, encodeWav([toneSamples(hz, seconds, rate)], rate))
+}
+
+/** A RIFF/WAVE header the decoder must reject: A-law is not integer PCM. */
+function alawWavBytes () {
+  const bytes = Buffer.alloc(48)
+  bytes.write('RIFF', 0, 'ascii')
+  bytes.writeUInt32LE(40, 4)
+  bytes.write('WAVE', 8, 'ascii')
+  bytes.write('fmt ', 12, 'ascii')
+  bytes.writeUInt32LE(16, 16)
+  bytes.writeUInt16LE(6, 20) // WAVE_FORMAT_ALAW
+  bytes.writeUInt16LE(1, 22)
+  bytes.writeUInt32LE(44100, 24)
+  bytes.writeUInt32LE(44100, 28)
+  bytes.writeUInt16LE(1, 32)
+  bytes.writeUInt16LE(8, 34)
+  bytes.write('data', 36, 'ascii')
+  bytes.writeUInt32LE(4, 40)
+  return bytes
+}
+
+const syntheticRoot = await mkdtemp(join(tmpdir(), 'dsh-voicebank-'))
+try {
+  /* -- one corrupt take must not take the bank down -- */
+  const partialDir = join(syntheticRoot, 'partial')
+  await mkdir(partialDir)
+  await writeToneWav(join(partialDir, 'good.wav'), 220, 0.5, 44100)
+  await writeFile(join(partialDir, 'broken.wav'), alawWavBytes())
+  await writeFile(join(partialDir, 'oto.ini'), 'good.wav=ka,0,0,-1,50,0\nbroken.wav=na,0,0,-1,50,0\n', 'utf8')
+  let partialBank = null
+  let partialError = ''
+  try {
+    partialBank = loadVoicebank(partialDir)
+  } catch (error) {
+    partialError = String(error?.message ?? error)
+  }
+  console.log(`\n-- synthetic bank: one corrupt wav --`)
+  if (partialBank === null) {
+    console.log(`  load threw: ${partialError}`)
+  } else {
+    console.log(`  loaded ${partialBank.meta.syllables} syllable(s) from ${partialBank.meta.files} wav file(s): ` +
+      `${partialBank.meta.missingFiles} missing file(s), ${partialBank.meta.missingEntries} missing entr(ies) of ${partialBank.meta.entries}`)
+  }
+  check('a corrupt wav does not fail the whole bank', partialBank !== null, partialError)
+  if (partialBank !== null) {
+    check('the healthy alias still loads', partialBank.syllables.has('ka') && !partialBank.syllables.has('na'),
+      [...partialBank.syllables.keys()].join(','))
+    check('missing files and entries are counted',
+      partialBank.meta.files === 1 && partialBank.meta.missingFiles === 1 &&
+      partialBank.meta.missingEntries === 1 && partialBank.meta.entries === 2,
+      JSON.stringify({ files: partialBank.meta.files, missingFiles: partialBank.meta.missingFiles, missingEntries: partialBank.meta.missingEntries, entries: partialBank.meta.entries }))
+    const healthy = renderVoicebank(
+      { bpm: 120, notes: [{ midi: 57, syllable: 'ka', durationSeconds: 0.3 }] },
+      { bank: partialBank, sampleRate: 44100, seed: 4 }
+    )
+    const audible = healthy.samples.some((sample) => Math.abs(sample) > 1e-3)
+    console.log(`  healthy take renders ${healthy.samples.length} frames, audible ${audible}, fallback ${healthy.syllableTimings[0].fallback}`)
+    check('the healthy alias renders audio', audible && healthy.syllableTimings[0].fallback === false)
+  }
+
+  /* -- preutterance converts with the recorded rate -- */
+  // A single note at start 0 gets exactly `preutterance` seconds of lead-in, so
+  // the reported start time is the preutterance in seconds. With the output rate
+  // misused it was twice that (50 ms read as 100 ms) whenever the bank rate was
+  // half the output rate.
+  const preDir = join(syntheticRoot, 'preutterance')
+  await mkdir(preDir)
+  await writeToneWav(join(preDir, 'tone22.wav'), 220, 0.6, 22050)
+  await writeFile(join(preDir, 'oto.ini'), 'tone22.wav=ka,0,0,-1,50,0\n', 'utf8')
+  const preBank = loadVoicebank(preDir)
+  console.log(`\n-- synthetic bank: 22.05 kHz preutterance, 50 ms --`)
+  const preRows = [22050, 44100].map((rate) => {
+    const rendered = renderVoicebank(
+      { bpm: 120, notes: [{ midi: 57, syllable: 'ka', start: 0, durationSeconds: 0.35 }] },
+      { bank: preBank, sampleRate: rate, seed: 3 }
+    )
+    const timing = rendered.syllableTimings[0]
+    console.log(`  ${rate} Hz output: preutterance ${fixed(timing.startSeconds, 4)} s (recorded 0.05 s)`)
+    return timing.startSeconds
+  })
+  check('22.05 kHz preutterance is 50 ms at 22.05 kHz output', Math.abs(preRows[0] - 0.05) < 0.005, String(preRows[0]))
+  check('22.05 kHz preutterance is still 50 ms at 44.1 kHz output', Math.abs(preRows[1] - 0.05) < 0.005, String(preRows[1]))
+
+  /* -- a non-UTF-8 oto.ini keeps distinct aliases distinct -- */
+  const latinDir = join(syntheticRoot, 'latin1')
+  await mkdir(latinDir)
+  await writeToneWav(join(latinDir, 'tone-a.wav'), 220, 0.4, 44100)
+  await writeToneWav(join(latinDir, 'tone-b.wav'), 247, 0.4, 44100)
+  // 0x82A0 and 0x82A2 are two different Shift-JIS characters; a non-fatal UTF-8
+  // decode turns both into U+FFFD U+FFFD, so the aliases collapsed into one key.
+  const latinOto = Buffer.from('tone-a.wav=\x82\xA0,0,0,-1,50,0\ntone-b.wav=\x82\xA2,0,0,-1,50,0\n', 'latin1')
+  await writeFile(join(latinDir, 'oto.ini'), latinOto)
+  const latinBank = loadVoicebank(latinDir)
+  const aliases = [...latinBank.syllables.keys()]
+  console.log(`\n-- synthetic bank: non-UTF-8 oto.ini --`)
+  console.log(`  ${latinBank.meta.entries} entries -> ${aliases.length} alias(es): ${aliases.map((alias) => JSON.stringify(alias)).join(', ')}`)
+  check('non-UTF-8 aliases do not fold together', aliases.length === 2, aliases.map((alias) => JSON.stringify(alias)).join(','))
+  check('every non-UTF-8 entry stays usable', latinBank.meta.entries === 2 && latinBank.meta.missingEntries === 0,
+    JSON.stringify({ entries: latinBank.meta.entries, missing: latinBank.meta.missingEntries }))
+} finally {
+  await rm(syntheticRoot, { recursive: true, force: true })
+}
+
+if (failures > 0) {
+  console.log(`\nFAILED: ${failures} check(s)`)
+  process.exit(1)
+}
 
 if (!existsSync(bankDir)) {
   console.log(`voicebank not installed at ${bankDir}`)

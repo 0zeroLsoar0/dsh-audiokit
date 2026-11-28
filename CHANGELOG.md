@@ -11,6 +11,55 @@
 - **U 盘上的版本目录只增不删。** 需要更新同一版本时覆盖同名文件，不要删目录。
 - 旧版本的唯一权威来源是 git tag；U 盘只是副本。
 
+## 未发布（0.5.11-dev）— 2026-11-28
+
+版本号**暂未改动**（仍是 0.5.10）；以下改动已在仓库，等发版指令再 bump 与打 tag。
+
+### 新增
+
+- **`audio_generate`**（第 31 个工具）：接入外部纯音频生成模型。支持 OpenAI 兼容端点与自定义 HTTP 端点，
+  prompt → wav；未配置时不可用，结果不保证确定性（内容哈希命名，同一 prompt 重跑生成新 take）。
+- **时间线编辑器** `/dsh-audio/editor`：载入 cue 表、按波形拖动起点、改增益/淡入淡出/循环、BPM 吸附、试听，
+  导出 cue JSON / `audio_bind` / `audio_daw` 片段；只读工作区内的 `.json`/`.wav`，拒绝路径逃逸。
+- **本地音频自检**：`audio_check` 内置确定性声学自检（时长、峰值、削波、DC、起音、音色族 crest/centroid 区间、
+  循环接缝），没有外部多模态模型也能给结论；`test/selfcheck.mjs` 用 9 个预设 + 10 个配方钉住区间。
+- **`audio_daw` 交换格式**：新增 OpenTimelineIO（`.otio`，Resolve 可导入）与 FCP7 XML（`.xmeml`，Premiere/Resolve）；
+  AAF 是结构子集、OMF 是骨架，均在文件内与返回值里明确标注"不可导入"。
+- **`audio_design` 生物配方 ×12**：鸟鸣/群鸟、虫群、鲸歌、狼嚎、蛙鸣、马蹄、翅膀、呼吸、嘶声、鼠叫、蝙蝠回声。
+  猫叫/狗吠等"人耳模板极强"的叫声刻意不做（合成会掉进恐怖谷），请走采样器。
+- **`test/schema-budget.mjs`**：把工具 schema 的模型侧字节纳入测试预算（当前 102,605 B / 31 工具）。
+
+### 修复（只读审计驱动）
+
+- **安全**：`/dsh-audio/voices` 不再合并请求体（已保存 key 可被发往任意主机）；写接口只接受同源 + `application/json`；
+  `apiKeyEnv`/`baseUrl`/`ffmpegPath` 白名单化；自检探测改用正确的默认环境变量；保存设置不再丢字段；
+  413/415/408 语义修正；`ffmpegPath` 不再执行任意路径。
+- **数据安全**：`audio_mux`/extract 写入改为同目录临时文件 + rename，执行前拒绝 `out` 等于输入，失败不再删用户文件。
+- **测量**：`audio_probe`/`audio_check` 按全部声道度量（单边削波不再被平均放行、反相立体声不再误报静音）；
+  多声道 LUFS 排除 LFE 并按 BS.1770-4 环绕加权，与 `audio_master` 同口径。
+- **人声/口型**：歌声辅音受 velocity 控制；`audio_mouth` 在 120 bpm 处连续单调；声库坏文件逐条降级；
+  preutterance 用源采样率；oto.ini 非 UTF-8 回落 latin1；lipsync 最短时长 ceil + viseme 白名单。
+- **采样器/作曲**：力度带未命中给出带 midi/velocity 的明确 warning；`bars`/`bpm` 非数值回落默认值。
+- **运行时**：bind 的 loop cue 不再无限循环、drift 报告如实；master 迭代不再保留整段输出
+  （180 s 立体声约省 276 MB）；resampleTo 窗函数修复（升调镜像低 38 dB）；bus 跨采样率改用 HiFi（混叠低 85 dB）；
+  analyze 清洗 NaN；decodeWav 校验 format/subformat/坏头。
+- **导出**：EDL 事件号按排序后 1..N；xmeml `pathurl` 为 `file://` 且增益校验；AAF essence 引用链自洽；
+  CFB 目录树为合法红黑树（15 子项深度 14 → 6）；`lib/omf.js` 恢复合法 UTF-8。
+- **测试可信度**：`tools/test-all.mjs` 要求每个文件打印 `OK:`/`SKIP:`（空跑不算通过）；helper 移入 `test/support/`；
+  `design-listen` 补上真实断言。
+
+### 上下文税
+
+- 移除常驻 system prompt 注入（约 1.2 KB/会话，所有会话都付）；`animation-sound` 技能仍在需要时按需加载。
+- 31 个工具的模型侧 schema 实测 **102,605 B（约 32k token）**，削减方案（短描述 + skill、按需启用、合并入口）
+  见 `dsh-audio/docs/SCHEMA_DIET.zh.md`。`test/schema-budget.mjs` 会阻止它继续变大。
+
+### 测试
+
+- `node tools/test-all.mjs` → **57 file(s) · 57 ok · 0 failed · 2 skipped**。
+  新增：`check` / `selfcheck` / `loudness` / `pattern` / `lipsync` / `generate` / `security-settings` /
+  `wav-decode` / `schema-budget` / `daw-aaf` 扩充。
+
 ## 0.5.10 — 2026-11-22
 
 对外名称统一为 dsh-audiokit（包名/客户端身份/文档；Cordis 入口 id、HTTP 路由与工具名保持不变）。

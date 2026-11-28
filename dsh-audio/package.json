@@ -25,6 +25,7 @@
     "README.md",
     "LICENSE",
     "test/*.mjs",
+    "test/support/*.mjs",
     "tools/*.mjs"
   ],
   "scripts": {

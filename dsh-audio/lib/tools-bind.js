@@ -143,7 +143,7 @@ export function registerBindTools (ctx) {
               gainDb: { type: 'number', description: 'Level trim in dB applied in the page; defaults to 0.' },
               fadeIn: { type: 'number', description: 'Fade-in seconds; use it for ambience beds, not for hits. Defaults to 0.' },
               fadeOut: { type: 'number', description: 'Fade-out seconds; default 0.' },
-              loop: { type: 'boolean', description: 'Loop until the end of the timeline. Loops cannot be double-started.' }
+              loop: { type: 'boolean', description: 'Loop until the end of the timeline. A loop started on demand with dshAudio.play() has no timeline end to play to, so it sounds one 4 s phrase and stops; it never loops forever. Loops cannot be double-started.' }
             },
             required: ['at', 'path']
           }
@@ -242,7 +242,8 @@ export function registerBindTools (ctx) {
           ? `  inline: ${loaded.length} sound(s), ${formatBytes(inlineResult.totalBytes)} of base64 (${formatBytes(inlineResult.rawBytes)} raw), page weight ${formatBytes(pageWeightBytes)} of ${formatBytes(inlineResult.maxBytes)} budget`
           : '  external: the page resolves cue paths as written; keep the wavs next to the HTML or set basePath',
         `  drift budget ≤ ${drift.worstCaseSamples} sample(s) at ${drift.sampleRate} Hz (${drift.worstCaseMs} ms): ${drift.math}; ` +
-        `timer jitter cannot move a cue (lookahead ${drift.lookahead.aheadSeconds}s > wake ${drift.lookahead.wakeSeconds}s)`,
+        `a wake-up can be up to ${drift.lookahead.marginSeconds}s late without moving a cue (lookahead ${drift.lookahead.aheadSeconds}s - wake ${drift.lookahead.wakeSeconds}s), ` +
+        'and a later wake-up starts the cue late by the excess',
         `  cues: ${preview}${more}`
       ]
 

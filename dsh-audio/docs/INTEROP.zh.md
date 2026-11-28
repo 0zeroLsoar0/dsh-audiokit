@@ -24,9 +24,14 @@
 AAF 文件是 MS-CFB（结构化存储）复合文档，`lib/cfb.js` 从零实现了该容器（零依赖）：
 
 - CFB v3（512 字节扇区）、FAT、迷你流（<4096 字节的流）+ MiniFAT、超过 109 个 FAT 扇区时的 DIFAT；
-- 每个存储（storage）的子项是一棵红黑树，按 CFB 规定的顺序（**先短后长，同长忽略大小写**）排序，
-  用标准红黑插入构造（黑高一致、无红红边、根为黑）；
+- 每个存储（storage）的子项是一棵红黑树，按 CFB 规定的顺序（**先短后长，同长忽略大小写**）排序。
+  插入用教科书式红黑插入（CLRS：新节点为红，父染黑、祖父染红，必要时上溯；旋转只改指针、不改颜色，
+  并把提升后的节点接回父节点的子指针），因此根为黑、无红红边、各路径黑高一致，n 个子项的深度有界于
+  `2·log2(n)+2`。子项按名字有序逐个插入是二叉搜索树的最坏情况，所以"看起来有序"不够，必须真正重新平衡；
+  测试对 1/2/3/7/15 个子项直接解码原始目录项验证这组不变量（实测深度 1/2/2/4/6），并对 AAF 里最宽的
+  ContentStorage（15 个 cue 时 49 个子项）断言深度 9 ≤ 13.23；
 - 读取端支持 v3/v4，逐项校验签名、字节序、扇区位移、FAT 链（无环、不越界）、迷你流边界、目录树有序性；
+  `readCompoundFile` 另外返回原始目录项（`left`/`right`/`child`/`color`），便于检查树形而不只是顺序；
 - 确定性：不读时钟、不用随机数，时间戳写 0，同一棵树永远同字节。
 
 在容器之上，`lib/aaf.js` 写的对象图（类 ID 取自 AAF 注册表，属性 ID 为规范内置 PID）：
@@ -44,6 +49,11 @@ AAF 文件是 MS-CFB（结构化存储）复合文档，`lib/cfb.js` 从零实�
       Mobs-1901{1..n}               MasterMob（每个 cue 一个）+ SourceMob（每个 cue 一个，带 PCMDescriptor）
       EssenceData-1902{i}           嵌入的 PCM（原始帧，无 RIFF 头），属性 0x2702 指向流 Data-2702
 ```
+
+EssenceData 的归属是显式的一条链，不是两个互不相干的引用：`0x2701 MobID` 指向**带 PCMDescriptor 的
+SourceMob**（不是 MasterMob），而 SourceMob 自身 slot 里的 SourceClip 用**自身 UMID** 且 `length` = 媒体
+帧数（不再是全 0 UMID + 长度 0）。时间轴一侧是 CompositionMob → MasterMob → SourceMob，语料一侧是
+EssenceData → SourceMob，两头落在同一个 mob 上。
 
 属性流格式（与 AAF 存储对象规范一致）：
 
@@ -79,8 +89,11 @@ Mob / Slot / Component / Descriptor 的 PID 与编码（来自 AAF 对象规范�
 时间轴映射：cue 先按重叠关系**打包成最少 lane**（`lib/timeline.js` 的区间分割贪心），每条 lane 一个
 `TimelineMobSlot`，段为该 lane 的 `Sequence`，组件序列是 `Filler(间隙) + SourceClip(片段)`，编辑率 = 采样率
 （默认取第一条被嵌入媒体的采样率），因此 `at`/`duration` 换算成采样点后**逐样本精确**（测试实测误差 0 µs）。
-每个 cue 还有 MasterMob → SourceMob → PCMDescriptor 的引用链，EssenceData 里是**原始交错 PCM 帧**
-（不是 RIFF 文件）。
+每个 cue 还有一条自洽的引用链：CompositionMob 的时间轴 → MasterMob → SourceMob（带 PCMDescriptor）；
+SourceMob 自身 slot 的 SourceClip 用自身 UMID、`length` = 媒体帧数，EssenceData 的 `MobID`（0x2701）也指向
+这个 SourceMob，所以描述符长度、slot 长度与嵌入字节数三处一致。`parseAaf` 读回时断言整条链
+（`validateAafGraph`）：essence 必须指向带 descriptor 的 SourceMob、SourceMob 的 slot 长度必须等于 descriptor
+长度、模型里任何引用都不允许出现全 0 UMID。EssenceData 里是**原始交错 PCM 帧**（不是 RIFF 文件）。
 
 确定性：UMID 的素材号 = `SHA-256("dsh-audiokit/aaf/1:<seed>")` 前 16 字节；日期固定 2025-01-01T00:00:00；
 所有名字由 `属性名-PID` 派生。同一请求两次调用字节完全相同（测试断言）。
@@ -288,14 +301,22 @@ audio tracks: 2, clipitems: 4
 新增测试（裸 `node`，零依赖，风格与 `test/daw.mjs` 一致；`tools/test-all.mjs` 自动发现 `test/*.mjs`，无需登记）：
 
 ```bash
-node test/daw.mjs       # 241 checks：原有四格式 + 新 format 的确定性/扩展名/二进制分支
-node test/daw-aaf.mjs   # 143 checks：CFB 容器、AAF 对象图、引用完整性、PCM 逐字节、离线模式、工具层
-node test/daw-otio.mjs  # 148 checks：OTIO 结构/不变量/往返、xmeml 结构/帧率/往返、OMF 骨架诚实性、工具层
+node test/daw.mjs       # 251 checks：原有四格式 + 新 format 的确定性/扩展名/二进制分支
+node test/daw-aaf.mjs   # 193 checks：CFB 容器与目录红黑树、AAF 对象图、essence 归属链、PCM 逐字节、离线模式、工具层
+node test/daw-otio.mjs  # 165 checks：OTIO 结构/不变量/往返、xmeml 结构/帧率/往返、OMF 骨架诚实性、工具层
 ```
 
 `test/daw-aaf.mjs` 除了往返，还做**全图引用完整性**检查：每个 `properties` 流都能解码；每条强引用在
 持有它的对象下都能找到同名子存储；每个向量的索引流条目都能找到对应子存储；每个存储的类 ID 都属于
 写入器声称的 AAF 类集合。这是"字节自洽"的机器证据，也是当前能做到的最强证明。
+
+此外还有两组结构不变量（都是解码真实字节，不依赖写入器自报）：
+
+- **目录树**：对 1/2/3/7/15 个子项和 AAF 的 ContentStorage，从原始目录项验证深度 ≤ `2·log2(n)+2`、
+  左右黑高相等、无红红边、根为黑、中序顺序符合 CFB 规则——这是"退化成链"会立刻失败的检查；
+- **essence 归属链**：`validateAafGraph` 在 `parseAaf` 末尾运行，断言 essence 指向带 descriptor 的
+  SourceMob、SourceMob 的 slot 长度等于 descriptor 长度、模型里没有全 0 UMID、所有引用可解析；
+  测试另外用 4 个"故意打断链"的副本（essence 指向 master、长度差 1、全 0 UMID、悬空引用）证明它真的会拒绝。
 
 ---
 

@@ -103,7 +103,8 @@ console.log('-- cueScheduleDrift --')
   console.log(`  cue "hit" at 1.234 s: ${row.at} * 48000 = ${row.exactFrames} frames -> start frame ${row.frame}, error ${row.errorSamples} sample(s)`)
   console.log(`  budget: ${drift.math}`)
   console.log(`  worst cue ${drift.worstCue.name} (${drift.worstCue.at}s) error ${drift.worstCue.errorSamples} samples = ${drift.worstCue.errorMs} ms`)
-  console.log(`  lookahead ${drift.lookahead.aheadSeconds}s > wake ${drift.lookahead.wakeSeconds}s -> ${drift.lookahead.marginSeconds}s slack, timer can shift cue: ${drift.lookahead.timerCanShiftCue}`)
+  console.log(`  lookahead ${drift.lookahead.aheadSeconds}s - wake ${drift.lookahead.wakeSeconds}s = ${drift.lookahead.marginSeconds}s margin; ` +
+    `a later wake-up can shift a cue: ${drift.lookahead.timerCanShiftCue}, shift bounded: ${drift.lookahead.shiftBounded}`)
   check('1.234 s is 59232 whole frames', row.exactFrames === 59232 && row.frame === 59232)
   check('1.234 s has zero sample error', row.errorSamples === 0, String(row.errorSamples))
   check('budget is at most 1 sample', drift.worstCaseSamples <= 1, String(drift.worstCaseSamples))
@@ -112,6 +113,15 @@ console.log('-- cueScheduleDrift --')
   check('lookahead window leaves slack', drift.lookahead.aheadSeconds > drift.lookahead.wakeSeconds)
   check('one sample is small in ms', drift.worstCaseMs < 0.03, `${drift.worstCaseMs} ms`)
   check('48 kHz sample length', drift.sampleMs === 0.020833, String(drift.sampleMs))
+  // The old report claimed a timer could never move a cue. It can, once the
+  // wake-up is later than the look-ahead margin; the report has to say so and
+  // name the 0.35 s margin as the condition that protects a cue.
+  check('the 0.35 s margin is reported', drift.lookahead.marginSeconds === 0.35, String(drift.lookahead.marginSeconds))
+  check('the margin is stated in samples too', drift.lookahead.marginSamples === 16800, String(drift.lookahead.marginSamples))
+  check('the report admits a late timer shifts a cue', drift.lookahead.timerCanShiftCue === true)
+  check('the report does not pretend the shift is bounded', drift.lookahead.shiftBounded === false)
+  check('the math names the margin, not only the rounding', /margin|shift-free up to a 0\.35 s late wake-up/.test(drift.math), drift.math)
+  check('the note explains the beyond-margin behaviour', /late by the excess/.test(drift.lookahead.note), drift.lookahead.note)
 }
 
 /* ---------------------------------------------------------------- inline -- */
@@ -325,6 +335,10 @@ console.log('-- generated player in a mocked browser --')
       { name: 'bed', at: 0.5, src: src.get('bed'), loop: true, fadeOut: 0.2 },
       { name: 'ding', at: 1.234, src: src.get('ding') },
       { name: 'tail', at: 2, src: src.get('tail') },
+      // A loop that starts 10 ms before the timeline ends: there is almost no
+      // sheet left to play it for, and it must still be stopped rather than
+      // looping forever off the end of the page's timeline.
+      { name: 'edgeLoop', at: 2.99, src: src.get('bed'), loop: true },
       // A bare-base64 `data:` cue (no src at all) is the documented alternative shape.
       { name: 'raw', at: 0.1, data: Buffer.from(wavBytes('zap', { duration: 0.2, seed: 3 })).toString('base64') }
     ],
@@ -551,6 +565,36 @@ console.log('-- generated player in a mocked browser --')
   // on the audio clock, not fired late by a timer.
   const tailSource = sources.find((source) => Math.abs((source.startedAt ?? -1) - (t0 + 2)) < 1e-12)
   check('pending cue survives pause and is placed on time', tailSource !== undefined, sources.map((s) => s.startedAt).join(','))
+
+  // The loop that starts at 2.99 s of a 3 s timeline: the old player computed a
+  // zero-length stop window for it (`END - at <= 0.02`) and left `src.loop` on
+  // with no stop at all. It now gets at least a 50 ms stop, so `stoppedAt` is
+  // always set and always after `startedAt`. Let the scheduler reach the cue's
+  // look-ahead window first.
+  await advance(0.2)
+  const placedLoops = sources.filter((source) => source.loop === true)
+  const edgeLoopSource = placedLoops.find((source) => (source.startedAt ?? 0) >= t0 + 2.9)
+  console.log(`  loop at 2.99 s of a 3 s timeline: ${edgeLoopSource === undefined ? 'NOT SCHEDULED' : `starts ${edgeLoopSource.startedAt.toFixed(3)} s, stops ${edgeLoopSource.stoppedAt === null ? 'never' : `${(edgeLoopSource.stoppedAt - edgeLoopSource.startedAt).toFixed(3)} s later`}`}`)
+  check('a loop cue starting at the end of the timeline is scheduled', edgeLoopSource !== undefined, placedLoops.map((s) => s.startedAt).join(','))
+  check('a loop cue starting at the end of the timeline still stops',
+    edgeLoopSource !== undefined && edgeLoopSource.stoppedAt !== null && edgeLoopSource.stoppedAt >= edgeLoopSource.startedAt + 0.049,
+    String(edgeLoopSource?.stoppedAt))
+
+  // On-demand loop: play() has no timeline end to stop at, so it must schedule
+  // its own stop (one phrase). It used to return true with end=0 and the source
+  // looped forever — the player's documented API could hang a page's audio.
+  loopSource.onended() // the mock context fires no ended event of its own
+  const phrasePlay = await audio.play('bed')
+  const phraseLoop = sources[sources.length - 1]
+  const phraseSeconds = phraseLoop.stoppedAt === null ? Number.NaN : phraseLoop.stoppedAt - phraseLoop.startedAt
+  console.log(`  play('bed') on a loop cue: ${phrasePlay}, starts ${phraseLoop.startedAt.toFixed(3)} s, ` +
+    `stops ${Number.isFinite(phraseSeconds) ? `${phraseSeconds.toFixed(3)} s later` : 'NEVER'}`)
+  check('play() of a loop cue starts it', phrasePlay === true)
+  check('play() of a loop cue schedules a stop', phraseLoop.loop === true && Number.isFinite(phraseSeconds), String(phraseLoop.stoppedAt))
+  check(`play() of a loop cue stops after the ${PLAYER_TIMING.loopPhraseSeconds}s phrase`,
+    Math.abs(phraseSeconds - PLAYER_TIMING.loopPhraseSeconds) < 1e-9, String(phraseSeconds))
+  check('a second play() while the phrase sounds is refused', (await audio.play('bed')) === false)
+  audio.stop('bed')
 
   audio.stopAll()
   check('stopAll resets the clock', audio.currentTime() === 0)

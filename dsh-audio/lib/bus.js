@@ -17,9 +17,10 @@
  * seconds). The report is the point: a model cannot listen, so the effect of a
  * knob has to arrive as a number it can reason about.
  *
- * The only import is `lib/multichannel.js`, the channel-arithmetic vocabulary:
- * no render kernel, no filesystem, no clock, no randomness, so identical input
- * always produces identical output bytes.
+ * The imports are the channel-arithmetic vocabulary (`lib/multichannel.js`) and
+ * the plugin's polyphase resampler (`lib/convert.js`): no render kernel, no
+ * filesystem, no clock, no randomness, so identical input always produces
+ * identical output bytes.
  *
  * A track is `{ samples: Float32Array, sampleRate: number }` for a mono layer,
  * or `{ channels: Float32Array[], sampleRate: number }` for a stereo/surround
@@ -49,6 +50,7 @@
  * is what makes the numbers in a report checkable against the request.
  */
 
+import { resampleHiFi } from './convert.js'
 import { CHANNEL_COUNTS, conversionKind, fitChannels, layoutFor, linkStemGain } from './multichannel.js'
 
 /* --------------------------------------------------------------- limits -- */
@@ -981,20 +983,21 @@ export function processTrack (track, chain = []) {
 
 /* ------------------------------------------------------------------ bus -- */
 
-function resampleLinear (samples, fromRate, toRate) {
+/**
+ * Rate-convert one layer channel to the bus rate.
+ *
+ * Linear interpolation used to be considered good enough; it is not, because it
+ * has no anti-alias/anti-image filter. A 48 kHz layer with 13 kHz content on a
+ * 22.05 kHz bus folds that partial to 9 kHz, and a 22.05 kHz layer on a 48 kHz
+ * bus paints its images at 12-14 kHz — both audible as a metallic top end, and
+ * neither is a property of the cue the author asked for. `convert.resampleHiFi`
+ * is the plugin's Kaiser-windowed polyphase resampler (the one `audio_convert`
+ * uses), so a layer's rate stops being the reason a bus sounds unlike its
+ * sources. Same-rate layers are handed back untouched: no copy, no filter.
+ */
+function resampleChannel (samples, fromRate, toRate) {
   if (fromRate === toRate) return samples
-  const ratio = toRate / fromRate
-  const length = Math.max(1, Math.round(samples.length * ratio))
-  const out = new Float32Array(length)
-  for (let index = 0; index < length; index += 1) {
-    const position = index / ratio
-    const floor = Math.floor(position)
-    const fraction = position - floor
-    const a = samples[floor] ?? 0
-    const b = samples[floor + 1] ?? a
-    out[index] = a + (b - a) * fraction
-  }
-  return out
+  return resampleHiFi(samples, fromRate, toRate).samples
 }
 
 function resolveMaster (master, caller) {
@@ -1067,7 +1070,7 @@ function uniqueId (base, used) {
 
 /** Resolve one track request into a processed layer (one or more channels) plus its meters. */
 function renderOneTrack (spec, sampleRate, caller) {
-  const sourceChannels = spec.channels.map((channel) => resampleLinear(channel, spec.sampleRate, sampleRate))
+  const sourceChannels = spec.channels.map((channel) => resampleChannel(channel, spec.sampleRate, sampleRate))
   const gain = dbToGain(spec.gainDb)
   // Gain lands before the chain so a compressor sees the level the caller set,
   // which is the behaviour a fader feeding an insert chain has. One gain for
@@ -1084,7 +1087,7 @@ function renderOneTrack (spec, sampleRate, caller) {
       const side = readTrackChannels(entry.sidechain, { sampleRate }, `${caller} tracks[i] duck sidechain`)
       return {
         ...entry,
-        sidechain: { channels: side.channels.map((channel) => resampleLinear(channel, side.sampleRate, sampleRate)), sampleRate }
+        sidechain: { channels: side.channels.map((channel) => resampleChannel(channel, side.sampleRate, sampleRate)), sampleRate }
       }
     }
     return entry

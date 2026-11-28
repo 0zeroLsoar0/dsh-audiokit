@@ -507,6 +507,32 @@ console.log('\nscore API robustness')
     `22050 Hz render is ${fmt(alternative.durationSeconds, 2)} s; section "${section.name}" rms ${fmt(section.rmsDbfs)} dBFS`)
 }
 
+/* ---------------------------------------- non-numeric request fields ---- */
+
+// `bars: 'abc'` used to become NaN and then `new Array(NaN)` (a crash), and
+// `bpm: 'fast'` a score whose beatMap was NaN. Both now fall back like
+// `intensity` does, so a model that writes a word instead of a number gets a
+// default-tempo cue instead of a broken score.
+console.log('\nnon-numeric bars/bpm fall back instead of producing NaN')
+{
+  const score = composeScore({ genre: 'lofi', bars: 'abc', bpm: 'fast', seed: 3 })
+  const beatsFinite = score.beatMap.every((beat) => Number.isFinite(beat))
+  const barsFinite = score.barMap.every((beat) => Number.isFinite(beat))
+  const notes = score.tracks.flatMap((track) => track.notes)
+  const notesFinite = notes.every((note) => Number.isFinite(note.midi) && Number.isFinite(note.velocity) && Number.isFinite(note.bar) && Number.isFinite(note.beat))
+  const loop = composeScore({ genre: 'action', bars: NaN, bpm: Infinity, seed: 5 })
+  console.log(`  bars "abc" -> ${score.bars}, bpm "fast" -> ${score.bpm} (genre ${GENRES.lofi.bpm}); ` +
+    `beatMap finite ${beatsFinite}, barMap finite ${barsFinite}, ${notes.length} notes finite ${notesFinite}`)
+  console.log(`  bars NaN -> ${loop.bars}, bpm Infinity -> ${loop.bpm} (genre ${GENRES.action.bpm})`)
+  check('non-numeric bars falls back to 16', score.bars === 16, String(score.bars))
+  check('non-numeric bpm falls back to the genre tempo', score.bpm === GENRES.lofi.bpm, String(score.bpm))
+  check('fallback beatMap and barMap are finite', beatsFinite && barsFinite)
+  check('fallback notes are finite', notesFinite)
+  check('NaN/Infinity fields also fall back',
+    loop.bars === 16 && loop.bpm === GENRES.action.bpm && loop.beatMap.every(Number.isFinite),
+    `${loop.bars}/${loop.bpm}`)
+}
+
 /* ------------------------------------------------------------- tools -- */
 
 console.log('\ntool layer: audio_compose')

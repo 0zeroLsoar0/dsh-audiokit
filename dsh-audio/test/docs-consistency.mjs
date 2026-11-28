@@ -34,7 +34,7 @@
 import { readFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { apply } from '../index.js'
+import { apply, PROMPT_SECTION } from '../index.js'
 import { GENRES } from '../lib/compose.js'
 import { RECIPES } from '../lib/design.js'
 import { PRESETS } from '../lib/dsp.js'
@@ -226,9 +226,11 @@ const readmeRaw = await readText('README.md')
 const indexRaw = await readText('index.js')
 const skillRaw = await readText('lib/skill.js')
 
+// The section is no longer registered as a host system prompt (it was pure
+// context tax for sessions that never touch audio); the exported text is still
+// the third document this test cross-checks, so the check keeps its value.
 const promptSection = state.sections.find((entry) => entry.name === 'dsh-audiokit:animation-sound')
-if (promptSection === undefined) fail('index.js', null, 'plugin registered no `dsh-audiokit:animation-sound` prompt section')
-const promptText = promptSection?.text ?? ''
+const promptText = promptSection?.text ?? PROMPT_SECTION
 
 let skillContent = ''
 if (state.skillProviders.length === 0) {
@@ -249,7 +251,7 @@ if (state.skillProviders.length === 0) {
  */
 function locatePrompt (raw, text) {
   const lines = raw.split('\n')
-  const start = lines.findIndex((line) => line.startsWith('const PROMPT_SECTION = ['))
+  const start = lines.findIndex((line) => line.startsWith('const PROMPT_SECTION = [') || line.startsWith('export const PROMPT_SECTION = ['))
   const end = start < 0 ? -1 : lines.findIndex((line, index) => index > start && line.startsWith('].join('))
   if (start < 0 || end <= start) return { sourceLine: () => null }
   const parts = []

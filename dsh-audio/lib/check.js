@@ -1,21 +1,44 @@
 /**
  * `audio_check`: the quality gate.
  *
- * Two layers, because they fail differently:
+ * Three layers, because they fail differently:
  *   - technical: measurable things a machine can be certain about (clipping,
  *     silence, late attacks, a cue that never plays, a sum that will clip);
+ *   - local acoustic self-check: deterministic family-shape heuristics from
+ *     `lib/selfcheck.js` — no model, no key, no network, so it always runs;
  *   - semantic: an optional opinion from an audio-understanding model, asked a
- *     question with a checkable answer instead of "does this sound good".
+ *     question with a checkable answer instead of "does this sound good". It is
+ *     optional on purpose: an unconfigured machine gets the local verdict
+ *     instead of a configuration error.
+ *
+ * Every channel is measured, never a mono fold: a clipped channel averaged with
+ * a silent one would stop reporting clipping, and an out-of-phase stereo pair
+ * would average to digital silence.
  */
 
-import { stat } from 'node:fs/promises'
 import { relative } from 'node:path'
-import { measure, readTrack, resolvePath, toWavBytes } from './audio.js'
-import { describeAudio, toWav } from './providers.js'
+import {
+  averageChannels,
+  measureChannels,
+  peakEnvelope,
+  readChannels,
+  resolvePath,
+  toWavBytes
+} from './audio.js'
+import { describeAudio } from './providers.js'
+import { selfCheck } from './selfcheck.js'
 
 const SILENT_PEAK_DB = -40
 const LATE_ATTACK_SECONDS = 0.15
 const CLIP_SUM_PEAK = 1.0
+
+/**
+ * Self-check failures that the file-level technical checks already report, so a
+ * broken file does not produce the same sentence twice. Everything else the
+ * local check catches (non-finite samples, family shape, loop seam, a duration
+ * the caller stated in `spec`, sample rate) is new information.
+ */
+const DUPLICATE_WITH_FILE_CHECKS = new Set(['peak', 'clipping', 'dcOffset'])
 
 function displayPath (cwd, path) {
   const rel = relative(cwd, path)
@@ -62,33 +85,75 @@ function fractionBelow (samples, sampleRate, thresholdDb = SILENT_PEAK_DB) {
   return samples.length === 0 ? 1 : quiet / samples.length
 }
 
-function inspectFile (cwd, path, expectDuration, issues, trackCache) {
+/**
+ * Inspect one decoded file: technical issues plus the metrics the report shows.
+ *
+ * @param {string} cwd - session directory, for display paths.
+ * @param {string} path - absolute path of the file.
+ * @param {number|undefined} expectDuration - requested duration, when the caller named one.
+ * @param {object[]} issues - accumulator for file-level issues.
+ * @param {Map<string, object>} stash - decoded channels, shared with the cue pass.
+ * @returns {object} report entry, including the decoded channels for the self-check.
+ */
+function inspectFile (cwd, path, expectDuration, issues, stash) {
   const label = displayPath(cwd, path)
-  const track = trackCache.get(path)
-  const metrics = { ...measure(track.samples, track.sampleRate), sampleRate: track.sampleRate }
-  const attack = leadingSilence(track.samples, track.sampleRate)
+  const decoded = stash.get(path)
+  const metrics = {
+    ...measureChannels(decoded.channels, decoded.sampleRate),
+    sampleRate: decoded.sampleRate,
+    channelCount: decoded.channelCount
+  }
+  // The peak envelope, not the mono fold: an out-of-phase stereo pair must keep
+  // its attack and its level, and a one-sided clipped pair must keep its clip.
+  const envelope = peakEnvelope(decoded.channels)
+  const attack = leadingSilence(envelope, decoded.sampleRate)
+  const worstChannel = metrics.perChannel === undefined
+    ? -1
+    : metrics.perChannel.findIndex((channel) => channel.clipping === metrics.clipping)
+  const channelNote = metrics.channelCount > 1 && worstChannel >= 0
+    ? `（最差声道 ${worstChannel + 1}/${metrics.channelCount}）`
+    : ''
 
-  if (metrics.clipping > 0) issues.push({ level: 'error', target: label, message: `${metrics.clipping} 个采样被削波` })
-  if (metrics.peakDbfs <= SILENT_PEAK_DB) issues.push({ level: 'error', target: label, message: `几乎无声（峰值 ${metrics.peakDbfs} dBFS）` })
-  else if (metrics.peakDbfs > -0.2) issues.push({ level: 'warn', target: label, message: `峰值 ${metrics.peakDbfs} dBFS 贴顶，混在一起会破` })
+  if (metrics.clipping > 0) issues.push({ level: 'error', target: label, message: `${metrics.clipping} 个采样被削波${channelNote}` })
+  if (metrics.peakDbfs <= SILENT_PEAK_DB) {
+    issues.push({ level: 'error', target: label, message: `几乎无声（峰值 ${metrics.peakDbfs} dBFS${metrics.channelCount > 1 ? `，${metrics.channelCount} 声道最大值` : ''}）` })
+  } else if (metrics.peakDbfs > -0.2) {
+    issues.push({ level: 'warn', target: label, message: `峰值 ${metrics.peakDbfs} dBFS 贴顶，混在一起会破` })
+  }
   if (metrics.dcOffset > 0.01) issues.push({ level: 'warn', target: label, message: `直流偏移 ${metrics.dcOffset}` })
   if (attack > 0.5) issues.push({ level: 'warn', target: label, message: `前 ${(attack * 1000).toFixed(0)}ms 是静音，声音会听起来晚` })
   else if (attack > LATE_ATTACK_SECONDS) issues.push({ level: 'info', target: label, message: `攻击前有 ${(attack * 1000).toFixed(0)}ms 静音，排拍点时要么算进去，要么裁掉` })
-  if (fractionBelow(track.samples, track.sampleRate) > 0.9) issues.push({ level: 'warn', target: label, message: '九成以上是静音，可能在申请一段没用满的文件' })
+  if (fractionBelow(envelope, decoded.sampleRate) > 0.9) issues.push({ level: 'warn', target: label, message: '九成以上是静音，可能在申请一段没用满的文件' })
   if (Number.isFinite(expectDuration) && Math.abs(metrics.durationSeconds - expectDuration) > 0.05) {
     issues.push({ level: 'error', target: label, message: `时长 ${metrics.durationSeconds.toFixed(2)}s ≠ 期望 ${expectDuration.toFixed(2)}s` })
   }
 
-  return { path, label, metrics, attack }
+  return {
+    path,
+    label,
+    metrics,
+    attack,
+    channels: decoded.channels,
+    sampleRate: decoded.sampleRate,
+    channelCount: decoded.channelCount,
+    expectedDuration: Number.isFinite(expectDuration) ? Number(expectDuration) : null,
+    durationIssue: Number.isFinite(expectDuration) && Math.abs(metrics.durationSeconds - expectDuration) > 0.05,
+    selfCheck: null
+  }
 }
 
-/** Register the `audio_check` tool. */
+/**
+ * Register the `audio_check` tool.
+ * @param {object} ctx - Cordis context with the tools service.
+ * @param {object} [config] - plugin config; `config.check` configures the
+ *   optional audio-understanding model. Its absence never fails a call.
+ */
 export function registerCheckTool (ctx, config = {}) {
   const checkConfig = config.check ?? {}
 
   ctx.tools.register({
     name: 'audio_check',
-    description: 'Check rendered audio before it ships: clipping, near-silence, late attacks, DC offset, duration mismatches, cue files that do not exist, and a summed peak that tells you whether the cues will clip when they play together. Give `question` to also have an audio-understanding model judge whether the sound matches what you intended.',
+    description: '交付前质量闸：削波/静音/时间轴/叠加峰值，外加本地声学自检（不依赖外部模型）。Quality gate before delivery: clipping, near-silence, late attacks, DC offset, duration mismatches, cue files that do not exist, and a summed peak that tells you whether the cues will clip when they play together — plus a deterministic local self-check (non-finite samples, signal level, crest factor / spectral centroid / onset shape against the preset or recipe named in `spec`, loop seam). The local check always runs and needs no key; `question` additionally asks an audio-understanding model and is skipped when no model is configured.',
     parameters: {
       type: 'object',
       properties: {
@@ -107,7 +172,19 @@ export function registerCheckTool (ctx, config = {}) {
           }
         },
         expectDuration: { type: 'number', description: 'Expected duration for a single file (used by paths).' },
-        question: { type: 'string', description: 'Optional: ask an audio-understanding model about the sound, e.g. "does this match a heavy metal door slamming in a large hall?". Requires config.check.' },
+        spec: {
+          type: 'object',
+          additionalProperties: false,
+          description: 'Optional render spec these files were made with, so the local self-check compares the sound against that family\'s expected shape (crest factor, spectral centroid, onset count, default length). Without it only the generic checks run.',
+          properties: {
+            preset: { type: 'string', description: 'Preset id used by audio_synth, e.g. impact, texture.' },
+            recipe: { type: 'string', description: 'Design recipe id used by audio_design, e.g. door-slam-metal, ui-success.' },
+            duration: { type: 'number', description: 'Length in seconds that was requested; when omitted a known family\'s default length is expected.' },
+            sampleRate: { type: 'integer', description: 'Sample rate that was requested.' },
+            loop: { type: 'boolean', description: 'True when the file was rendered as a seamless loop; adds the loop-seam check.' }
+          }
+        },
+        question: { type: 'string', description: 'Optional: also ask an audio-understanding model about the sound, e.g. "does this match a heavy metal door slamming in a large hall?". Only runs when config.check is configured; without it the local self-check still returns a verdict.' },
         audio: { type: 'string', description: 'Which file to send with `question`; defaults to the first path or cue source.' }
       },
       additionalProperties: false
@@ -119,7 +196,7 @@ export function registerCheckTool (ctx, config = {}) {
       const issues = []
       // Per-call cache: a module-level one would be cleared by a concurrent
       // call from another sub-agent while this one is still folding.
-      const trackCache = new Map()
+      const stash = new Map()
       const files = []
       const seen = new Set()
       const paths = Array.isArray(args.paths) ? args.paths : []
@@ -127,6 +204,10 @@ export function registerCheckTool (ctx, config = {}) {
       if (paths.length === 0 && cues.length === 0) {
         throw new Error('audio_check 需要 paths 或 cues：至少给一个要检查的音频文件或一条 cue')
       }
+      if (args.spec !== undefined && args.spec !== null && (typeof args.spec !== 'object' || Array.isArray(args.spec))) {
+        throw new Error(`audio_check: spec 必须是对象（{ preset, recipe, duration, sampleRate, loop }），收到 ${describeValue(args.spec)}`)
+      }
+      const checkSpec = args.spec ?? undefined
 
       for (let index = 0; index < paths.length; index += 1) {
         const path = resolvePath(cwd, paths[index])
@@ -136,9 +217,8 @@ export function registerCheckTool (ctx, config = {}) {
         if (seen.has(path)) continue
         seen.add(path)
         try {
-          const track = await readTrack(path)
-          trackCache.set(path, track)
-          files.push(inspectFile(cwd, path, paths.length === 1 ? args.expectDuration : undefined, issues, trackCache))
+          stash.set(path, await readChannels(path))
+          files.push(inspectFile(cwd, path, paths.length === 1 ? args.expectDuration : undefined, issues, stash))
         } catch (error) {
           issues.push({ level: 'error', target: displayPath(cwd, path), message: `读不出来：${error.message}` })
         }
@@ -171,31 +251,33 @@ export function registerCheckTool (ctx, config = {}) {
             continue
           }
           try {
-            if (!trackCache.has(path)) trackCache.set(path, await readTrack(path))
-            const track = trackCache.get(path)
-            if (!files.some((file) => file.path === path)) {
-              files.push(inspectFile(cwd, path, undefined, issues, trackCache))
-            }
-            const metrics = measure(track.samples, track.sampleRate)
-            if (metrics.peakDbfs <= SILENT_PEAK_DB) {
+            if (!stash.has(path)) stash.set(path, await readChannels(path))
+            const decoded = stash.get(path)
+            const entry = files.find((file) => file.path === path) ??
+              (() => { const created = inspectFile(cwd, path, undefined, issues, stash); files.push(created); return created })()
+            if (entry.metrics.peakDbfs <= SILENT_PEAK_DB) {
               issues.push({ level: 'error', target: displayPath(cwd, path), message: `cue 在 ${at.toFixed(2)}s，但文件是静音的` })
             }
-            placed.push({ at, track })
-            timelineEnd = Math.max(timelineEnd, at + track.samples.length / track.sampleRate)
+            // The timeline sum models the mono cues these tools write, so it
+            // sums the mono fold; the file-level check above is the one that
+            // sees every channel.
+            const mono = decoded.channels.length === 1 ? decoded.channels[0] : averageChannels(decoded.channels)
+            placed.push({ at, mono, sampleRate: decoded.sampleRate })
+            timelineEnd = Math.max(timelineEnd, at + mono.length / decoded.sampleRate)
           } catch (error) {
             issues.push({ level: 'error', target: displayPath(cwd, path), message: `cue 在 ${at.toFixed(2)}s，但文件读不出来：${error.message}` })
           }
         }
 
         if (placed.length > 0) {
-          const sampleRate = Math.max(...placed.map((item) => item.track.sampleRate))
+          const sampleRate = Math.max(...placed.map((item) => item.sampleRate))
           const frames = Math.ceil(timelineEnd * sampleRate) + 1
           const sum = new Float32Array(frames)
-          for (const { at, track } of placed) {
+          for (const { at, mono, sampleRate: trackRate } of placed) {
             const start = Math.round(at * sampleRate)
-            const step = track.sampleRate / sampleRate
-            for (let i = 0; start + i < frames && i < Math.ceil(track.samples.length / step); i += 1) {
-              sum[start + i] += track.samples[Math.min(track.samples.length - 1, Math.round(i * step))]
+            const step = trackRate / sampleRate
+            for (let i = 0; start + i < frames && i < Math.ceil(mono.length / step); i += 1) {
+              sum[start + i] += mono[Math.min(mono.length - 1, Math.round(i * step))]
             }
           }
           for (let i = 0; i < frames; i += 1) summedPeak = Math.max(summedPeak, Math.abs(sum[i]))
@@ -217,36 +299,119 @@ export function registerCheckTool (ctx, config = {}) {
         throw new Error(`audio_check: 没有可读的音频文件${reasons === '' ? '' : `（${reasons}）`}`)
       }
 
+      // --- local acoustic self-check (always runs, never needs a key) --------
+      for (const file of files) {
+        try {
+          file.selfCheck = await selfCheck({ samples: file.channels, sampleRate: file.sampleRate, spec: checkSpec })
+        } catch (error) {
+          file.selfCheck = null
+          issues.push({ level: 'warn', target: file.label, message: `本地自检失败：${error.message}` })
+        }
+        if (file.selfCheck === null) continue
+        // Do not report a technical failure twice: the file-level checks above
+        // already name the worst channel and the duration they compared against.
+        const duplicates = new Set(DUPLICATE_WITH_FILE_CHECKS)
+        if (file.durationIssue) duplicates.add('duration')
+        for (const check of file.selfCheck.checks) {
+          if (check.ok) continue
+          if (duplicates.has(check.name)) continue
+          issues.push({ level: check.level, target: file.label, message: `本地自检 ${check.name}：${check.detail}` })
+        }
+      }
+      const checkedFiles = files.filter((file) => file.selfCheck !== null)
+      const selfCheckBlock = {
+        ok: checkedFiles.length > 0 && checkedFiles.every((file) => file.selfCheck.ok),
+        family: checkedFiles.length > 0 ? checkedFiles[0].selfCheck.family : null,
+        checks: checkedFiles.flatMap((file) => file.selfCheck.checks.map((check) => ({
+          ...check,
+          name: checkedFiles.length === 1 ? check.name : `${file.label}:${check.name}`
+        }))),
+        summary: checkedFiles.length === 0
+          ? '本地自检没有可分析的文件'
+          : checkedFiles.length === 1
+            ? checkedFiles[0].selfCheck.summary
+            : `本地自检：${checkedFiles.length} 个文件中 ${checkedFiles.filter((file) => !file.selfCheck.ok).length} 个未通过`,
+        metrics: checkedFiles.length > 0 ? checkedFiles[0].selfCheck.metrics : null
+      }
+      if (checkedFiles.length === 0) {
+        issues.push({ level: 'warn', target: 'selfcheck', message: '本地自检没有可分析的文件' })
+      }
+
       let verdict = 'ok'
       if (issues.some((issue) => issue.level === 'error')) verdict = 'fail'
       else if (issues.some((issue) => issue.level === 'warn')) verdict = 'warn'
 
+      // --- optional external opinion ---------------------------------------
       let opinion = null
+      let opinionSkipped = false
+      let opinionError = null
       if (typeof args.question === 'string' && args.question.trim().length > 0) {
         const target = args.audio !== undefined
           ? resolvePath(cwd, args.audio)
-          : (files.length > 0 ? files[0].path : undefined)
+          : files[0].path
         if (target === undefined) throw new Error('audio_check: 给了 question 但找不到要分析的音频')
-        const track = trackCache.get(target) ?? await readTrack(target)
-        opinion = await describeAudio(checkConfig, toWavBytes(track.samples, track.sampleRate), args.question.trim())
+        try {
+          if (!stash.has(target)) stash.set(target, await readChannels(target))
+          const decoded = stash.get(target)
+          const mono = decoded.channels.length === 1 ? decoded.channels[0] : averageChannels(decoded.channels)
+          opinion = await describeAudio(checkConfig, toWavBytes(mono, decoded.sampleRate), args.question.trim())
+        } catch (error) {
+          // No configured model is a normal state, not a failure of the file:
+          // say so and keep the local verdict. A configured-but-failing endpoint
+          // is a warning, because the caller asked for the opinion.
+          const message = String(error?.message ?? error)
+          const unconfigured = /没有配置密钥|环境变量|apiKey|API_KEY/.test(message)
+          opinionSkipped = unconfigured
+          opinionError = message
+          issues.push({
+            level: unconfigured ? 'info' : 'warn',
+            target: displayPath(cwd, target),
+            message: unconfigured
+              ? `未配置音频理解模型，只运行本地自检（${message}）`
+              : `外部听感模型调用失败，本地自检结果不受影响（${message}）`
+          })
+        }
       }
+
+      // The verdict may have moved because of the opinion note.
+      verdict = 'ok'
+      if (issues.some((issue) => issue.level === 'error')) verdict = 'fail'
+      else if (issues.some((issue) => issue.level === 'warn')) verdict = 'warn'
 
       const lines = []
       lines.push(`Checked ${files.length} file(s)${cues.length > 0 ? `, ${cues.length} cue(s)` : ''} · verdict: ${verdict}`)
       for (const file of files) {
         const m = file.metrics
-        lines.push(`  ${file.label}  ${m.durationSeconds.toFixed(2)}s  peak ${m.peakDbfs}  rms ${m.rmsDbfs}  attack ${(file.attack * 1000).toFixed(0)}ms`)
+        const channels = m.channelCount > 1 ? ` · ${m.channelCount} ch` : ''
+        lines.push(`  ${file.label}  ${m.durationSeconds.toFixed(2)}s${channels}  peak ${m.peakDbfs}  rms ${m.rmsDbfs}  attack ${(file.attack * 1000).toFixed(0)}ms`)
+        if (m.perChannel !== undefined) {
+          lines.push(`    per channel: ${m.perChannel.map((channel, index) => `ch${index + 1} peak ${channel.peakDbfs} dBFS${channel.clipping > 0 ? ` CLIP ${channel.clipping}` : ''}`).join(' · ')}`)
+        }
+        if (file.selfCheck !== null) lines.push(`    ${file.selfCheck.summary}`)
       }
       if (cues.length > 0) lines.push(`  叠加峰值 ${summedPeak > 0 ? (20 * Math.log10(summedPeak)).toFixed(1) : '-inf'} dBFS`)
       for (const issue of issues) lines.push(`  ${issue.level.toUpperCase()} ${issue.target}: ${issue.message}`)
       if (opinion !== null) lines.push(`  听感：${opinion}`)
+      else if (opinionSkipped) lines.push('  听感：未配置音频理解模型，已跳过（本地自检已给出结论）')
 
       return {
         verdict,
         issues,
-        files: files.map((file) => ({ path: file.path, metrics: file.metrics, attackSeconds: Number(file.attack.toFixed(3)) })),
+        files: files.map((file) => ({
+          path: file.path,
+          label: file.label,
+          channels: file.channelCount,
+          metrics: file.metrics,
+          attackSeconds: Number(file.attack.toFixed(3)),
+          selfCheck: file.selfCheck === null
+            ? null
+            : { ok: file.selfCheck.ok, family: file.selfCheck.family, summary: file.selfCheck.summary }
+        })),
+        selfCheck: selfCheckBlock,
         summedPeakDbfs: summedPeak > 0 ? Number((20 * Math.log10(summedPeak)).toFixed(2)) : null,
         opinion,
+        opinionSkipped,
+        opinionError,
         text: lines.join('\n')
       }
     },

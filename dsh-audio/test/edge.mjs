@@ -157,8 +157,11 @@ function mountSettingsRoutes (ttsConfig) {
 function makeRequest (method, body) {
   const request = new EventEmitter()
   request.method = method
-  request.headers = { 'sec-fetch-site': 'same-origin' }
+  // The settings routes require a JSON media type on every POST; this helper is
+  // the test's stand-in for the page, which sends it too.
+  request.headers = { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin' }
   request.destroy = () => {}
+  request.setTimeout = () => request
   process.nextTick(() => {
     request.emit('data', Buffer.from(JSON.stringify(body)))
     request.emit('end')
