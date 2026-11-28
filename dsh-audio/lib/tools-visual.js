@@ -14,11 +14,50 @@
 import { join, relative } from 'node:path'
 import { PRESETS, clamp } from './dsp.js'
 import { hashSpec, readTrack, renderPreset, resolvePath, writeFileAtomic } from './audio.js'
-import { analyzeVisemes, visemeToTimeline } from './lipsync.js'
+import { VISEMES, analyzeVisemes, visemeToTimeline } from './lipsync.js'
 import { analyzeBeats } from './beats.js'
 
 const PRESET_NAMES = Object.keys(PRESETS)
 const LIPSYNC_FORMATS = ['json', 'srt', 'css', 'ae']
+const VISEME_SET = new Set(VISEMES)
+
+/** How many illegal-viseme frames one warning list names before it summarises. */
+const WARNING_FRAME_LIMIT = 32
+
+/**
+ * Frames whose `viseme` is not one of the whitelisted shapes.
+ *
+ * The formatters replace an unknown label with `none` (a closed mouth is the
+ * safe rendering of "shape not understood") and the low-level sanitizer only
+ * reports a count. A caller asking for warnings wants to know *which* frames,
+ * because that is what tells it whether the track came from this engine (never
+ * invalid) or from hand-edited/generated input — so this scan names the frame
+ * index and the label it found. Returns strings for the same reason every other
+ * warning list in this package does: they render as one text line and need no
+ * shape contract of their own.
+ *
+ * @param {Array<object>} frames - frame list, possibly from outside this module.
+ * @param {number} [limit=32] - how many frames to name before summarising.
+ * @returns {string[]} one line per invalid frame, plus a summary line when the
+ *   list was truncated; empty when every frame is whitelisted.
+ */
+export function visemeFallbackWarnings (frames, limit = WARNING_FRAME_LIMIT) {
+  const list = Array.isArray(frames) ? frames : []
+  const out = []
+  let invalid = 0
+  for (let index = 0; index < list.length; index += 1) {
+    const frame = list[index]
+    const viseme = frame !== null && typeof frame === 'object' ? frame.viseme : undefined
+    if (typeof viseme === 'string' && VISEME_SET.has(viseme)) continue
+    invalid += 1
+    if (out.length >= limit) continue
+    const label = typeof viseme === 'string' ? viseme : String(viseme)
+    const shown = label.length > 24 ? `${label.slice(0, 24)}…` : label
+    out.push(`lipsync: frame ${index} has viseme ${JSON.stringify(shown)} outside the whitelist; used "none"`)
+  }
+  if (invalid > out.length) out.push(`lipsync: ${invalid - out.length} more frame(s) had a viseme outside the whitelist; used "none"`)
+  return out
+}
 
 function displayPath (cwd, path) {
   const rel = relative(cwd, path)
@@ -129,7 +168,7 @@ function renderSchema () {
 export function registerVisualTools (ctx) {
   ctx.tools.register({
     name: 'audio_lipsync',
-    description: 'Analyse a voice/music file into a per-frame mouth track: for every animation frame it gives the viseme (AA, EH, EE, OH, OO, MM, FF, TH, SS, DD, none), a continuous jaw openness 0..1, the frame energy and whether the frame is voiced. Use it whenever a character talks or sings, then drive the mouth from the frames. Accepts an existing .wav (path) or renders a preset inline (render). Writes .json/.srt/.css/.ae when `out` is given; returns the first frames and the viseme counts.',
+    description: 'Analyse a voice/music file into a per-frame mouth track: for every animation frame it gives the viseme (AA, EH, EE, OH, OO, MM, FF, TH, SS, DD, none), a continuous jaw openness 0..1, the frame energy and whether the frame is voiced. Use it whenever a character talks or sings, then drive the mouth from the frames. Accepts an existing .wav (path) or renders a preset inline (render). Writes .json/.srt/.css/.ae when `out` is given; returns the first frames and the viseme counts. `includeWarnings` (default off) reports frames whose viseme was outside the whitelist.',
     parameters: {
       type: 'object',
       properties: {
@@ -139,6 +178,7 @@ export function registerVisualTools (ctx) {
         format: { type: 'string', enum: LIPSYNC_FORMATS, description: 'json = full analysis, srt = cue sheet, css = keyframes (opacity steps + jaw scale, no @property), ae = After Effects time<TAB>shape paste. Defaults to json.' },
         sensitivity: { type: 'number', description: 'Level scaling before classification, 0.25..4. Raise it for quiet dialogue, lower it for a mix that already peaks.' },
         leadMs: { type: 'number', description: 'Analyse this many ms ahead of each frame so the picture leads the audio by the display latency; -200..200, defaults to 0.' },
+        includeWarnings: { type: 'boolean', description: 'Also return a warnings array (default false) for viseme labels outside the whitelist.' },
         out: { type: 'string', description: 'Output path. Defaults to no file; when omitted the summary and first frames are still returned.' }
       },
       additionalProperties: false
@@ -151,6 +191,7 @@ export function registerVisualTools (ctx) {
       const format = LIPSYNC_FORMATS.includes(args.format) ? args.format : 'json'
       const sensitivity = clamp(Number.isFinite(args.sensitivity) ? args.sensitivity : 1, 0.25, 4)
       const leadMs = clamp(Number.isFinite(args.leadMs) ? args.leadMs : 0, -200, 200)
+      const includeWarnings = args.includeWarnings === true
       const source = await loadSource(cwd, args, 'audio_lipsync')
       const analysis = analyzeVisemes(source.samples, source.sampleRate, { fps, sensitivity, leadMs })
       const content = visemeToTimeline(analysis.frames, format, {
@@ -181,7 +222,7 @@ export function registerVisualTools (ctx) {
         `shapes ${Object.entries(counts).filter(([, count]) => count > 0).map(([key, count]) => `${key}:${count}`).join(' ')}`
       ].join(' · ')
 
-      return {
+      const result = {
         path: target,
         relativePath: target === null ? null : displayPath(cwd, target),
         bytes,
@@ -196,6 +237,11 @@ export function registerVisualTools (ctx) {
         previewFrames,
         text
       }
+      // Off by default: a track this engine generates is always whitelisted, so an
+      // always-present empty array would only cost tokens. When asked, report the
+      // frames that would fall back (none today, all of them for outside data).
+      if (includeWarnings) result.warnings = visemeFallbackWarnings(analysis.frames)
+      return result
     },
     output: {
       schema: { type: 'object' },

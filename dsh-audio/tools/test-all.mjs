@@ -19,8 +19,8 @@
  * `test/out/` scratch directory, so the full suite is only correct one file at
  * a time. `--jobs` speeds up filtered subsets that do not share scratch paths.
  *
- * A test that cannot run on this machine (no ffmpeg, no voicebank, an external
- * service down) prints `SKIP:` and exits 0. It is reported as `ok` with an
+ * A test that cannot run on this machine (no ffmpeg, an external service down)
+ * prints `SKIP:` and exits 0. It is reported as `ok` with an
  * extra `[skip]` marker; no file name is special-cased, and a SKIP is never a
  * failure as long as the process exits 0.
  *

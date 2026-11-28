@@ -27,6 +27,7 @@ import {
 } from './audio.js'
 import { describeAudio } from './providers.js'
 import { selfCheck } from './selfcheck.js'
+import { SEMANTIC_DISABLED_TEXT, semanticCheckEnabled } from './settings-route.js'
 
 const SILENT_PEAK_DB = -40
 const LATE_ATTACK_SECONDS = 0.15
@@ -153,7 +154,7 @@ export function registerCheckTool (ctx, config = {}) {
 
   ctx.tools.register({
     name: 'audio_check',
-    description: '交付前质量闸：削波/静音/时间轴/叠加峰值，外加本地声学自检（不依赖外部模型）。Quality gate before delivery: clipping, near-silence, late attacks, DC offset, duration mismatches, cue files that do not exist, and a summed peak that tells you whether the cues will clip when they play together — plus a deterministic local self-check (non-finite samples, signal level, crest factor / spectral centroid / onset shape against the preset or recipe named in `spec`, loop seam). The local check always runs and needs no key; `question` additionally asks an audio-understanding model and is skipped when no model is configured.',
+    description: '交付前质量闸：削波/静音/时间轴/叠加峰值，外加本地声学自检（不依赖外部模型）。Quality gate before delivery: clipping, near-silence, late attacks, DC offset, duration mismatches, cue files that do not exist, and a summed peak that tells you whether the cues will clip when they play together — plus a deterministic local self-check (non-finite samples, signal level, crest factor / spectral centroid / onset shape against the preset or recipe named in `spec`, loop seam). The local check always runs and needs no key; `question` additionally asks an audio-understanding model and is skipped unless the semantic check is enabled in Settings (off by default) with a model configured.',
     parameters: {
       type: 'object',
       properties: {
@@ -184,7 +185,7 @@ export function registerCheckTool (ctx, config = {}) {
             loop: { type: 'boolean', description: 'True when the file was rendered as a seamless loop; adds the loop-seam check.' }
           }
         },
-        question: { type: 'string', description: 'Optional: also ask an audio-understanding model about the sound, e.g. "does this match a heavy metal door slamming in a large hall?". Only runs when config.check is configured; without it the local self-check still returns a verdict.' },
+        question: { type: 'string', description: 'Optional: also ask an audio-understanding model about the sound, e.g. "does this match a heavy metal door slamming in a large hall?". Only runs when config.check.enabled is true and a model is configured; without it the local self-check still returns a verdict.' },
         audio: { type: 'string', description: 'Which file to send with `question`; defaults to the first path or cue source.' }
       },
       additionalProperties: false
@@ -342,34 +343,51 @@ export function registerCheckTool (ctx, config = {}) {
       else if (issues.some((issue) => issue.level === 'warn')) verdict = 'warn'
 
       // --- optional external opinion ---------------------------------------
+      // The semantic layer is opt-in (`config.check.enabled`, off by default).
+      // While it is off, a `question` is skipped *before* any key lookup or
+      // fetch: "off" has to mean no network, not "make a call and hope it
+      // fails fast". The skip is an info note, so the local verdict still
+      // stands on its own.
       let opinion = null
       let opinionSkipped = false
       let opinionError = null
+      let semanticDisabled = false
       if (typeof args.question === 'string' && args.question.trim().length > 0) {
         const target = args.audio !== undefined
           ? resolvePath(cwd, args.audio)
           : files[0].path
         if (target === undefined) throw new Error('audio_check: 给了 question 但找不到要分析的音频')
-        try {
-          if (!stash.has(target)) stash.set(target, await readChannels(target))
-          const decoded = stash.get(target)
-          const mono = decoded.channels.length === 1 ? decoded.channels[0] : averageChannels(decoded.channels)
-          opinion = await describeAudio(checkConfig, toWavBytes(mono, decoded.sampleRate), args.question.trim())
-        } catch (error) {
-          // No configured model is a normal state, not a failure of the file:
-          // say so and keep the local verdict. A configured-but-failing endpoint
-          // is a warning, because the caller asked for the opinion.
-          const message = String(error?.message ?? error)
-          const unconfigured = /没有配置密钥|环境变量|apiKey|API_KEY/.test(message)
-          opinionSkipped = unconfigured
-          opinionError = message
+        if (!semanticCheckEnabled(checkConfig)) {
+          semanticDisabled = true
+          opinionSkipped = true
+          opinionError = SEMANTIC_DISABLED_TEXT
           issues.push({
-            level: unconfigured ? 'info' : 'warn',
+            level: 'info',
             target: displayPath(cwd, target),
-            message: unconfigured
-              ? `未配置音频理解模型，只运行本地自检（${message}）`
-              : `外部听感模型调用失败，本地自检结果不受影响（${message}）`
+            message: `question 已跳过：${SEMANTIC_DISABLED_TEXT}`
           })
+        } else {
+          try {
+            if (!stash.has(target)) stash.set(target, await readChannels(target))
+            const decoded = stash.get(target)
+            const mono = decoded.channels.length === 1 ? decoded.channels[0] : averageChannels(decoded.channels)
+            opinion = await describeAudio(checkConfig, toWavBytes(mono, decoded.sampleRate), args.question.trim())
+          } catch (error) {
+            // No configured model is a normal state, not a failure of the file:
+            // say so and keep the local verdict. A configured-but-failing endpoint
+            // is a warning, because the caller asked for the opinion.
+            const message = String(error?.message ?? error)
+            const unconfigured = /没有配置密钥|环境变量|apiKey|API_KEY/.test(message)
+            opinionSkipped = unconfigured
+            opinionError = message
+            issues.push({
+              level: unconfigured ? 'info' : 'warn',
+              target: displayPath(cwd, target),
+              message: unconfigured
+                ? `未配置音频理解模型，只运行本地自检（${message}）`
+                : `外部听感模型调用失败，本地自检结果不受影响（${message}）`
+            })
+          }
         }
       }
 
@@ -392,6 +410,7 @@ export function registerCheckTool (ctx, config = {}) {
       if (cues.length > 0) lines.push(`  叠加峰值 ${summedPeak > 0 ? (20 * Math.log10(summedPeak)).toFixed(1) : '-inf'} dBFS`)
       for (const issue of issues) lines.push(`  ${issue.level.toUpperCase()} ${issue.target}: ${issue.message}`)
       if (opinion !== null) lines.push(`  听感：${opinion}`)
+      else if (semanticDisabled) lines.push(`  听感：${SEMANTIC_DISABLED_TEXT}，已跳过（本地自检已给出结论）`)
       else if (opinionSkipped) lines.push('  听感：未配置音频理解模型，已跳过（本地自检已给出结论）')
 
       return {
@@ -412,6 +431,7 @@ export function registerCheckTool (ctx, config = {}) {
         opinion,
         opinionSkipped,
         opinionError,
+        semanticDisabled,
         text: lines.join('\n')
       }
     },

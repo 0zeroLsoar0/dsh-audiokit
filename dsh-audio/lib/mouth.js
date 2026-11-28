@@ -8,9 +8,9 @@
  * one page drives both tracks with the same code.
  *
  * Why it is built this way:
- *   - The syllable knowledge already ships in `sing.js` (the pinyin initial and
- *     vowel tables, `parseSyllable`), so the mouth is built from the same
- *     phonetics as the singing voice instead of a second, drifting table.
+ *   - The syllable knowledge already ships in `pinyin.js` (the pinyin initial and
+ *     vowel tables, `parseSyllable`), so the mouth is built from one phonetics
+ *     table instead of a second, drifting copy.
  *   - A viseme vocabulary is discrete: eleven labels cannot represent a blend.
  *     Coarticulation is therefore applied where it is physically visible — jaw
  *     aperture and energy move on a 30-60 ms time constant across every shape
@@ -36,7 +36,7 @@
  */
 
 import { clamp } from './dsp.js'
-import { CONSONANTS, VOWELS, parseSyllable, primaryVowel } from './sing.js'
+import { CONSONANTS, VOWELS, parseSyllable, primaryVowel } from './pinyin.js'
 import { VISEMES, visemeToSrt, visemeToTimeline } from './lipsync.js'
 
 /* ------------------------------------------------------------ vocabulary -- */
@@ -350,7 +350,7 @@ function latinSyllables (letters) {
  * Parse one syllable chunk with the shared pinyin knowledge, after pulling off
  * an English onset digraph the pinyin table does not know.
  * @param {string} chunk - normalised a-z syllable.
- * @returns {{ consonant: string|null, vowels: string[] }} ids from `sing.js`.
+ * @returns {{ consonant: string|null, vowels: string[] }} ids from `pinyin.js`.
  */
 function parseChunk (chunk) {
   let rest = chunk
@@ -389,8 +389,8 @@ function vowelTarget (id) {
 
 /**
  * Build the internal event for one syllable. Consonant timing and voicing come
- * from the imported `CONSONANTS` table, which is what keeps text and singing on
- * the same phonetics.
+ * from the imported `CONSONANTS` table, which is what keeps the mouth on the
+ * shared pinyin phonetics rather than a second, drifting table.
  * @param {string|null} consonant - pinyin initial id or null.
  * @param {string} vowelId - pinyin vowel id.
  * @param {string} text - source text, kept for debugging.

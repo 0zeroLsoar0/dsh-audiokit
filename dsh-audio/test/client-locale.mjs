@@ -141,7 +141,8 @@ const REASON_VARS = {
   'no-base-url': [],
   'provider-none': [],
   'decoder-missing': [],
-  'unsupported-target': ['target']
+  'unsupported-target': ['target'],
+  'semantic-disabled': []
 }
 console.log(`  ${reasonCodes.length} codes: ${reasonCodes.join(', ')}`)
 
@@ -168,6 +169,25 @@ for (const code of reasonCodes) {
     check(`${locale} "${key}" has no trailing punctuation`, !/[.。,，;；:：]$/.test(value), value)
   }
 }
+
+/* -------------------------------------- semantic check switch copy -- */
+
+console.log('-- semantic check switch copy --')
+
+// The opt-in semantic layer adds page copy that must exist in both languages:
+// a missing translation would leave the switch or its failure reason in Chinese
+// on an English page, which is the acceptance bug this file already guards for
+// server reasons.
+const SEMANTIC_KEYS = ['check.enabledRow', 'check.enabledDesc', 'reason.semantic-disabled']
+for (const key of SEMANTIC_KEYS) {
+  check(`"${key}" exists in zh`, typeof zh[key] === 'string' && zh[key].trim() !== '', JSON.stringify(zh[key]))
+  check(`"${key}" exists in en`, typeof en[key] === 'string' && en[key].trim() !== '', JSON.stringify(en[key]))
+  check(`"${key}" is actually translated`, zh[key] !== en[key], JSON.stringify(zh[key]))
+  check(`en "${key}" contains no CJK`, !CJK.test(en[key] ?? ''), JSON.stringify(en[key]))
+}
+check('the disabled reason says where to turn it on',
+  zh['reason.semantic-disabled'].includes('设置') && /Settings/.test(en['reason.semantic-disabled']),
+  `${JSON.stringify(zh['reason.semantic-disabled'])} / ${JSON.stringify(en['reason.semantic-disabled'])}`)
 
 /* --------------------------------------------------------- t() helper -- */
 
@@ -633,7 +653,7 @@ const CONFIG = {
   },
   check: {
     provider: 'openai', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode', model: 'qwen2.5-omni-7b',
-    autoValidate: false, keySet: true
+    autoValidate: false, keySet: true, enabled: true
   }
 }
 const VOICES = {
@@ -725,6 +745,8 @@ const ZH_TEXTS = [
   '合成并试听',
   '音频检查 · 语义层（可选）',
   'MiniMax 没有音频理解接口，这里使用 OpenAI 兼容的 input_audio 端点（Qwen-Omni 等）。不填则只跑技术检查。',
+  '语义检查（实验）',
+  '默认关闭。关闭时测试识别和 audio_check 的 question 都不发请求；开启后才使用下面的地址、模型与密钥。',
   '接口地址',
   '模型',
   'API 密钥',
@@ -876,6 +898,7 @@ console.log('-- rendered page (zh) --')
   check('en page has no Chinese copy left', leftoverCjk.length === 0, leftoverCjk.slice(0, 3).join(' | '))
   check('provider data stays in its own language', enTexts.filter((text) => PROVIDER_DATA.has(text)).length === 1)
   check('en page shows English section titles', enTexts.includes('Narration · TTS') && enTexts.includes('Audio check · semantic layer (optional)'), JSON.stringify(enTexts.slice(0, 4)))
+  check('en page shows the semantic switch in English', enTexts.includes(en['check.enabledRow']), JSON.stringify(enTexts.filter((text) => /semantic/i.test(text))))
   check('en page shows English field labels', ['Provider', 'Endpoint', 'Model', 'Voice', 'Speed', 'Pitch', 'API key'].every((label) => enTexts.includes(label)), JSON.stringify(enTexts.slice(3, 12)))
   check('en page shows English buttons', ['Synthesize & listen', 'Listen & identify', 'Validate now', 'Save', 'Reload'].every((label) => enTexts.includes(label)), JSON.stringify(enTexts.slice(-8)))
   check('en page shows English descriptions', enTexts.includes(en['tts.voiceDescStatic']) && enTexts.includes(en['tts.keyStored']) && enTexts.includes(en['tts.keyEnvDetected'].replace('{env}', 'MINIMAX_API_KEY')))

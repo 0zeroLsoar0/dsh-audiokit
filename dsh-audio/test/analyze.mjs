@@ -2,9 +2,9 @@
  * Analysis tests.
  *
  * Every assertion is against a signal whose truth is known — the frequency it
- * was generated at, the RT60 that was applied to it, the vowel formants the
- * singer renders from — never against a previous run of the same code. A test
- * that only compares the analyser with itself would happily bless a wrong
+ * was generated at, the RT60 that was applied to it, the formant table the
+ * synthetic vowel is built from — never against a previous run of the same code.
+ * A test that only compares the analyser with itself would happily bless a wrong
  * number.
  *
  * Run: node test/analyze.mjs   (node path is in ../WORKERS.md)
@@ -17,7 +17,7 @@ import { analyzeSound, compareSounds, describeReport } from '../lib/analyze.js'
 import { registerAnalyzeTools } from '../lib/tools-analyze.js'
 import { renderPreset, finalize, toWavBytes, writeFileAtomic } from '../lib/audio.js'
 import { makeRng, noise } from '../lib/dsp.js'
-import { VOWELS, renderSing, singPlan } from '../lib/sing.js'
+import { VOWELS } from '../lib/pinyin.js'
 
 const RATE = 44100
 let failures = 0
@@ -75,15 +75,70 @@ function harmonic (seconds, hz, partials, { rt60 = 0, target = 0.7 } = {}) {
 
 /* ------------------------------------------------------------- signals -- */
 
+/**
+ * Synthetic formant vowel: a harmonic source at `hz` shaped by the four
+ * resonances `pinyin.js` stores for a vowel. The formant frequencies are the
+ * truth the analyser is judged against, and they come from the table rather than
+ * from the analyser. A 32 ms raised-cosine attack and the long hold also make the
+ * onset shape a known "sustained" target.
+ *
+ * The tract response is a sum of Lorentzians with a flat floor: without the floor
+ * a narrow F1 (80 Hz) puts the first two harmonics 20 dB below the formant peak,
+ * and a pitch tracker then hears the third harmonic as the fundamental. The floor
+ * is what a real glottal pulse's broadband skirt gives for free.
+ *
+ * Each partial is added with a per-sample rotation (no `Math.sin` in the inner
+ * loop) so a 2 s vowel with a 220 Hz fundamental stays cheap to build.
+ */
+function formantVowel (seconds, hz, vowel, { attack = 0.032, target = 0.7 } = {}) {
+  const frames = Math.round(seconds * RATE)
+  const out = new Float32Array(frames)
+  const peaks = [
+    [vowel.f1, vowel.bw1, 0.9],
+    [vowel.f2, vowel.bw2, 0.55],
+    [vowel.f3, vowel.bw3, 0.25],
+    [vowel.f4, vowel.bw4, 0.12]
+  ]
+  // Resonant gain of the tract at one frequency: one Lorentzian per formant over
+  // a flat 0.2 broadband floor.
+  const tract = (freq) => peaks.reduce(
+    (sum, [center, bandwidth, gain]) => sum + gain / (1 + ((freq - center) / bandwidth) ** 2),
+    0.2
+  )
+  const partials = Math.floor((RATE / 2) / hz)
+  for (let n = 1; n <= partials; n += 1) {
+    const frequency = n * hz
+    const amplitude = tract(frequency) / n
+    if (amplitude < 1e-4) continue
+    const step = (2 * Math.PI * frequency) / RATE
+    const cosStep = Math.cos(step)
+    const sinStep = Math.sin(step)
+    let sin = 0
+    let cos = 1
+    for (let i = 0; i < frames; i += 1) {
+      out[i] += amplitude * sin
+      const nextSin = sin * cosStep + cos * sinStep
+      cos = cos * cosStep - sin * sinStep
+      sin = nextSin
+    }
+  }
+  const attackFrames = Math.max(1, Math.round(attack * RATE))
+  for (let i = 0; i < frames; i += 1) {
+    out[i] *= i >= attackFrames ? 1 : 0.5 - 0.5 * Math.cos((Math.PI * i) / attackFrames)
+  }
+  let peak = 0
+  for (let i = 0; i < frames; i += 1) peak = Math.max(peak, Math.abs(out[i]))
+  const scale = peak > 0 ? target / peak : 0
+  for (let i = 0; i < frames; i += 1) out[i] *= scale
+  return out
+}
+
 const sine440 = harmonic(3, 440, 1, { rt60: 1.6 })
 const sine440Rt60 = 1.6
 const harmonic440 = harmonic(3, 440, 6)
 const saw220 = harmonic(3, 220, 40)
 const white = noise(Math.round(3 * RATE), makeRng(20240117))
-const vowel = renderSing(
-  singPlan({ notes: [{ midi: 57, dur: 2 }], bpm: 60, lyric: 'a' }),
-  { seed: 3, vibrato: 0, formantScale: 1, space: 0 }
-)
+const vowel = formantVowel(2, 110, VOWELS.a)
 const impact = renderPreset({ preset: 'impact', seed: 5, duration: 1 })
 // A preset renders hot on purpose; finalize is what audio_synth writes to disk,
 // so that is the signal whose peak a report should be judged on.
@@ -96,7 +151,7 @@ const reportSine = analyzeSound(sine440, RATE)
 const reportHarmonic = analyzeSound(harmonic440, RATE)
 const reportSaw = analyzeSound(saw220, RATE, { maxHarmonics: 16 })
 const reportNoise = analyzeSound(white, RATE)
-const reportVowel = analyzeSound(vowel.samples, vowel.sampleRate)
+const reportVowel = analyzeSound(vowel, RATE)
 const reportImpact = analyzeSound(impact.samples, impact.sampleRate)
 
 console.log(
@@ -115,7 +170,7 @@ printRow('440 sine, rt60 1.6s', reportSine)
 printRow('440 harmonic 1/n x6', reportHarmonic)
 printRow('220 sawtooth 1/n x40', reportSaw)
 printRow('white noise', reportNoise)
-printRow('vowel /a/ A3 (220 Hz)', reportVowel)
+printRow('vowel /a/ 110 Hz harmonic', reportVowel)
 printRow('impact preset', reportImpact)
 
 /* ------------------------------------------------------ 440 Hz pure tone -- */
@@ -198,9 +253,9 @@ console.log('\n-- white noise --')
 
 /* ------------------------------------------------------------ vowel -- */
 
-console.log('\n-- vowel /a/ rendered by lib/sing.js at A3 (220 Hz) --')
+console.log('\n-- vowel /a/ synthesized from the pinyin formant table at 110 Hz --')
 {
-  // The truth is the vowel table the renderer itself uses.
+  // The truth is the vowel table the synthetic signal was built from.
   const first = VOWELS.a.f1
   const second = VOWELS.a.f2
   const closest = (target) => reportVowel.formants.reduce(
@@ -214,14 +269,14 @@ console.log('\n-- vowel /a/ rendered by lib/sing.js at A3 (220 Hz) --')
   console.log(`formants ${reportVowel.formants.map((row) => `${fmt(row.hz, 0)}Hz/${fmt(row.bandwidthHz, 0)}Hz`).join(' ')}`)
   console.log(`closest to F1 ${first} Hz -> ${foundFirst} Hz (${fmt((foundFirst - first) / first * 100, 1)} %) · ` +
     `closest to F2 ${second} Hz -> ${foundSecond} Hz (${fmt((foundSecond - second) / second * 100, 1)} %)`)
-  check('f0 is the sung A3', Math.abs(reportVowel.f0.hz - 220) / 220 <= 0.01, String(reportVowel.f0.hz))
+  check('f0 is the 110 Hz fundamental', Math.abs(reportVowel.f0.hz - 110) / 110 <= 0.01, String(reportVowel.f0.hz))
   check('F1 within 20 %', Math.abs(foundFirst - first) / first <= 0.2, `${foundFirst} Hz vs ${first} Hz`)
   check('F2 within 20 %', Math.abs(foundSecond - second) / second <= 0.2, `${foundSecond} Hz vs ${second} Hz`)
   check('formants are sorted ascending', reportVowel.formants.every((row, index) => index === 0 || reportVowel.formants[index - 1].hz < row.hz))
   check('no NaN in the report', findNonFinite(reportVowel) === null, findNonFinite(reportVowel) ?? '')
-  // The alto preset attacks over 32 ms, so the 10-90 % rise must be of that
-  // order and the sound must read as a held note, not a hit.
-  check('attack reflects the sung 32 ms rise', reportVowel.onset.attackMs > 10 && reportVowel.onset.attackMs < 90,
+  // The generator attacks over 32 ms, so the 10-90 % rise must be of that order
+  // and the sound must read as a held note, not a hit.
+  check('attack reflects the 32 ms raised-cosine rise', reportVowel.onset.attackMs > 10 && reportVowel.onset.attackMs < 90,
     `${reportVowel.onset.attackMs} ms`)
   check('a held vowel reads as sustained', reportVowel.onset.type === 'sustained', reportVowel.onset.type)
 }
@@ -246,7 +301,7 @@ console.log('\n-- percussive hit (renderPreset impact) --')
 
 console.log('\n-- compareSounds --')
 {
-  const same = compareSounds(reportVowel, analyzeSound(vowel.samples, vowel.sampleRate))
+  const same = compareSounds(reportVowel, analyzeSound(vowel, RATE))
   console.log(`vowel vs identical vowel: pass=${same.pass} rows=${same.rows.length} failed=${same.failed.length}`)
   check('identical sounds pass', same.pass === true, JSON.stringify(same.failed))
   check('every row passed', same.rows.every((row) => row.status !== 'fail'), JSON.stringify(same.failed))

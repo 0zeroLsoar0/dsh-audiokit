@@ -39,7 +39,6 @@ const CONTENT = `# 给 HTML 动画配音
 | 一段音乐 | \`audio_compose\` | 真和声 + 声部进行 + 鼓，返回节拍表 |
 | 旁白/台词 | \`audio_tts\` | MiniMax / OpenAI 兼容 / 免费 Edge |
 | 选音色 | \`audio_voices\` | 列出当前供应商可用的音色（不产出音频） |
-| 风格化唱腔（提示音/机器人声） | \`audio_sing\` | 共振峰合成，零素材、零网络；不用于真人歌曲 |
 | 角色口型 | \`audio_lipsync\` | 每帧 viseme + 连续张嘴量 |
 | 画面卡在音乐上 | \`audio_beats\` | 从成品音乐里测出 bpm 与节拍网格 |
 | 把声音接到事件上 | \`audio_bind\` | 生成 cue 表 + 播放器代码 |
@@ -51,7 +50,7 @@ const CONTENT = `# 给 HTML 动画配音
 | 要把工程交给 DAW/剪辑软件 | \`audio_daw\` | CMX3600 EDL / Reaper .rpp / CSV / Audacity labels / OTIO / FCP7 xmeml（Resolve、Premiere 可直接导入）/ AAF 子集 / OMF 骨架 |
 | 要 EQ / 压缩 / 侧链闪避 | \`audio_bus\` | 每轨处理器链 + 总线限幅 |
 | 声音要有方向、要出 5.1/双耳 | \`audio_spatial\` | 立体声/双耳/quad/5.1/7.1/一阶 Ambisonics |
-| 和 DAW 交换乐谱 | \`audio_midi\` | 导出 .mid 给 DAW，导入外部旋律来唱/渲 |
+| 和 DAW 交换乐谱 | \`audio_midi\` | 导出 .mid 给 DAW；读入外部 .mid 报告速度/轨道/音符 |
 | 没有音频也要口型 | \`audio_mouth\` | 文本/字幕直接出口型轨（与音频口型同一套格式） |
 | 把几条声音混成一条 | \`audio_mix\` | 多轨叠加，逐条给增益与时间偏移 |
 | 改已有文件 | \`audio_convert\` / \`audio_stretch\` | 裁剪、拼接、淡入、转码 / 变速不变调 |
@@ -118,16 +117,14 @@ const CONTENT = `# 给 HTML 动画配音
 - 想改情绪：先改 \`genre\` 和 \`mode\`，再改 \`bpm\`、\`intensity\`，最后才动 \`sections\`。
 - 一个项目里多个 cue 要用同一个 \`key\`/\`mode\`，否则转场会"跳调"。
 
-## 人声：audio_tts / audio_sing
+## 人声：audio_tts
 
 - \`audio_tts({ text, voice, speed, pitch, subtitle, subtitleType, srt, out })\`：旁白与台词。
   供应商在「设置 → 声音」里选（不是工具参数）：MiniMax 默认，换成 Edge 就是免费免密钥的微软朗读
   （300+ 音色，**只给压缩音频**，本机有 ffmpeg 时自动解码成 wav，没有则写出可直接播放的 .mp3）。
   音色列表用 \`audio_voices\` 查。返回时间戳时可直接喂给 \`audio_lipsync\`；端点不返回时工具会如实说明。
-- \`audio_sing({ notes|melody, lyric, bpm, voice, vibrato, breath, harmony, seed })\`：**风格化唱腔**，不是人声。
-  \`melody: "C4:1 E4:1 G4:2"\`，\`lyric: "wo ai ni"\`（拼音；汉字没有字典，会退化成 "a" 并给出警告）。
-  它适合提示音、机器人声、卡通哼唱；**不要用它做真人歌曲、翻唱或模仿具体歌手**。
-  要人声请用 \`audio_tts\` + 后期；要演唱请用你自己有授权的录音素材——插件不内置也不模仿他人作品。
+- **演唱不在这里。** 插件不做合成唱腔（共振峰合成的人声不可辨识，已移除）：要唱就用 \`audio_tts\`
+  朗读 + 音乐性处理，或交给专门的人声 TTS / AnyAudio 插件；真人歌曲请用有授权的录音素材。
 - 时间戳缺失时不要编（MiniMax T2A v2 同步接口实测不返回时间戳）；用 \`audio_beats\`/\`audio_lipsync\` 自己测。
 
 ## 画面对齐：audio_lipsync / audio_beats
@@ -184,7 +181,7 @@ const CONTENT = `# 给 HTML 动画配音
 export function registerSkill (skills) {
   const summary = {
     name: SKILL_NAME,
-    description: '给 HTML 动画配音：选型、拍点、音效/作曲/唱声、口型与节拍对齐、交付与验收。Whenever you build an HTML animation, motion graphic, or browser demo that should make sound, load this first.',
+    description: '给 HTML 动画配音：选型、拍点、音效/作曲/旁白、口型与节拍对齐、交付与验收。Whenever you build an HTML animation, motion graphic, or browser demo that should make sound, load this first.',
     invocation: { modelInvocable: true, userInvocable: true },
     provider: 'dsh-audiokit',
     source: 'bundled',

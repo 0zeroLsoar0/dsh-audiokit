@@ -12,16 +12,18 @@ import { relative } from 'node:path'
 import {
   defaultOutputPath,
   finalize,
+  finalizeChannels,
   hashSpec,
   measure,
   measureChannels,
-  mixTracks,
+  normalizeMixChannels,
   readChannels,
-  readTrack,
+  renderMix,
   renderPattern,
   renderPreset,
   resolvePath,
   toWavBytes,
+  toWavBytesChannels,
   validateMixOptions,
   writeFileAtomic
 } from './audio.js'
@@ -109,6 +111,25 @@ async function finish (cwd, samples, sampleRate, requestedOut, label, hash, opti
   const info = await stat(target)
   const metrics = { ...measure(samples, sampleRate), sampleRate }
   return { target, bytes: info.size ?? bytes.length, metrics, samples, sampleRate }
+}
+
+/**
+ * Channel-preserving sibling of `finish`, used by `audio_mix`.
+ *
+ * Kept separate so the mono synthesis tools keep their exact pipeline (and
+ * bytes); only the mix writes through here, because it is the one tool whose
+ * output channel count follows its input. Finalisation, encoding and metering
+ * all take the channel list, so a stereo mix keeps its image through every one
+ * of them.
+ */
+async function finishChannels (cwd, channels, sampleRate, requestedOut, label, hash, options = {}) {
+  finalizeChannels(channels, sampleRate, options.peakDbfs ?? -1, { loop: options.loop === true })
+  const bytes = toWavBytesChannels(channels, sampleRate)
+  const target = resolvePath(cwd, requestedOut) ?? defaultOutputPath(cwd, label, hash)
+  await writeFileAtomic(target, bytes)
+  const info = await stat(target)
+  const metrics = { ...measureChannels(channels, sampleRate), sampleRate }
+  return { target, bytes: info.size ?? bytes.length, metrics, channels, sampleRate }
 }
 
 /** Register the audio tools on `ctx.tools`. */
@@ -231,7 +252,7 @@ export function registerTools (ctx) {
 
   ctx.tools.register({
     name: 'audio_mix',
-    description: 'Mix existing .wav files into one track with per-input gain, fades, peak normalisation and a limiter. The output is always a mono file: every input is folded to one channel by averaging it (a 2/4/6/8-channel input loses its stereo image and its LFE), so use audio_bus or audio_master for a stereo/surround deliverable. Use it to assemble a finished cue from individually tweaked sounds, or to combine a bed with the hits that land on top of it.',
+    description: 'Mix existing .wav files into one track with per-input gain, fades, peak normalisation and a limiter. Channels are preserved: any stereo or multichannel input makes the output stereo (mono inputs are placed at -3 dB per side), and only an all-mono request stays mono; 4/6/8-channel inputs fold to L/R through the WAVE layout matrix with LFE dropped. Limiter and peak normalisation are linked across channels, so the image does not shift. Reports `channels`, `foldedFrom` and each input\'s channel count. Use it to assemble a finished cue from individually tweaked sounds, or to combine a bed with one-shots.',
     parameters: {
       type: 'object',
       properties: {
@@ -244,6 +265,11 @@ export function registerTools (ctx) {
         limiter: { type: 'boolean', description: 'Soft-limit the sum; defaults to true.' },
         peakDbfs: { type: 'number', description: 'Normalise the final peak to this level; defaults to -1.' },
         sampleRate: { type: 'integer', description: 'Output rate; inputs are resampled. Defaults to the highest input rate.' },
+        channels: {
+          type: ['string', 'integer'],
+          enum: ['auto', 1, 2],
+          description: "Output channels: 'auto' (default) follows the widest input (stereo when any input has more than one channel, mono only when all are mono); 1 forces mono (stereo/multichannel folded, LFE dropped); 2 forces stereo (mono inputs at -3 dB per side, multichannel downmixed to L/R)."
+        },
         out: { type: 'string', description: 'Output path; defaults to assets/audio/mix-<hash>.wav.' }
       },
       required: ['inputs'],
@@ -253,19 +279,32 @@ export function registerTools (ctx) {
     presentCall: (args) => ({ card: 'generic', title: `Mix ${args.inputs?.length ?? 0} tracks`, kind: 'other', rawInput: args }),
     async execute (args, exec) {
       const cwd = sessionCwd(ctx, exec)
-      // Reject a bad offset/duration before any file is opened: the same check
-      // runs inside mixTracks, but by then the inputs have already been read.
-      validateMixOptions({ offsets: args.offsets ?? [], gains: args.gains ?? [], durationSeconds: args.durationSeconds })
+      // Reject a bad offset/duration/channels before any file is opened: the same
+      // check runs inside renderMix, but by then the inputs have already been read.
+      validateMixOptions({ offsets: args.offsets ?? [], gains: args.gains ?? [], durationSeconds: args.durationSeconds, channels: args.channels })
       readNumber('audio_mix', 'sampleRate', args.sampleRate)
       readNumber('audio_mix', 'peakDbfs', args.peakDbfs)
       readNumber('audio_mix', 'fadeInSeconds', args.fadeInSeconds)
       readNumber('audio_mix', 'fadeOutSeconds', args.fadeOutSeconds)
       const paths = (args.inputs ?? []).map((input) => resolvePath(cwd, input)).filter(Boolean)
       if (paths.length === 0) throw new Error('audio_mix needs at least one input path')
+      // Read the real channels: `readTrack` folds a file to mono, and that fold
+      // is exactly the information a stereo mix has to keep.
       const tracks = []
-      for (const path of paths) tracks.push(await readTrack(path))
-      const hash = hashSpec({ inputs: paths, gains: args.gains ?? [], offsets: args.offsets ?? [], duration: args.durationSeconds, peak: args.peakDbfs ?? -1 })
-      const mixed = mixTracks(tracks, {
+      for (const path of paths) tracks.push(await readChannels(path))
+      const channelsChoice = normalizeMixChannels(args.channels)
+      // The explicit channel choice belongs in the cache key; an `auto` request
+      // is left out of it so an all-mono mix keeps its historical default path.
+      const hash = hashSpec({
+        inputs: paths,
+        gains: args.gains ?? [],
+        offsets: args.offsets ?? [],
+        duration: args.durationSeconds,
+        peak: args.peakDbfs ?? -1,
+        channels: channelsChoice === 'auto' ? undefined : channelsChoice
+      })
+      const mixed = renderMix(tracks, {
+        channels: channelsChoice,
         sampleRate: args.sampleRate,
         gains: args.gains ?? [],
         offsets: args.offsets ?? [],
@@ -275,18 +314,25 @@ export function registerTools (ctx) {
         limiter: args.limiter !== false,
         peakDbfs: Number.isFinite(args.peakDbfs) ? args.peakDbfs : -1
       })
-      const result = await finish(cwd, mixed.samples, mixed.sampleRate, args.out, 'mix', hash, { peakDbfs: args.peakDbfs ?? -1 })
-      // Say it in the result too: a caller that fed in stereo must not be
-      // surprised by a mono file.
-      const widestInput = Math.max(...tracks.map((track) => track.channels ?? 1))
-      const foldNote = widestInput > 1 ? [`mono output (${widestInput}-ch input folded by averaging)`] : ['mono output']
+      const result = await finishChannels(cwd, mixed.channels, mixed.sampleRate, args.out, 'mix', hash, { peakDbfs: args.peakDbfs ?? -1 })
+      // Say it in the result too: a caller that feeds in stereo must be able to
+      // see that the image survived (or exactly where it was folded).
+      const foldNote = [
+        mixed.channelCount === 2
+          ? 'stereo output'
+          : (mixed.foldedFrom > 1 ? `mono output (${mixed.foldedFrom}-ch input folded)` : 'mono output'),
+        mixed.lfeDropped ? 'LFE dropped' : null,
+        `input channels ${mixed.inputChannels.join('/')}`
+      ].filter(Boolean)
       return {
         path: result.target,
         relativePath: displayPath(cwd, result.target),
         bytes: result.bytes,
         inputs: paths.length,
-        channels: 1,
-        foldedFrom: widestInput,
+        channels: mixed.channelCount,
+        foldedFrom: mixed.foldedFrom,
+        inputChannels: mixed.inputChannels,
+        lfeDropped: mixed.lfeDropped,
         durationSeconds: result.metrics.durationSeconds,
         metrics: result.metrics,
         text: summaryLine(`Mixed ${paths.length} track(s) into`, cwd, result.target, result.bytes, result.metrics, foldNote)

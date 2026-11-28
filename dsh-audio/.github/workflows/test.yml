@@ -5,16 +5,33 @@
 # files go through tools/test-all.mjs, which runs one child process per file and
 # prints `ok`/`FAIL` plus the elapsed milliseconds.
 #
+# Matrix: ubuntu-latest and windows-latest × node 20, 22 and 24. Windows is in
+# the matrix because several seams are platform-shaped — the bundled DSH ffmpeg
+# lookup, path separators in the editor/cue routes, and CRLF in files a test
+# reads back — and a Linux-only run cannot see those. `fail-fast: false` keeps
+# one red leg from hiding the other five.
+#
+# Shells are left at the runner defaults (bash on Linux, pwsh on Windows) on
+# purpose: `npm`/`node` resolve their own launchers through the shell on both,
+# and no step uses a POSIX-only construct. The suite itself spawns
+# `process.execPath` directly with a relative path, so it does not depend on the
+# shell at all.
+#
 # Environment notes:
 #   * Tests that cannot run here skip themselves (`SKIP:` + exit 0), never fail:
-#     test/video.mjs needs ffmpeg/ffprobe, which ubuntu-latest does not ship.
-#     The bundled Windows ffmpeg path (~/.dsh/tools/ffmpeg/bin) is therefore
-#     only covered by running the suite on Windows.
+#     test/video.mjs needs ffmpeg/ffprobe (hosted runners have neither; the
+#     bundled Windows ffmpeg under ~/.dsh/tools/ffmpeg/bin belongs to a DSH
+#     install, not to the runner). One `[skip]` line per leg today; the count
+#     follows the table in docs/RELEASE.md §4, so read the log rather than
+#     assuming a number.
 #   * test/edge.mjs is the exception: it talks to the live Microsoft Edge
 #     read-aloud service. Hosted runners have network access, so it normally
-#     passes; if that service is unreachable the test fails loudly with a FAIL
-#     line instead of pretending to pass. Check the run log before assuming a
-#     code regression.
+#     passes; if that service blocks or rate-limits the runner, the test fails
+#     loudly with a FAIL line instead of pretending to pass. Check the run log
+#     before assuming a code regression.
+#   * A leg takes ~3-5 minutes on a fast machine and up to ~8 on a 2-vCPU
+#     runner (the suite is serial; ~3 minutes measured on the reference Windows
+#     machine). The 15-minute job timeout is the guard against a hung leg.
 name: test
 
 on:
@@ -26,15 +43,24 @@ on:
 permissions:
   contents: read
 
+# A second push to the same branch supersedes the previous run instead of
+# queueing six more jobs; the workflow only reads the tree.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    name: node ${{ matrix.node }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    name: node ${{ matrix.node }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
+      # One red leg must not cancel the others: a Windows-only failure is
+      # exactly the signal this matrix exists to produce.
       fail-fast: false
       matrix:
-        node: [20, 22]
+        os: [ubuntu-latest, windows-latest]
+        node: [20, 22, 24]
     steps:
       - uses: actions/checkout@v4
 
@@ -42,9 +68,17 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
+      # Printed for failure triage: a Node behavioural difference is the first
+      # thing to check when only one leg is red.
+      - name: Environment
+        run: |
+          node --version
+          npm --version
+
       # No dependencies: this only proves the manifest is installable/parseable.
       - name: Install (no dependencies)
         run: npm install --no-audit --no-fund
 
+      # Same entry point a human uses: npm test -> node tools/test-all.mjs.
       - name: Tests
-        run: node tools/test-all.mjs
+        run: npm test

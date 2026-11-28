@@ -15,10 +15,10 @@ dsh-audiokit 是一个为 HTML 动画设计的声音处理插件，提供可供 
 
 ## 工具分组
 
-本插件提供 31 个工具，分类如下：
+本插件提供 30 个工具，分类如下：
 
 *   **造声 (10)**：包含 38 个预设的 `audio_synth`、自定义图谱 `audio_synth_graph`、规则铺设 `audio_pattern`、38 种分层配方 `audio_design`、8 种风格和声 `audio_compose`、MIDI 读写 `audio_midi`、采样器 `audio_sampler`、接入外部纯音频生成模型的 `audio_generate`、实时合成 `audio_live`、16 种交互音效 `audio_react`。
-*   **人声 (5)**：提供 `audio_tts`（支持 MiniMax、OpenAI 接口、Edge）、`audio_voices`、逐帧口型 `audio_lipsync`、无音频口型 `audio_mouth`、风格化唱腔 `audio_sing`。
+*   **人声 (4)**：提供 `audio_tts`（支持 MiniMax、OpenAI 接口、Edge）、`audio_voices`、逐帧口型 `audio_lipsync`、无音频口型 `audio_mouth`。演唱不在插件内：合成唱腔已移除，交给 TTS 服务或外部人声插件。
 *   **对画面 (4)**：包括 BPM 与节拍网格测量 `audio_beats`、生成 Cue 表与播放器 `audio_bind`、视频混流及切点处理 `audio_mux`、导出 EDL/Reaper/CSV/labels/OpenTimelineIO/FCP7 XML 的 `audio_daw`。
 *   **混音母带交付 (8)**：包括多轨合一 `audio_mix`、含压缩与侧链的总线 `audio_bus`、多段压缩与限制 `audio_master`、分轨处理 `audio_stems`、音频转换 `audio_convert`、变速变调 `audio_stretch`、多声道处理 `audio_spatial`、响度度量 `audio_loudness`。
 *   **验收 (4)**：度量工具 `audio_probe`、交付质检 `audio_check`（含本地声学自检，不依赖外部模型）、频谱分析 `audio_analyze`、快照回归 `audio_regress`。
@@ -55,7 +55,6 @@ audio_check({ paths: ['out/mix.wav'], cues: [{ at: 0.82, src: 'assets/audio/slam
 
 ## 限制说明
 
-*   唱腔功能仅提供合成音色，非真人录音。
 *   MiniMax 同步接口无法返回时间戳。
 *   多声道处理仅支持 16 位与 24 位位深。
 *   演示动画与截图未包含在仓库中。

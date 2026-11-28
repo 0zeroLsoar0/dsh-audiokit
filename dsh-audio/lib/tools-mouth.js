@@ -22,6 +22,7 @@ import {
   mouthFromText,
   mouthFromTimeline
 } from './mouth.js'
+import { visemeFallbackWarnings } from './tools-visual.js'
 
 function displayPath (cwd, path) {
   const rel = relative(cwd, path)
@@ -93,7 +94,7 @@ function cueSchema () {
 export function registerMouthTools (ctx) {
   ctx.tools.register({
     name: 'audio_mouth',
-    description: 'Build a mouth track from text alone (a caption, a typewriter line, a silent comic): the same per-frame viseme/openness/energy shape audio_lipsync returns, so one page can drive both. Schedules one syllable per half beat, with a 190 ms floor so fast tempos stay legible (the slot never gets longer at a faster bpm), closes the mouth on punctuation, and writes json/srt/css/ae when `out` is given. Use it when there is no voice audio yet; use audio_lipsync when there is.',
+    description: 'Build a mouth track from text alone (a caption, a typewriter line, a silent comic): the same per-frame viseme/openness/energy shape audio_lipsync returns, so one page can drive both. Schedules one syllable per half beat, with a 190 ms floor so fast tempos stay legible (the slot never gets longer at a faster bpm), closes the mouth on punctuation, and writes json/srt/css/ae when `out` is given. Use it when there is no voice audio yet; use audio_lipsync when there is. `includeWarnings` (default off) returns the text notes and any viseme outside the whitelist.',
     parameters: {
       type: 'object',
       properties: {
@@ -105,6 +106,7 @@ export function registerMouthTools (ctx) {
         format: { type: 'string', enum: MOUTH_FORMATS, description: 'json = full track, srt = cue sheet, css = keyframes (opacity steps + jaw scale, no @property), ae = After Effects time<TAB>shape paste. Defaults to json.' },
         style: { type: 'string', enum: MOUTH_STYLES, description: 'Performance: neutral, excited (wider jaw, faster transitions) or tired (smaller jaw, slower transitions). Defaults to neutral.' },
         alignment: { type: 'string', enum: MOUTH_ALIGNMENTS, description: 'bpm = syllables on the musical grid (default), even = every event gets an equal slice, cues = drive from the timed cues list.' },
+        includeWarnings: { type: 'boolean', description: 'Also return a warnings array (default false) with the text notes and viseme labels outside the whitelist.' },
         out: { type: 'string', description: 'Output path. Defaults to no file; when omitted the summary and first frames are still returned.' }
       },
       additionalProperties: false
@@ -179,6 +181,7 @@ export function registerMouthTools (ctx) {
         `${source} · ${style}, ${track.alignment} alignment, ${fmt(track.durationSeconds)}s — ${where}`
       ].join(' · ')
 
+      const warnings = [...visemeFallbackWarnings(track.frames), ...track.warnings]
       return {
         path: target,
         relativePath: target === null ? null : displayPath(cwd, target),
@@ -195,7 +198,9 @@ export function registerMouthTools (ctx) {
         voicedFrames: track.voicedFrames,
         counts,
         previewFrames,
-        warnings: track.warnings,
+        // Off by default: the warnings are diagnostic notes a caller opts into,
+        // so a normal call keeps the same shape it always had.
+        ...(args.includeWarnings === true ? { warnings: [...new Set(warnings)] } : {}),
         text
       }
     },

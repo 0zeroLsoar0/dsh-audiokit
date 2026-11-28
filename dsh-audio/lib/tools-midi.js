@@ -1,16 +1,18 @@
 /**
  * `audio_midi`: the bridge between a compose score and a Standard MIDI File.
  *
- * One tool with three verbs, because they are three questions about the same
- * file format:
+ * One tool with two verbs, because they are two questions about the same file
+ * format:
  *
  * - `export` — take music this plugin made (a score object, or a compose request)
  *   and write it as a `.mid` that a DAW, notation app or game engine can open.
  *   Without this the score died inside the plugin.
- * - `import` — read a `.mid` from the user and report what is in it; with
- *   `render: true` it also sings the melody to a `.wav`, so an existing tune
- *   becomes audio.
- * - `parse` — the same read, JSON only, no file written.
+ * - `parse` — read a `.mid` from the user and report what is in it: tempo,
+ *   tracks, note counts, ranges and a bounded preview.
+ *
+ * There is deliberately no "import to audio" verb. Singing an imported melody
+ * needed the formant voice, and that engine is gone: singing belongs to a TTS
+ * engine or an external plugin (see CHANGELOG 0.6.0).
  *
  * Like every other tool here it returns a bounded summary, never audio bytes and
  * never a whole note list: the preview is capped, and `text` is the one human
@@ -18,24 +20,19 @@
  */
 
 import { readFile, stat } from 'node:fs/promises'
-import { basename, join, relative } from 'node:path'
-import { defaultOutputPath, hashSpec, measure, resolvePath, toWavBytes, writeFileAtomic } from './audio.js'
+import { join, relative } from 'node:path'
+import { resolvePath, writeFileAtomic } from './audio.js'
 import { GENRES, KEYS, MODES, composeScore } from './compose.js'
-import { clamp, specHash } from './dsp.js'
-import { midiToPlan, parseMidiFile, scoreToMid, writeMidiFile } from './midi.js'
-import { VOICE_PRESETS, renderSing, singPlan } from './sing.js'
+import { specHash } from './dsp.js'
+import { parseMidiFile, scoreToMid, writeMidiFile } from './midi.js'
 
 const GENRE_NAMES = Object.keys(GENRES)
 const KEY_NAMES = Object.keys(KEYS)
 const MODE_NAMES = Object.keys(MODES)
-const VOICE_NAMES = Object.keys(VOICE_PRESETS)
 
 /** Bounds on the JSON this tool can hand back, so one big file cannot flood it. */
 const MAX_TRACKS_LISTED = 12
 const PREVIEW_NOTES = 6
-/** A sung import is still one phrase: the `audio_sing` limits apply. */
-const MAX_SING_NOTES = 256
-const MAX_SING_SECONDS = 120
 
 function displayPath (cwd, path) {
   const rel = relative(cwd, path)
@@ -113,18 +110,6 @@ function trackLine (parsed) {
   const parts = parsed.tracks.slice(0, 6).map((track) => `${track.name ?? `track ${track.index + 1}`} ${track.notes.length}n`)
   if (parsed.tracks.length > 6) parts.push(`+${parsed.tracks.length - 6} more`)
   return `tracks: ${parts.join(' · ')}`
-}
-
-/** Wav summary in the same vocabulary as the other tools. */
-function wavLine (cwd, path, bytes, metrics) {
-  return [
-    `Sang ${displayPath(cwd, path)} (${fmt(metrics.durationSeconds, 2)}s, ${metrics.sampleRate} Hz, ${sizeText(bytes)})`,
-    `peak ${fmt(metrics.peakDbfs)} dBFS`,
-    `rms ${fmt(metrics.rmsDbfs)} dBFS`,
-    `crest ${fmt(metrics.crestDb)} dB`,
-    `centroid ${fmt(metrics.centroidHz)} Hz`,
-    metrics.clipping > 0 ? `CLIPPING ${metrics.clipping} samples` : 'no clipping'
-  ].join(' · ')
 }
 
 /* ------------------------------------------------------------------ export -- */
@@ -209,15 +194,15 @@ async function exportMidi (cwd, args) {
   }
 }
 
-/* ------------------------------------------------------------- read/import -- */
+/* ------------------------------------------------------------- read/parse -- */
 
 /**
- * Parse a `.mid`; for `import` also plan (and optionally sing) the melody.
+ * Parse a `.mid` and report what is in it.
  * @returns {Promise<object>} the tool result.
  */
-async function readMidi (cwd, args, action) {
+async function readMidi (cwd, args) {
   const path = resolvePath(cwd, args.path)
-  if (path === undefined) throw new Error(`audio_midi ${action} needs a .mid file path`)
+  if (path === undefined) throw new Error('audio_midi parse needs a .mid file path')
   let bytes
   try {
     bytes = await readFile(path)
@@ -254,8 +239,11 @@ async function readMidi (cwd, args, action) {
   const header = `Read ${displayPath(cwd, path)} (${sizeText(bytes.length)}, format ${parsed.format}, ${parsed.tracks.length} track(s), ${parsed.noteCount} note(s), ${fmt(parsed.durationSeconds, 2)}s @ ${fmt(parsed.tempoBpm)} BPM, ${parsed.ticksPerQuarter} tpq)`
   const lines = [header, trackLine(parsed)]
 
-  const result = {
-    action,
+  if (tracksOmitted > 0) lines.push(`note: ${tracksOmitted} more track(s) omitted from this summary`)
+  for (const warning of warnings) lines.push(`warning: ${warning}`)
+
+  return {
+    action: 'parse',
     path,
     relativePath: displayPath(cwd, path),
     bytes: bytes.length,
@@ -271,107 +259,27 @@ async function readMidi (cwd, args, action) {
     trackList,
     tracksOmitted,
     warnings,
-    text: ''
+    text: lines.join('\n')
   }
-
-  if (action === 'import') {
-    // A sung line has to be monophonic and in range; the plan reports both.
-    const plan = midiToPlan(parsed, {
-      track: args.track,
-      bpm: args.bpm,
-      maxNotes: args.maxNotes,
-      maxSeconds: MAX_SING_SECONDS,
-      syllable: args.syllable
-    })
-    warnings.push(...plan.warnings)
-    result.singable = {
-      track: plan.source.track,
-      trackIndex: plan.source.trackIndex,
-      channel: plan.source.channel,
-      notes: plan.notes.length,
-      bpm: plan.bpm,
-      totalSeconds: plan.totalSeconds,
-      preview: plan.notes.slice(0, PREVIEW_NOTES).map((note) => [note.midi, note.startBeat, note.durBeats])
-    }
-
-    if (args.render === true) {
-      const request = singPlan({ bpm: plan.bpm, notes: plan.notes })
-      if (request.notes.length > MAX_SING_NOTES) {
-        throw new Error(`audio_midi: ${request.notes.length} notes exceeds the ${MAX_SING_NOTES} note singing limit; raise maxNotes or pick a shorter track`)
-      }
-      if (request.totalSeconds > MAX_SING_SECONDS) {
-        throw new Error(`audio_midi: ${fmt(request.totalSeconds)} s exceeds the ${MAX_SING_SECONDS} s singing limit; lower maxNotes or raise bpm`)
-      }
-      const requestedVoice = args.voice === undefined || args.voice === null ? 'alto' : String(args.voice)
-      const voice = VOICE_PRESETS[requestedVoice] !== undefined ? requestedVoice : 'alto'
-      if (voice !== requestedVoice) warnings.push(`unknown voice "${requestedVoice}"; sang with "${voice}"`)
-      const sampleRate = clamp(Math.round(Number(args.sampleRate ?? 44100)), 8000, 96000)
-      const rendered = renderSing(request, {
-        voice,
-        vibrato: args.vibrato,
-        breath: args.breath,
-        harmony: args.harmony,
-        seed: 1,
-        sampleRate
-      })
-      const wavBytes = toWavBytes(rendered.samples, rendered.sampleRate)
-      const hash = hashSpec({
-        engine: 'midi/import-render/1',
-        notes: request.notes.map((note) => [note.midi, note.startBeat, note.durBeats]),
-        bpm: request.bpm,
-        voice,
-        seed: 1,
-        sampleRate: rendered.sampleRate
-      })
-      const stem = basename(path).replace(/\.[^.\\/]+$/, '') || 'midi'
-      const target = resolvePath(cwd, args.out) ?? defaultOutputPath(cwd, `midi-${stem}`, hash)
-      await writeFileAtomic(target, wavBytes)
-      const info = await stat(target)
-      const metrics = { ...measure(rendered.samples, rendered.sampleRate), sampleRate: rendered.sampleRate }
-      result.render = {
-        path: target,
-        relativePath: displayPath(cwd, target),
-        bytes: info.size,
-        durationSeconds: metrics.durationSeconds,
-        sampleRate: rendered.sampleRate,
-        bpm: request.bpm,
-        notes: request.notes.length,
-        voice,
-        metrics
-      }
-      lines.push(wavLine(cwd, target, info.size, metrics))
-    } else if (args.render !== undefined && args.render !== false) {
-      warnings.push('render only accepts true/false; nothing was sung')
-    }
-  }
-
-  const sang = result.singable === undefined
-    ? ''
-    : `singable: ${result.singable.notes} note(s) from "${result.singable.track ?? `track ${result.singable.trackIndex + 1}`}" at ${fmt(result.singable.bpm)} BPM (${fmt(result.singable.totalSeconds, 2)}s)`
-  if (sang !== '') lines.push(sang)
-  if (tracksOmitted > 0) lines.push(`note: ${tracksOmitted} more track(s) omitted from this summary`)
-  for (const warning of warnings) lines.push(`warning: ${warning}`)
-  result.text = lines.join('\n')
-  return result
 }
 
 /* ------------------------------------------------------------------- tools -- */
 
 /**
- * Register the MIDI export/import tool on `ctx.tools`.
+ * Register the MIDI export/read tool on `ctx.tools`.
  * @param {object} ctx - Cordis registrant context.
  */
 export function registerMidiTools (ctx) {
   ctx.tools.register({
     name: 'audio_midi',
-    description: 'Export a composed score to a Standard MIDI File (.mid) a DAW or notation app can open, or import an existing .mid as notes (optionally singing it to a .wav). Use it when the deliverable must be editable music rather than rendered audio, or when the user brings music in. export accepts a score object (the audio_compose result) or a genre to compose in one call; import/parse read a .mid and return its tempo, tracks, note count and duration.',
+    description: 'Export a composed score to a Standard MIDI File (.mid) a DAW or notation app can open, or read an existing .mid and report its tempo, tracks, note counts and ranges. Use it when the deliverable must be editable music rather than rendered audio, or when the user brings music in. export accepts a score object (the audio_compose result) or a genre to compose in one call; parse reads a .mid and returns a bounded JSON summary.',
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['export', 'import', 'parse'], description: 'export=score or genre in, .mid out. import=.mid in, summary plus optional sung .wav. parse=.mid in, JSON summary only.' },
+        action: { type: 'string', enum: ['export', 'parse'], description: 'export=score or genre in, .mid out. parse=.mid in, JSON summary only (no audio is rendered).' },
         score: { type: 'object', additionalProperties: true, description: 'The score to export, in the audio_compose shape (bpm, beatsPerBar, bars, tracks[].notes[]). Use this to export music already composed in the conversation instead of composing again.' },
         genre: { type: 'string', enum: GENRE_NAMES, description: 'Export by composing in one call: the same eight genres as audio_compose. Ignored when score is given.' },
-        bpm: { type: 'number', description: 'Tempo 40..220. Export: the file tempo (defaults to the genre tempo). import+render: retimes the sung line instead of using the file tempo.' },
+        bpm: { type: 'number', description: 'Export only: the file tempo (defaults to the genre tempo).' },
         bars: { type: 'integer', description: 'Export only: length in bars; defaults to 16.' },
         key: { type: 'string', enum: KEY_NAMES, description: 'Export only: tonic note name; defaults to the genre key.' },
         mode: { type: 'string', enum: MODE_NAMES, description: 'Export only: scale/mode; defaults to the genre mode.' },
@@ -393,18 +301,9 @@ export function registerMidiTools (ctx) {
             additionalProperties: false
           }
         },
-        path: { type: 'string', description: 'import/parse: the .mid file to read, relative to the working directory or absolute.' },
-        out: { type: 'string', description: 'Output path. export defaults to assets/audio/<label>-<hash>.mid; import+render defaults to assets/audio/midi-<name>-<hash>.wav.' },
-        render: { type: 'boolean', description: 'import only: also sing the melody to a .wav with the built-in formant voice, so the imported tune is audible.' },
-        track: { anyOf: [{ type: 'string' }, { type: 'integer' }], description: 'import only: which track to sing. An index, or part of a track name ("melody"). Defaults to the track named like a melody, else the one with the most notes.' },
-        voice: { type: 'string', enum: VOICE_NAMES, description: 'Singing voice for render, same ids as audio_sing; default alto.' },
-        vibrato: { type: 'number', description: 'Formant voice vibrato depth 0..1; 0 keeps the pitch measurable on import.' },
-        breath: { type: 'number', description: 'Formant voice breathiness 0..1.' },
-        harmony: { type: 'string', enum: ['third', 'fifth', 'octave'], description: 'Add a harmony voice a third/fifth/octave above while singing.' },
-        syllable: { type: 'string', description: 'Pinyin syllable to sing on every note; default "la".' },
-        maxNotes: { type: 'integer', description: 'import: cap on notes sung from the file (default 256, hard limit 256).' },
-        ticksPerQuarter: { type: 'integer', description: 'export: MIDI timing resolution, 24..9600; default 480.' },
-        sampleRate: { type: 'integer', description: 'import+render: defaults to 44100.' }
+        path: { type: 'string', description: 'parse: the .mid file to read, relative to the working directory or absolute.' },
+        out: { type: 'string', description: 'Export output path. Defaults to assets/audio/<label>-<hash>.mid; parse writes no file.' },
+        ticksPerQuarter: { type: 'integer', description: 'export: MIDI timing resolution, 24..9600; default 480.' }
       },
       required: ['action'],
       additionalProperties: false
@@ -424,13 +323,9 @@ export function registerMidiTools (ctx) {
       readNumber('audio_midi', 'seed', args.seed)
       readNumber('audio_midi', 'intensity', args.intensity)
       readNumber('audio_midi', 'ticksPerQuarter', args.ticksPerQuarter)
-      readNumber('audio_midi', 'maxNotes', args.maxNotes)
-      readNumber('audio_midi', 'sampleRate', args.sampleRate)
-      readNumber('audio_midi', 'vibrato', args.vibrato)
-      readNumber('audio_midi', 'breath', args.breath)
       if (action === 'export') return exportMidi(cwd, args)
-      if (action === 'import' || action === 'parse') return readMidi(cwd, args, action)
-      throw new Error(`audio_midi: action must be "export", "import" or "parse", got ${describeValue(args.action)}`)
+      if (action === 'parse') return readMidi(cwd, args)
+      throw new Error(`audio_midi: action must be "export" or "parse", got ${describeValue(args.action)}`)
     },
     output: {
       schema: { type: 'object' },

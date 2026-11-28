@@ -13,8 +13,7 @@
  *    parses, the others fail with a readable `midi: ...` reason, never a
  *    RangeError.
  * 4. Exports are byte-deterministic.
- * 5. An imported melody really is singable: `midiToPlan` -> `singPlan` ->
- *    `renderSing` produces audio whose measured pitch matches the MIDI notes.
+ * 5. An imported file reports what is in it: note count, tempo, track name.
  * 6. Exporting 1000 notes stays far below the 50 ms budget.
  *
  * Run with the workspace node (node is not on PATH):
@@ -25,10 +24,8 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { measure } from '../lib/audio.js'
 import { composeScore } from '../lib/compose.js'
-import { MIDI_TICKS_PER_QUARTER, midiToPlan, parseMidiFile, scoreToMid, writeMidiFile } from '../lib/midi.js'
-import { measurePitch, midiToHz, renderSing, singPlan } from '../lib/sing.js'
+import { MIDI_TICKS_PER_QUARTER, parseMidiFile, scoreToMid, writeMidiFile } from '../lib/midi.js'
 import { registerMidiTools } from '../lib/tools-midi.js'
 
 let failures = 0
@@ -283,9 +280,9 @@ const reversedBytes = writeMidiFile({ bpm: 90, tracks: [{ name: 'x', notes: dist
 console.log(`note-order independence: ${orderedBytes.equals(reversedBytes) ? 'identical' : 'DIFFERENT'} (${orderedBytes.length} bytes)`)
 check('note input order does not change the bytes', orderedBytes.equals(reversedBytes))
 
-/* ------------------------------------------------- 6. imported melody is sung -- */
+/* ----------------------------------------- 6. imported melody, reported -- */
 
-console.log('\n-- imported melody, sung --')
+console.log('\n-- imported melody, reported --')
 const melodyScore = {
   bpm: 120,
   bars: 1,
@@ -304,38 +301,10 @@ const melodyScore = {
 }
 const melodyFile = writeMidiFile(scoreToMid(melodyScore))
 const melodyParsed = parseMidiFile(melodyFile)
-const plan = midiToPlan(melodyParsed)
-const singRequest = singPlan({ bpm: plan.bpm, notes: plan.notes })
-const sung = renderSing(singRequest, { voice: 'alto', vibrato: 0, sampleRate: 44100 })
-const sungMetrics = measure(sung.samples, sung.sampleRate)
-console.log(`imported: ${melodyParsed.noteCount} note(s) at ${num(melodyParsed.tempoBpm, 3)} BPM -> plan ${plan.notes.length} note(s), ${num(plan.totalSeconds, 3)}s, bpm ${plan.bpm}`)
-console.log(`sung: ${sung.samples.length} samples @ ${sung.sampleRate} Hz, ${num(sungMetrics.durationSeconds, 3)}s, rms ${num(sungMetrics.rmsDbfs)} dBFS, peak ${num(sungMetrics.peakDbfs)} dBFS, onsets ${sungMetrics.onsets}`)
-check('plan keeps every note', plan.notes.length === melodyParsed.noteCount, `${plan.notes.length} vs ${melodyParsed.noteCount}`)
-check('plan keeps the tempo', Math.abs(plan.bpm - 120) < 1e-9, String(plan.bpm))
-check('render is non-silent', sungMetrics.rmsDbfs > -40, `${sungMetrics.rmsDbfs} dBFS`)
-check('render is not clipping', sungMetrics.clipping === 0, `${sungMetrics.clipping} samples`)
-
-let worstCents = 0
-let measuredNotes = 0
-for (let index = 0; index < Math.min(plan.notes.length, sung.syllableTimings.length); index += 1) {
-  const note = plan.notes[index]
-  const timing = sung.syllableTimings[index]
-  const length = timing.end - timing.start
-  // Measure the vowel sustain, past the consonant and before the release.
-  const from = Math.min(timing.start + (timing.vowelStart - timing.start) + 0.04, timing.start + length * 0.5)
-  const to = Math.max(from + 0.04, timing.end - Math.max(0.04, length * 0.15))
-  const measured = measurePitch(sung.samples, sung.sampleRate, { from, to, minHz: 80, maxHz: 1000 })
-  const target = midiToHz(note.midi)
-  const cents = measured.hz > 0 ? 1200 * Math.log2(measured.hz / target) : Number.NaN
-  const usable = measured.hz > 0 && measured.clarity >= 0.5
-  if (usable) measuredNotes += 1
-  if (Number.isFinite(cents)) worstCents = Math.max(worstCents, Math.abs(cents))
-  console.log(`  note ${index}: midi ${note.midi} target ${num(target, 2)} Hz, measured ${num(measured.hz, 2)} Hz, ${num(cents, 1)} cents, clarity ${num(measured.clarity, 2)}`)
-  check(`note ${index} pitch measurable`, usable, `hz=${measured.hz} clarity=${measured.clarity}`)
-  check(`note ${index} pitch within 40 cents`, Number.isFinite(cents) && Math.abs(cents) <= 40, `${cents} cents`)
-}
-console.log(`pitch: ${measuredNotes}/${plan.notes.length} note(s) measured, worst |error| ${num(worstCents, 1)} cents`)
-check('every imported note was measured', measuredNotes === plan.notes.length, `${measuredNotes}/${plan.notes.length}`)
+console.log(`imported: ${melodyParsed.noteCount} note(s) at ${num(melodyParsed.tempoBpm, 3)} BPM, ${num(melodyParsed.durationSeconds, 3)}s, track "${melodyParsed.tracks[0]?.name}"`)
+check('parse keeps every note', melodyParsed.noteCount === 4, `${melodyParsed.noteCount}`)
+check('parse keeps the tempo', Math.abs(melodyParsed.tempoBpm - 120) < 1e-9, String(melodyParsed.tempoBpm))
+check('parse names the melody track', String(melodyParsed.tracks[0]?.name ?? '').startsWith('melody'), String(melodyParsed.tracks[0]?.name))
 
 /* ------------------------------------------------------------- 7. performance -- */
 
@@ -389,11 +358,21 @@ try {
   check('parse note count matches the export', parsedTool.notes === exportedTool.notes, `${parsedTool.notes} vs ${exportedTool.notes}`)
   check('parse track list is bounded', Array.isArray(parsedTool.trackList) && parsedTool.trackList.length <= 12, `${parsedTool.trackList.length}`)
 
-  const importedTool = await tool.execute({ action: 'import', path: join(workDir, 'cue.mid'), render: true, maxNotes: 64, out: join(workDir, 'sung.wav') }, {})
-  console.log(`import: ${importedTool.notes} notes, singable ${importedTool.singable?.notes} note(s) from "${importedTool.singable?.track}", render ${importedTool.render?.bytes} bytes, ${num(importedTool.render?.durationSeconds, 3)}s, rms ${num(importedTool.render?.metrics?.rmsDbfs)} dBFS`)
-  check('import produced a wav', importedTool.render !== undefined && importedTool.render.bytes > 1000, `${importedTool.render?.bytes}`)
-  check('import render is audible', importedTool.render !== undefined && importedTool.render.metrics.rmsDbfs > -60, `${importedTool.render?.metrics?.rmsDbfs}`)
-  check('import text names the wav', importedTool.text.includes('sung.wav'))
+  // The import-to-audio verb is gone with the formant voice: a `.mid` is read as
+  // data, never rendered, and the removed action must say what is still legal.
+  await writeFile(join(workDir, 'melody.mid'), melodyFile)
+  const parsedMelody = await tool.execute({ action: 'parse', path: join(workDir, 'melody.mid') }, {})
+  console.log(`parse melody: ${parsedMelody.notes} notes, ${num(parsedMelody.tempoBpm, 3)} BPM, "${parsedMelody.trackList[0]?.name}"`)
+  check('parse reports the melody file', parsedMelody.notes === 4, `${parsedMelody.notes}`)
+
+  let removedImport = ''
+  try {
+    await tool.execute({ action: 'import', path: join(workDir, 'cue.mid') }, {})
+  } catch (error) {
+    removedImport = error.message
+  }
+  console.log(`removed import action error: ${removedImport}`)
+  check('the removed import action is a readable error', removedImport.includes('must be "export" or "parse"'), removedImport)
 
   const fromScoreTool = await tool.execute({ action: 'export', score: melodyScore, out: join(workDir, 'melody.mid') }, {})
   console.log(`export from score object: ${fromScoreTool.notes} notes, ${fromScoreTool.tracks} track(s), ${num(fromScoreTool.durationSeconds, 3)}s`)
@@ -415,13 +394,9 @@ try {
   check('same score reuses the default file', defaultFirst.path === defaultSecond.path, `${defaultFirst.path} vs ${defaultSecond.path}`)
   check('default export bytes are stable', (await readFile(defaultFirst.path)).equals(await readFile(defaultSecond.path)))
 
-  const retimed = await tool.execute({ action: 'import', path: join(workDir, 'cue.mid'), bpm: 90, maxNotes: 64 }, {})
-  console.log(`retimed import: bpm ${retimed.singable?.bpm}, ${retimed.singable?.notes} note(s), ${num(retimed.singable?.totalSeconds, 3)}s`)
-  check('import can retime the sung line', retimed.singable !== undefined && Math.abs(retimed.singable.bpm - 90) < 1e-9, String(retimed.singable?.bpm))
-
   let toolError = ''
   try {
-    await tool.execute({ action: 'import', path: join(workDir, 'missing.mid') }, {})
+    await tool.execute({ action: 'parse', path: join(workDir, 'missing.mid') }, {})
   } catch (error) {
     toolError = error.message
   }
@@ -455,7 +430,7 @@ try {
 console.log('\n-- summary --')
 console.log(`known-byte layout: writer == hand-built (${HAND_BYTES.length} bytes)`)
 console.log(`compose roundtrip: ${score.tracks.length} tracks / ${scoreTicks.length} notes, worst timing delta ${worstStart}/${worstDuration} tick, tempo error ${num(tempoError, 5)} BPM`)
-console.log(`sung import: ${measuredNotes}/${plan.notes.length} notes within ±40 cents (worst ${num(worstCents, 1)} cents), rms ${num(sungMetrics.rmsDbfs)} dBFS`)
+console.log(`imported: ${melodyParsed.noteCount} notes, ${num(melodyParsed.tempoBpm, 3)} BPM, track "${melodyParsed.tracks[0]?.name}"`)
 console.log(`performance: 1000 notes exported in ${num(perfMilliseconds, 2)} ms (budget 50 ms)`)
 console.log(failures === 0 ? 'OK: ALL CHECKS PASSED' : `${failures} CHECK(S) FAILED`)
 if (failures > 0) process.exitCode = 1

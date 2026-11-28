@@ -82,6 +82,8 @@ export const zh = {
   /* ---- audio check (semantic layer) section ---- */
   'check.sectionTitle': '音频检查 · 语义层（可选）',
   'check.sectionDesc': 'MiniMax 没有音频理解接口，这里使用 OpenAI 兼容的 input_audio 端点（Qwen-Omni 等）。不填则只跑技术检查。',
+  'check.enabledRow': '语义检查（实验）',
+  'check.enabledDesc': '默认关闭。关闭时测试识别和 audio_check 的 question 都不发请求；开启后才使用下面的地址、模型与密钥。',
   'check.testRow': '测试识别',
   'check.testDesc': '送一段铃声给模型，看它能不能描述出来',
   'check.testAction': '试听并识别',
@@ -125,6 +127,7 @@ export const zh = {
   'reason.provider-none': '旁白已关闭（provider = none）',
   'reason.decoder-missing': '缺少解码器（Edge 需要 ffmpeg）',
   'reason.unsupported-target': '不支持的目标（{target}）',
+  'reason.semantic-disabled': '语义检查未启用（设置→声音里打开）',
 
 
   /* ---- buttons ---- */
@@ -189,6 +192,8 @@ export const en = {
   /* ---- audio check (semantic layer) section ---- */
   'check.sectionTitle': 'Audio check · semantic layer (optional)',
   'check.sectionDesc': 'MiniMax has no audio-understanding endpoint, so this uses an OpenAI-compatible input_audio endpoint (Qwen-Omni and similar). Leave empty to run technical checks only.',
+  'check.enabledRow': 'Semantic check (experimental)',
+  'check.enabledDesc': 'Off by default. While off, Test recognition and audio_check question send no request; when on, the endpoint, model and key below are used.',
   'check.testRow': 'Test recognition',
   'check.testDesc': 'Send a chime to the model and see whether it can describe it',
   'check.testAction': 'Listen & identify',
@@ -232,6 +237,7 @@ export const en = {
   'reason.provider-none': 'narration is off (provider = none)',
   'reason.decoder-missing': 'decoder missing (Edge needs ffmpeg)',
   'reason.unsupported-target': 'unsupported target ({target})',
+  'reason.semantic-disabled': 'semantic check is off (Settings → Sound)',
 
   /* ---- buttons ---- */
   'buttons.save': 'Save',

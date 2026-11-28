@@ -13,9 +13,12 @@
  * machines and package stores.
  */
 
+import { createRequire } from 'node:module'
+
 // The extra preset table must be registered before the tool modules load: each
 // one snapshots `Object.keys(PRESETS)` when it builds its JSON schema, so a late
-// import would leave the enum at the original nine ids. Keep this import first.
+// import would leave the enum at the original nine ids. Keep this import ahead
+// of every `tools-*` import.
 import { registerExtraPresets } from './lib/presets-extra.js'
 
 import { registerCheckTool } from './lib/check.js'
@@ -35,7 +38,6 @@ import { registerMasterTools } from './lib/tools-master.js'
 import { registerLiveTools } from './lib/tools-live.js'
 import { registerReactTools } from './lib/tools-react.js'
 import { registerSettingsRoute } from './lib/settings-route.js'
-import { registerSingTools } from './lib/tools-sing.js'
 import { registerSamplerTools } from './lib/tools-sampler.js'
 import { registerSkill } from './lib/skill.js'
 import { registerSpatialTools } from './lib/tools-spatial.js'
@@ -50,8 +52,23 @@ import { registerVideoTools } from './lib/tools-video.js'
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'dsh-audiokit'
 
-/** Shown by the settings page; keep in sync with package.json. */
-const VERSION = '0.5.10'
+/*
+ * The plugin version comes from `package.json`, which is the only place a
+ * release bumps: the settings page and the editor page header receive this
+ * string through the host, and `test/version-single-source.mjs` pins it to the
+ * manifest, so a second literal must never appear in this file.
+ *
+ * `createRequire` rather than `import pkg from './package.json' with { type:
+ * 'json' }`: import attributes need Node >= 20.10 while `engines.node` allows
+ * `>=20`, and JSON modules still print an experimental warning on older 20.x.
+ * A `require` of the manifest is a plain synchronous parse every supported
+ * Node accepts, and npm always packs `package.json` (even though `files` does
+ * not list it), so an installed copy can never be missing it.
+ */
+const requireFromPlugin = createRequire(import.meta.url)
+
+/** Shown by the settings page and the editor header; equals `package.json.version`. */
+export const VERSION = requireFromPlugin('./package.json').version
 
 /** The tool registry is required; the other seams are used when present. */
 export const inject = ['tools']
@@ -77,7 +94,7 @@ export const PROMPT_SECTION = [
   '  (config-driven, off until an endpoint is set, not deterministic)',
   '- combining rendered files into one cue → `audio_mix` (per-track gain and time offsets)',
   '- music: a cue with harmony and a groove → `audio_compose` (8 genres, returns beat times for sync)',
-  '- narration or dialogue → `audio_tts`; singing → `audio_sing` (zero assets); `audio_voices` lists voice ids',
+  '- narration, dialogue or singing → `audio_tts` (singing is a TTS job or an external plugin); `audio_voices` lists voice ids',
   '- character mouth / lip-sync → `audio_lipsync` (per-frame viseme + jaw openness)',
   '- motion that should land on the music → `audio_beats`',
   '- assembling cues + the page player → `audio_bind` (generates the scheduling code, inline or external)',
@@ -127,7 +144,6 @@ export function apply (ctx, config = {}) {
   registerLiveTools(ctx)
   registerComposeTools(ctx)
   registerMidiTools(ctx)
-  registerSingTools(ctx, config)
   registerSamplerTools(ctx)
   registerStemsTools(ctx)
   registerDawTools(ctx)

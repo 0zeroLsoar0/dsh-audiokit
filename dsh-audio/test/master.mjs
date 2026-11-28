@@ -27,6 +27,8 @@ import { join } from 'node:path'
 import { finalize, mixTracks, renderPreset } from '../lib/audio.js'
 import { analyzeLoudness, truePeak } from '../lib/lufs.js'
 import {
+  fastModeFootprint,
+  MASTER_MODES,
   masterChain,
   masterPresets,
   multibandCompressor,
@@ -39,7 +41,9 @@ import { decodeWav } from '../lib/wav.js'
 import { encodeWavEx } from '../lib/wav-encode.js'
 
 let failures = 0
+let checks = 0
 function check (label, condition, detail = '') {
+  checks += 1
   if (condition) return
   failures += 1
   console.log(`  FAIL ${label} ${detail}`)
@@ -659,6 +663,153 @@ console.log('\n-- refactor regression: the report and the samples are unchanged 
   }
 }
 
+/* --------------------------------------------------------- memory vs fast mode -- */
+
+console.log('\n-- mode: memory (default) vs fast (same bytes, different memory) --')
+{
+  // `memory` keeps scalar measurements and re-renders the winning attempt once;
+  // `fast` keeps every attempt's rendered samples and hands the winner back
+  // as-is. The contract is that they are the same master at a different memory
+  // cost, so the checks here are: identical output bytes (SHA-256 over the raw
+  // samples), identical report values apart from the `mode` field itself, and a
+  // diagnostics counter proving `fast` really retains attempt buffers — RSS is
+  // far too noisy to prove that on a few seconds of audio.
+  const sha256OfChannels = (channels) => channels.map((channel) => createHash('sha256')
+    .update(Buffer.from(channel.buffer, channel.byteOffset, channel.byteLength)).digest('hex'))
+
+  /** Four seconds of four detuned tremolo tones: a cheap quad master. */
+  const quadFrames = RATE * 4
+  const quad = [0, 1, 2, 3].map((index) => {
+    const channel = new Float32Array(quadFrames)
+    for (let i = 0; i < quadFrames; i += 1) {
+      channel[i] = 0.07 * Math.sin(2 * Math.PI * (110 + 55 * index) * i / RATE) *
+        (0.55 + 0.45 * Math.sin(2 * Math.PI * 0.9 * i / RATE))
+    }
+    return channel
+  })
+
+  const cases = [
+    ['quietMono', quietMono, { targetLufs: -14, ceilingDbtp: -1 }],
+    ['quietStereo', quietStereo, { targetLufs: -14, ceilingDbtp: -1 }],
+    ['hotMono', hotMono, { targetLufs: -6, ceilingDbtp: -1 }],
+    ['quad', quad, { targetLufs: -18, ceilingDbtp: -1 }]
+  ]
+
+  for (const [name, input, options] of cases) {
+    const memoryTelemetry = {}
+    const fastTelemetry = {}
+    const memoryRun = masterChain(input, RATE, { ...options, mode: 'memory', telemetry: memoryTelemetry })
+    const fastRun = masterChain(input, RATE, { ...options, mode: 'fast', telemetry: fastTelemetry })
+    const memoryChannels = Array.isArray(memoryRun.samples) ? memoryRun.samples : [memoryRun.samples]
+    const fastChannels = Array.isArray(fastRun.samples) ? fastRun.samples : [fastRun.samples]
+    const memoryHashes = sha256OfChannels(memoryChannels)
+    const fastHashes = sha256OfChannels(fastChannels)
+    const memoryKeys = Object.keys(memoryRun.report).sort()
+    const fastKeys = Object.keys(fastRun.report).sort()
+    // Every measurement must agree value for value (arrays included). `mode`
+    // and `modeNote` are the two fields that intentionally differ: they are the
+    // only observable difference between the two modes.
+    const differing = memoryKeys.filter((key) => key !== 'mode' && key !== 'modeNote' &&
+      JSON.stringify(memoryRun.report[key]) !== JSON.stringify(fastRun.report[key]))
+    const channelCount = Array.isArray(input) ? input.length : 1
+    const frames = (Array.isArray(input) ? input[0] : input).length
+    const expectedRetainedBytes = frames * channelCount * Float32Array.BYTES_PER_ELEMENT * fastRun.report.iterations
+    console.log(`  ${name.padEnd(12)} ${fastRun.report.iterations} iteration(s), ${show(fastRun.report.lufsAfter, 3)} LUFS, ` +
+      `limiter passes ${memoryTelemetry.limiterApplies} (memory) / ${fastTelemetry.limiterApplies} (fast), ` +
+      `retained ${fastTelemetry.retainedAttemptBuffers} buffer(s) ~${(fastTelemetry.retainedBytes / 1e6).toFixed(1)} MB, ` +
+      `sha ${fastHashes[0].slice(0, 12)}: identical ${JSON.stringify(memoryHashes) === JSON.stringify(fastHashes)}, ` +
+      `report diff [${differing.join(', ')}]`)
+
+    check(`${name}: memory run reports its mode`, memoryRun.report.mode === 'memory', String(memoryRun.report.mode))
+    check(`${name}: fast run reports its mode`, fastRun.report.mode === 'fast', String(fastRun.report.mode))
+    check(`${name}: both modes describe the trade`, typeof memoryRun.report.modeNote === 'string' &&
+      memoryRun.report.modeNote !== fastRun.report.modeNote && /re-render/.test(memoryRun.report.modeNote) &&
+      /rendered samples/.test(fastRun.report.modeNote))
+    check(`${name}: both modes expose the same report fields`, JSON.stringify(memoryKeys) === JSON.stringify(fastKeys),
+      `${memoryKeys.length} vs ${fastKeys.length}`)
+    check(`${name}: reports agree on every field but mode`, differing.length === 0, differing.join(', '))
+    check(`${name}: both modes produce byte-identical samples`,
+      JSON.stringify(memoryHashes) === JSON.stringify(fastHashes),
+      `${memoryHashes.map((hash) => hash.slice(0, 12)).join(',')} vs ${fastHashes.map((hash) => hash.slice(0, 12)).join(',')}`)
+    check(`${name}: memory mode pays one limiter pass for the re-render`,
+      memoryTelemetry.limiterApplies === fastTelemetry.limiterApplies + 1 &&
+      memoryTelemetry.limiterApplies === fastRun.report.iterations + 1,
+      `${memoryTelemetry.limiterApplies} vs ${fastTelemetry.limiterApplies}`)
+    check(`${name}: memory mode retains no attempt buffers`, memoryTelemetry.retainedAttemptBuffers === 0,
+      String(memoryTelemetry.retainedAttemptBuffers))
+    check(`${name}: fast mode retains one buffer per attempt`,
+      fastTelemetry.retainedAttemptBuffers === fastRun.report.iterations && fastRun.report.iterations > 0,
+      `${fastTelemetry.retainedAttemptBuffers} for ${fastRun.report.iterations} iteration(s)`)
+    check(`${name}: fast mode rerendered nothing`, fastTelemetry.rerenderedPasses === 0, String(fastTelemetry.rerenderedPasses))
+    check(`${name}: fast mode accounts for the buffers it kept`,
+      fastTelemetry.retainedBytes === expectedRetainedBytes,
+      `${fastTelemetry.retainedBytes} vs ${expectedRetainedBytes}`)
+    check(`${name}: short cues earn no memory warning`, fastRun.report.warnings.length === 0 &&
+      Array.isArray(memoryRun.report.warnings) && memoryRun.report.warnings.length === 0,
+      JSON.stringify(fastRun.report.warnings))
+  }
+
+  // Default: the cheap mode, and it is what a caller who says nothing gets.
+  const defaultTelemetry = {}
+  const defaultRun = masterChain(quietMono, RATE, { targetLufs: -14, ceilingDbtp: -1, telemetry: defaultTelemetry })
+  console.log(`  default mode: ${defaultRun.report.mode}, ${defaultTelemetry.limiterApplies} limiter pass(es), ` +
+    `retained ${defaultTelemetry.retainedAttemptBuffers} attempt buffer(s)`)
+  check('mode defaults to memory', defaultRun.report.mode === 'memory', String(defaultRun.report.mode))
+  check('the default is the mode that retains nothing', defaultTelemetry.rerenderedPasses === 1 &&
+    defaultTelemetry.retainedAttemptBuffers === 0)
+  check('the schema enum offers exactly the two modes', JSON.stringify([...MASTER_MODES]) === '["memory","fast"]')
+
+  // Rejecting a bad mode matters more than it looks: a silent fallback would let
+  // `fast` quietly keep hundreds of megabytes, or a typo quietly cost the extra
+  // limiter pass, and either one is invisible in the output.
+  for (const invalid of ['turbo', 'Fast', 'FAST', '', ' memory', 42, true, {}]) {
+    let error = null
+    try {
+      masterChain(quietMono, RATE, { targetLufs: -14, ceilingDbtp: -1, mode: invalid })
+    } catch (caught) { error = caught }
+    check(`invalid mode ${JSON.stringify(invalid)} is rejected`, error !== null &&
+      /mode must be/.test(error.message) && /memory/.test(error.message) && /fast/.test(error.message),
+      error?.message === undefined ? 'no error thrown' : error.message.slice(0, 120))
+  }
+
+  // The memory estimate the docs quote, and the threshold that turns it into a
+  // warning. These numbers are what a 180 s stereo master costs: ~69 MB per
+  // attempt, ~345 MB at the five-attempt cap (versus ~69 MB for one output).
+  const shipped = fastModeFootprint(180 * RATE, 2, 5, RATE)
+  const shortCue = fastModeFootprint(6 * RATE, 2, 5, RATE)
+  const longMaster = fastModeFootprint(305 * 8000, 1, 5, 8000)
+  console.log(`  footprint 180 s stereo x5: ${shipped.bytes} B (~${shipped.megabytes} MB, one attempt ~${shipped.oneAttemptMegabytes} MB), ` +
+    `warning ${shipped.warnings.length}; 6 s stereo x5: ~${shortCue.megabytes} MB, warning ${shortCue.warnings.length}; ` +
+    `305 s mono x5: ~${longMaster.megabytes} MB, warning ${longMaster.warnings.length}`)
+  check('180 s stereo fast mode costs ~345 MB at five attempts',
+    shipped.bytes === 345600000 && Math.abs(shipped.oneAttemptMegabytes - 69.1) < 0.05, `${shipped.bytes} B`)
+  check('fast mode says so past its memory threshold', shipped.warnings.length === 1 &&
+    /345\.6 MB/.test(shipped.warnings[0]) && /memory/.test(shipped.warnings[0]) && /identical/.test(shipped.warnings[0]),
+    JSON.stringify(shipped.warnings))
+  check('a six-second cue earns no memory warning', shortCue.warnings.length === 0, JSON.stringify(shortCue.warnings))
+  check('a master longer than 300 s always warns', longMaster.warnings.length === 1, JSON.stringify(longMaster.warnings))
+
+  // The warning is wired into a real master, not only into the estimator: a
+  // 305 s request (8 kHz mono keeps this cheap) reports the memory risk, while
+  // the same request in memory mode does not — and the samples still match.
+  const longFrames = Math.round(305 * 8000)
+  const longTone = new Float32Array(longFrames)
+  for (let i = 0; i < longFrames; i += 1) {
+    longTone[i] = 0.03 * Math.sin(2 * Math.PI * 220 * i / 8000) * (0.7 + 0.3 * Math.sin(2 * Math.PI * 0.5 * i / 8000))
+  }
+  const longFast = masterChain(longTone, 8000, { targetLufs: -16, ceilingDbtp: -1, mode: 'fast' })
+  const longMemory = masterChain(longTone, 8000, { targetLufs: -16, ceilingDbtp: -1 })
+  console.log(`  305 s 8 kHz mono: ${longFast.report.iterations} iteration(s), fast warning: ` +
+    `"${(longFast.report.warnings[0] ?? '').slice(0, 78)}..."`)
+  check('a 305 s fast master carries the memory warning in its report',
+    longFast.report.warnings.length === 1 && /memory/.test(longFast.report.warnings[0]), JSON.stringify(longFast.report.warnings))
+  check('the same 305 s master in memory mode carries none', longMemory.report.warnings.length === 0,
+    JSON.stringify(longMemory.report.warnings))
+  check('the warned master is still byte-identical across modes',
+    sha256OfChannels([longFast.samples]).join() === sha256OfChannels([longMemory.samples]).join(),
+    sha256OfChannels([longFast.samples])[0])
+}
+
 /* ------------------------------------------------------------------ performance -- */
 
 console.log('\n-- performance: 60 s stereo mastered under 2 s --')
@@ -793,6 +944,56 @@ const cwd = await mkdtemp(join(tmpdir(), 'dsh-master-'))
   check('tool output is byte-deterministic', bytesA.equals(bytesB))
   check('tool rerun reports the same numbers', repeatA.after.lufs === repeatB.after.lufs)
 
+  // The memory/time switch reaches the chain and comes back in the result. The
+  // bytes are identical, so both modes must also resolve to the same default
+  // output path: `mode` is deliberately not part of the path hash.
+  const modeDefault = await call({ path: 'cue.wav', preset: 'streaming-safe' })
+  const defaultMasterBytes = await readFile(join(cwd, modeDefault.relativePath))
+  const modeFast = await call({ path: 'cue.wav', preset: 'streaming-safe', mode: 'fast' })
+  const fastMasterBytes = await readFile(join(cwd, modeFast.relativePath))
+  console.log(`  mode: default ${modeDefault.mode}, fast ${modeFast.mode}, same path ${modeDefault.relativePath === modeFast.relativePath}, ` +
+    `identical bytes ${defaultMasterBytes.equals(fastMasterBytes)}, warnings ${modeDefault.warnings.length}/${modeFast.warnings.length}`)
+  check('tool schema offers exactly the two modes',
+    JSON.stringify(definition.parameters.properties.mode.enum) === JSON.stringify([...MASTER_MODES]),
+    JSON.stringify(definition.parameters.properties.mode.enum))
+  check('tool defaults to memory mode', modeDefault.mode === 'memory', String(modeDefault.mode))
+  check('tool reports fast mode when asked', modeFast.mode === 'fast', String(modeFast.mode))
+  check('tool modes resolve to the same default output path',
+    modeDefault.relativePath === modeFast.relativePath, `${modeDefault.relativePath} vs ${modeFast.relativePath}`)
+  check('tool modes write byte-identical files', defaultMasterBytes.equals(fastMasterBytes),
+    `${defaultMasterBytes.length} vs ${fastMasterBytes.length} bytes`)
+  check('tool modes report the same numbers', modeFast.after.lufs === modeDefault.after.lufs &&
+    modeFast.iterations === modeDefault.iterations && modeFast.trimDb === modeDefault.trimDb,
+    `${modeFast.after.lufs}/${modeFast.iterations}/${modeFast.trimDb} vs ${modeDefault.after.lufs}/${modeDefault.iterations}/${modeDefault.trimDb}`)
+  check('tool reports no warnings for a short master', Array.isArray(modeDefault.warnings) &&
+    modeDefault.warnings.length === 0 && Array.isArray(modeFast.warnings) && modeFast.warnings.length === 0,
+    JSON.stringify([modeDefault.warnings, modeFast.warnings]))
+  check('tool text marks the fast mode', /fast mode/.test(modeFast.text) && !/fast mode/.test(modeDefault.text),
+    modeFast.text.slice(0, 90))
+  check('tool reports the mode note that explains it', /re-render/.test(modeDefault.chain.modeNote) &&
+    /rendered samples/.test(modeFast.chain.modeNote))
+
+  // A long fast master must say what it costs in the tool result too: the model
+  // reads `text`, so a warning that only lived in a nested report would be
+  // invisible. 305 s at 8 kHz keeps the check cheap while crossing the limit.
+  const longSeconds = 305
+  const longRate = 8000
+  const longChannel = new Float32Array(longSeconds * longRate)
+  for (let i = 0; i < longChannel.length; i += 1) longChannel[i] = 0.03 * Math.sin(2 * Math.PI * 220 * i / longRate)
+  await writeFile(join(cwd, 'long.wav'), encodeWavEx([longChannel], longRate, { bitDepth: 16 }))
+  const longFast = await call({ path: 'long.wav', mode: 'fast', targetLufs: -16, out: 'long-fast.wav' })
+  const longMemory = await call({ path: 'long.wav', mode: 'memory', targetLufs: -16, out: 'long-memory.wav' })
+  const longFastBytes = await readFile(join(cwd, 'long-fast.wav'))
+  const longMemoryBytes = await readFile(join(cwd, 'long-memory.wav'))
+  console.log(`  long file (${longSeconds} s, ${longRate} Hz mono): fast warning "${(longFast.warnings[0] ?? '').slice(0, 64)}...", ` +
+    `memory warnings ${longMemory.warnings.length}, identical bytes ${longFastBytes.equals(longMemoryBytes)}`)
+  check('tool surfaces the fast memory warning', longFast.warnings.length === 1 && /memory/.test(longFast.warnings[0]),
+    JSON.stringify(longFast.warnings))
+  check('tool text repeats the warning for the model', /can hold up to/.test(longFast.text), longFast.text.slice(-120))
+  check('memory mode carries no memory warning', longMemory.warnings.length === 0 && !/can hold up to/.test(longMemory.text))
+  check('a 305 s master is still byte-identical across modes', longFastBytes.equals(longMemoryBytes),
+    `${longFastBytes.length} vs ${longMemoryBytes.length} bytes`)
+
   // Guard rails.
   let error = null
   try { await call({}) } catch (caught) { error = caught }
@@ -813,9 +1014,15 @@ const cwd = await mkdtemp(join(tmpdir(), 'dsh-master-'))
   error = null
   try { await call({ path: 'cue.wav', bitDepth: 12 }) } catch (caught) { error = caught }
   check('bad bit depth is rejected', error !== null && /bitDepth/.test(error.message), error?.message)
+  for (const invalid of ['turbo', 'Fast', '', 3, true]) {
+    error = null
+    try { await call({ path: 'cue.wav', mode: invalid }) } catch (caught) { error = caught }
+    check(`bad mode ${JSON.stringify(invalid)} is rejected with a readable error`, error !== null &&
+      /mode must be/.test(error.message) && /memory/.test(error.message) && /fast/.test(error.message), error?.message)
+  }
 }
 
 await rm(cwd, { recursive: true, force: true })
 
-console.log(failures === 0 ? '\nOK: mastering chain holds its promises' : `\nFAILED: ${failures} check(s)`)
+console.log(failures === 0 ? `\nOK: mastering chain holds its promises (${checks} checks)` : `\nFAILED: ${failures} of ${checks} check(s)`)
 process.exit(failures === 0 ? 0 : 1)

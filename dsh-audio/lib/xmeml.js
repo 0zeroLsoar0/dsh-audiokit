@@ -18,11 +18,12 @@
  *   and non-ASCII file names arrive percent-encoded instead of raw;
  * - the clip name, and a `<comment>` when the cue name differs from the file;
  * - audio gain through the standard `Audio Levels` filter, whose `level`
- *   parameter is a linear multiplier (1.0 = unity). UNIT TO BE VERIFIED: the
- *   linear multiplier is the documented meaning of the `audiolevels` effect id,
- *   but this writer has not been checked against an xmeml exported by a real
- *   FCP7 (or by Premiere), so do not "fix" the conversion on a guess; compare
- *   the `<value>` against a reference document first;
+ *   parameter is a **linear gain, not decibels** (1.0 = unity). This is stated
+ *   by Apple's Final Cut Pro 7 XML Interchange Format documentation ("The
+ *   parameter `Level` expresses linear gain rather than decibels"):
+ *   `dB = 20 * log10(level)`, `level = 10 ** (dB / 20)`. So -6 dB is written as
+ *   0.501187, and the unit is not a guess; the only unverified part is how a
+ *   specific NLE maps the filter, not what the number means;
  * - per-clip source in/out, so a trimmed item stays trimmed.
  *
  * What is not: fades. FCP7 XML expresses a fade as an `<transitionitem>` with a
@@ -429,7 +430,8 @@ export function exportXmeml (request = {}) {
       lines.push('            </sourcetrack>')
       if (entry.gainDb !== 0) {
         // The standard FCP7 audio level filter; Premiere and Resolve both map it
-        // to the clip's volume, and the value is a linear amplitude multiplier.
+        // to the clip's volume. Apple documents `Level` as linear gain, not dB
+        // (dB = 20*log10(level)), so -6 dB is 0.501187.
         lines.push('            <filter>')
         lines.push('              <effect>')
         lines.push('                <name>Audio Levels</name>')

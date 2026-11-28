@@ -29,7 +29,9 @@
  * the count used.
  *
  * Everything is pure and deterministic: the same samples, rate and options
- * produce identical output. No randomness, no state that survives a call.
+ * produce identical output. No randomness, no state that survives a call — the
+ * optional `telemetry` object a caller may pass to `masterChain` is written to
+ * for diagnostics only and never read back into a result.
  */
 
 import { clamp, dbToGain } from './dsp.js'
@@ -71,6 +73,42 @@ const SECANT_OVER_RELAXATION = 1.1
 const GAIN_LIMITS_DB = Object.freeze([-40, 40])
 
 /**
+ * The two ways `masterChain` can spend memory to save time.
+ *
+ * `memory` (the default) keeps a handful of scalars per attempt and re-renders
+ * the winning gain once; `fast` keeps every attempt's rendered channel list so
+ * the winner is handed back as-is. Both produce the same samples — the second
+ * limiter pass `memory` pays for is redundant work, not a different result — so
+ * the choice is purely a memory/time trade and is never allowed to move a
+ * number.
+ *
+ * `memory` is the default because the fast path's cost grows with the request:
+ * a 180 s / 48 kHz stereo master is ~69 MB per attempt, so keeping up to five
+ * of them is ~345 MB of output buffers for one used result.
+ */
+export const MASTER_MODES = Object.freeze(['memory', 'fast'])
+const DEFAULT_MASTER_MODE = 'memory'
+
+/** One sentence per mode, so `report.mode` describes its own cost. */
+const MODE_NOTES = Object.freeze({
+  memory: 'attempts keep scalar measurements only; the selected gain is re-rendered once after the search (default, lowest memory)',
+  fast: 'attempts keep their rendered samples, so the selected one is returned without a second limiter pass (saves one limiter pass, memory grows with every iteration)'
+})
+
+/**
+ * `fast` mode earns a warning past these sizes.
+ *
+ * The trade is not a bug — the caller asked for it and the output is identical —
+ * but silently holding hundreds of megabytes is the kind of thing that turns a
+ * big request into an out-of-memory crash in the host. 256 MB is about a 180 s /
+ * 48 kHz stereo master at four attempts, and 300 s is longer than any timeline
+ * the plugin's own tools produce (they cap at 180 s), so a caller that reaches
+ * the second limit brought a longer file than the presets were written for.
+ */
+const FAST_MODE_WARN_BYTES = 256e6
+const FAST_MODE_WARN_SECONDS = 300
+
+/**
  * The compressor updates its detector and gain law once per block of N samples
  * and interpolates the gain inside the block. At 48 kHz that is a 0.17 ms
  * attack resolution — far finer than any mastering attack time — and it removes
@@ -110,6 +148,43 @@ function validateRate (sampleRate) {
     throw new Error(`mastering needs a sample rate between 8000 and 192000 Hz, got ${sampleRate}`)
   }
   return rate
+}
+
+/**
+ * Read the memory/time mode, rejecting anything that is not one of the two
+ * documented names.
+ *
+ * A silent fallback would be the worst outcome here: `mode: 'Fast'` would then
+ * quietly hold hundreds of megabytes while the caller believes they got the
+ * default, and a typo in `memory` would look like a working request. The error
+ * names both modes and what each one costs, so the fix is in the message.
+ */
+function resolveMasterMode (value) {
+  if (value === undefined || value === null) return DEFAULT_MASTER_MODE
+  const text = String(value)
+  if (MASTER_MODES.includes(text)) return text
+  throw new Error(`mode must be "memory" (re-render the selected attempt once, lowest memory) or "fast" (keep every attempt's samples, one limiter pass less), got ${JSON.stringify(text)}`)
+}
+
+/**
+ * Read the optional diagnostics accumulator.
+ *
+ * It is write-only: the chain fills it with how many limiter passes ran and how
+ * many attempt buffers a mode retained, and nothing in the result depends on it.
+ * It exists so a test can prove the memory claim with counters instead of RSS,
+ * which is noisy, platform-specific and slow to settle.
+ */
+function readTelemetry (value) {
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'object') {
+    throw new Error('masterChain telemetry must be an object (diagnostics only; the result never depends on it)')
+  }
+  return value
+}
+
+function noteTelemetry (telemetry, key) {
+  if (telemetry === null) return
+  telemetry[key] = (telemetry[key] ?? 0) + 1
 }
 
 /**
@@ -1081,9 +1156,57 @@ export function truePeakLimiter (samples, sampleRate, options = {}) {
 
 /* ------------------------------------------------------------- master chain -- */
 
+/**
+ * What `mode: 'fast'` can keep alive, and the warning that size earns.
+ *
+ * One attempt is `channelCount * frames` Float32 samples — the output of
+ * `applyGainCurve` for the whole file — so the retained set is one copy of the
+ * deliverable per iteration, up to the iteration cap: a 180 s / 48 kHz stereo
+ * master is ~69 MB per attempt and ~345 MB at five attempts, against ~69 MB for
+ * `memory` mode's single re-rendered output. `attempts` here is that worst-case
+ * cap (not how many iterations a particular file happened to run), because the
+ * memory has to be held while the search is still going. The rest of the chain's
+ * working set (the pre-mastered buffer and the peak envelope) is the same in
+ * both modes and is not counted here.
+ *
+ * Exported because the number is the only thing the two modes disagree about:
+ * a test asserts this estimate (and the warning threshold) directly, which is
+ * cheaper and more precise than watching RSS.
+ *
+ * @param {number} frames - samples per channel.
+ * @param {number} channelCount - retained channels.
+ * @param {number} attempts - attempt buffers that can be alive at once (the cap).
+ * @param {number} sampleRate - Hz, only used for the readable duration.
+ * @returns {{ frames: number, channelCount: number, attempts: number, bytes: number,
+ *   megabytes: number, oneAttemptBytes: number, oneAttemptMegabytes: number,
+ *   warnings: string[] }}
+ */
+export function fastModeFootprint (frames, channelCount, attempts, sampleRate) {
+  const oneAttemptBytes = frames * channelCount * Float32Array.BYTES_PER_ELEMENT
+  const bytes = oneAttemptBytes * attempts
+  const megabytes = Math.round((bytes / 1e6) * 10) / 10
+  const oneAttemptMegabytes = Math.round((oneAttemptBytes / 1e6) * 10) / 10
+  const seconds = sampleRate > 0 ? Math.round((frames / sampleRate) * 10) / 10 : 0
+  const warnings = []
+  if (bytes >= FAST_MODE_WARN_BYTES || seconds >= FAST_MODE_WARN_SECONDS) {
+    warnings.push(`fast mode can hold up to ${attempts} attempt buffer(s) of this ${seconds}s ${channelCount}-channel master (~${megabytes} MB, one attempt ~${oneAttemptMegabytes} MB) while mode:'memory' holds the output once (~${oneAttemptMegabytes} MB) and re-renders it. The output bytes and every reported number are identical either way — this is a memory cost only.`)
+  }
+  return {
+    frames,
+    channelCount,
+    attempts,
+    bytes,
+    megabytes,
+    oneAttemptBytes,
+    oneAttemptMegabytes,
+    warnings
+  }
+}
+
 function resolveChainOptions (options, rate) {
   if (options === null || typeof options !== 'object') throw new Error('masterChain options must be an object')
   return {
+    mode: resolveMasterMode(options.mode),
     targetLufs: numberOr(options.targetLufs, -14, 'targetLufs', -45, 0),
     ceilingDbtp: numberOr(options.ceilingDbtp, -1, 'ceilingDbtp', -20, 0),
     bands: resolveBands(options.bands, rate),
@@ -1217,15 +1340,23 @@ function predictGainForTarget (envelope, rate, settings, lufsBefore, residual) {
  * gain reduction), not the rendered buffer. The winning gain is re-rendered
  * once after the search, so a master holds one output buffer instead of
  * `maxIterations` copies of it — the difference between ~69 MB and ~345 MB of
- * attempt storage for the documented 180 s / 48 kHz stereo maximum.
+ * attempt storage for the documented 180 s / 48 kHz stereo maximum. That is
+ * the `mode: 'memory'` path. `mode: 'fast'` is the opposite trade: every
+ * attempt's channel list is kept, so the winner is returned without the extra
+ * limiter pass (~10 % of a search), at one output buffer per iteration. The two
+ * modes run the same arithmetic in the same order and are byte-identical; only
+ * the memory and the number of limiter passes differ, and the report says which
+ * one ran (`mode` + `modeNote`).
  *
  * @param {Float32Array|Float32Array[]} samples - mono buffer or one per channel.
  * @param {number} sampleRate - Hz.
  * @param {object} [options] - `{ targetLufs, ceilingDbtp, bands, width,
  *   bassMonoHz, driveDb }` plus `kneeDb`, `lookaheadMs`, `releaseMs`,
- *   `maxGainReductionDb` (default 12) and `maxIterations` (default 5).
+ *   `maxGainReductionDb` (default 12), `maxIterations` (default 5) and `mode`
+ *   (`'memory'` default, or `'fast'`).
  * @returns {{ samples: Float32Array|Float32Array[],
- *   report: { lufsBefore: number, lufsAfter: number, truePeakBefore: number,
+ *   report: { mode: string, modeNote: string, warnings: string[],
+ *   lufsBefore: number, lufsAfter: number, truePeakBefore: number,
  *   truePeakAfter: number, truePeakChannel: number, truePeakByChannelDbtp: number[],
  *   channelCount: number, channelLayout: string, channelPeaksDbfs: number[],
  *   gainReductionDb: number, bands: object[], iterations: number,
@@ -1236,6 +1367,15 @@ export function masterChain (samples, sampleRate, options = {}) {
   const mono = !Array.isArray(samples)
   const list = asChannelList(samples)
   const settings = resolveChainOptions(options, rate)
+  // Diagnostics only; `readTelemetry` returns null unless a caller injected one.
+  const telemetry = readTelemetry(options.telemetry)
+  if (telemetry !== null) {
+    telemetry.mode = settings.mode
+    telemetry.limiterApplies = 0
+    telemetry.retainedAttemptBuffers = 0
+    telemetry.rerenderedPasses = 0
+    telemetry.retainedBytes = 0
+  }
   const source = list.map(copyChannel)
   const before = analyseChannels(source, rate)
   const lufsBefore = before.integratedLufs
@@ -1264,6 +1404,12 @@ export function masterChain (samples, sampleRate, options = {}) {
     (maximum, band) => (band.gainReductionDb > maximum ? band.gainReductionDb : maximum), 0)
 
   const baseReport = {
+    // Which memory/time trade ran, and what it means: the two modes differ in
+    // nothing else, so a caller that sees "fast" in a report knows the bytes are
+    // the same as "memory" and the cost was RAM, not a different result.
+    mode: settings.mode,
+    modeNote: MODE_NOTES[settings.mode],
+    warnings: [],
     targetLufs: round2(settings.targetLufs),
     ceilingDbtp: round2(settings.ceilingDbtp),
     lufsBefore: round3(lufsBefore),
@@ -1325,6 +1471,7 @@ export function masterChain (samples, sampleRate, options = {}) {
     const settled = settleGainUnderCap(envelope, rate, settings, plannedGainDb)
     gainDb = settled.gainDb
     const limited = applyGainCurve(preMastered, settled.curve, dbToGain(gainDb))
+    noteTelemetry(telemetry, 'limiterApplies')
     const analysis = analyseChannels(limited, rate)
     // `analyzeLoudness` already measured the true peak of every channel it used,
     // and for mono/stereo that is every channel — measuring it a second time in
@@ -1345,11 +1492,7 @@ export function masterChain (samples, sampleRate, options = {}) {
     const truePeakAfter = Number.isFinite(peakDbtp) ? peakDbtp + trimDb : Number.NEGATIVE_INFINITY
     const error = settings.targetLufs - lufsAfter
     const meanReductionDb = meanGainReductionDb(settled.curve)
-    // Only measurements and scalars are kept per iteration. A 180 s stereo
-    // deliverable is ~69 MB per channel list, so holding one per attempt was
-    // five copies of the whole output (hundreds of MB) to ultimately use one;
-    // the winning iteration is re-rendered from `plannedGainDb` after selection.
-    attempts.push({
+    const attempt = {
       plannedGainDb,
       gainDb,
       lufs: lufsAfter,
@@ -1362,7 +1505,22 @@ export function masterChain (samples, sampleRate, options = {}) {
       trimDb,
       gainReductionDb: settled.gainReductionDb,
       atCap: settled.atCap
-    })
+    }
+    // `memory` (default): only measurements and scalars are kept per iteration.
+    // A 180 s stereo deliverable is ~69 MB per channel list, so holding one per
+    // attempt would be five copies of the whole output (hundreds of MB) to
+    // ultimately use one; the winning iteration is re-rendered from
+    // `plannedGainDb` after selection.
+    //
+    // `fast`: the pre-refactor behaviour — keep the rendered attempt so the
+    // selected one needs no second limiter pass. The buffer already carries this
+    // iteration's trim, because the trim was applied to this very buffer above,
+    // which is what makes the two paths bit-identical.
+    if (settings.mode === 'fast') {
+      attempt.samples = limited
+      noteTelemetry(telemetry, 'retainedAttemptBuffers')
+    }
+    attempts.push(attempt)
 
     if (Math.abs(error) <= TARGET_TOLERANCE_LU) {
       achieved = true
@@ -1404,20 +1562,39 @@ export function masterChain (samples, sampleRate, options = {}) {
   const chosen = selectAttempt(attempts, settings.targetLufs)
   const hitTarget = Math.abs(chosen.lufs - settings.targetLufs) <= TARGET_TOLERANCE_LU
 
-  // Re-render the winning iteration. `settleGainUnderCap` is deterministic in
-  // (envelope, rate, settings, planned gain) and every attempt stored the exact
-  // planned gain it was called with, so this computes the same curve and the
-  // same trim the pass that produced `chosen`'s measurements computed: the
-  // samples are bit-identical to keeping each iteration's output, at one
-  // output's worth of memory instead of `iterations` copies.
-  const settledChosen = settleGainUnderCap(envelope, rate, settings, chosen.plannedGainDb)
-  const output = applyGainCurve(preMastered, settledChosen.curve, dbToGain(settledChosen.gainDb))
-  if (chosen.trimDb !== 0) scaleChannels(output, dbToGain(chosen.trimDb))
+  let output
+  if (settings.mode === 'fast') {
+    // The retained attempt is the answer: same samples, one limiter pass less.
+    output = chosen.samples
+  } else {
+    // Re-render the winning iteration. `settleGainUnderCap` is deterministic in
+    // (envelope, rate, settings, planned gain) and every attempt stored the exact
+    // planned gain it was called with, so this computes the same curve and the
+    // same trim the pass that produced `chosen`'s measurements computed: the
+    // samples are bit-identical to keeping each iteration's output, at one
+    // output's worth of memory instead of `iterations` copies.
+    const settledChosen = settleGainUnderCap(envelope, rate, settings, chosen.plannedGainDb)
+    output = applyGainCurve(preMastered, settledChosen.curve, dbToGain(settledChosen.gainDb))
+    noteTelemetry(telemetry, 'limiterApplies')
+    noteTelemetry(telemetry, 'rerenderedPasses')
+    if (chosen.trimDb !== 0) scaleChannels(output, dbToGain(chosen.trimDb))
+  }
+
+  // Cost of the mode that ran. `memory` holds one output, so it needs no
+  // estimate; `fast` can hold one per attempt until the cap, and past a point
+  // that is worth saying out loud instead of silently taking the RAM.
+  const footprint = settings.mode === 'fast'
+    ? fastModeFootprint(source[0].length, source.length, settings.maxIterations, rate)
+    : null
+  if (telemetry !== null && footprint !== null) {
+    telemetry.retainedBytes = footprint.oneAttemptBytes * attempts.length
+  }
 
   return {
     samples: restoreShape(output, mono),
     report: {
       ...baseReport,
+      warnings: footprint === null ? [] : footprint.warnings,
       lufsAfter: round3(chosen.lufs),
       truePeakAfter: round3(chosen.truePeak),
       // The ceiling promise is about every channel: name the one that is closest

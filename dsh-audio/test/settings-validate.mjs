@@ -151,7 +151,9 @@ const config = {
     model: 'qwen2.5-omni-7b',
     apiKey: 'check-secret',
     apiKeyEnv: 'DASHSCOPE_API_KEY',
-    autoValidate: false
+    autoValidate: false,
+    // The semantic layer is opt-in; every check-target case below wants it on.
+    enabled: true
   }
 }
 
@@ -389,6 +391,47 @@ console.log('-- 10. autoValidate boolean survives the config round trip --')
   check('GET returns the boolean, not a string', value === true && typeof value === 'boolean', `${JSON.stringify(value)} (${typeof value})`)
   check('the JSON does not quote it', /"autoValidate":true/.test(get.raw), get.raw.slice(0, 200))
   check('the stored key is still not echoed', get.json?.config?.check?.keySet === true && !get.raw.includes('check-secret'))
+}
+
+console.log('-- 10b. semantic check off: /config hides the row and nothing is sent --')
+{
+  const saved = { ...config.check }
+  config.check = { ...saved, enabled: false }
+
+  const get = await callRoute('/dsh-audio/config', { method: 'GET' })
+  const view = get.json?.config?.check ?? {}
+  console.log(`  GET /dsh-audio/config -> check=${JSON.stringify(view)}`)
+  check('the disabled row reports enabled=false', view.enabled === false)
+  check('the disabled row hides the endpoint', view.baseUrl === undefined, JSON.stringify(view.baseUrl))
+  check('the disabled row hides the model', view.model === undefined, JSON.stringify(view.model))
+  check('the disabled row hides the key facts', view.keySet === undefined && view.envName === undefined, JSON.stringify(view))
+  check('the disabled row does not echo the saved key', !get.raw.includes('check-secret'))
+
+  requests.length = 0
+  const test = await callRoute('/dsh-audio/test', { body: JSON.stringify({ target: 'check' }) })
+  const testBody = test.json ?? {}
+  console.log(`  POST /dsh-audio/test -> HTTP ${test.status} ${test.raw}`)
+  check('a disabled /test is data, not a server error', test.status === 200 && testBody.ok === false)
+  checkCode('a disabled /test is classified semantic-disabled', testBody.reasonCode, 'semantic-disabled', 'POST /test target=check with check.enabled=false')
+  check('a disabled /test says why in readable text', /语义检查未启用/.test(testBody.error ?? ''), testBody.error)
+  check('the disabled /test names the target it skipped', testBody.target === 'check' && testBody.disabled === true, JSON.stringify(testBody.target))
+  check('the disabled /test sent nothing', requests.length === 0,
+    requests.map((entry) => `${entry.method} ${entry.url}`).join(' ; '))
+
+  requests.length = 0
+  const valid = await validate({ target: 'check' })
+  const validBody = valid.json ?? {}
+  console.log(`  POST /dsh-audio/validate -> HTTP ${valid.status} ${valid.raw}`)
+  check('a disabled /validate answers 200 with a skip report', valid.status === 200 && validBody.ok === true && validBody.disabled === true)
+  checkCode('a disabled /validate is classified semantic-disabled', validBody.reasonCode, 'semantic-disabled', 'POST /validate target=check with check.enabled=false')
+  check('a disabled /validate probes nothing',
+    validBody.endpoint?.reachable === null && validBody.endpoint?.reasonCode === 'semantic-disabled', JSON.stringify(validBody.endpoint))
+  check('a disabled /validate accepts no audio', validBody.audioAccepted === false)
+  check('the disabled /validate reason is readable', /语义检查未启用/.test(validBody.error ?? ''), validBody.error)
+  check('the disabled /validate sent nothing', requests.length === 0,
+    requests.map((entry) => `${entry.method} ${entry.url}`).join(' ; '))
+
+  config.check = saved
 }
 
 console.log('-- 11. probeEndpoint on its own --')

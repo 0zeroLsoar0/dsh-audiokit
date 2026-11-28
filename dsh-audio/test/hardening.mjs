@@ -35,7 +35,6 @@ import { registerConvertTools } from '../lib/tools-convert.js'
 import { registerDesignTools } from '../lib/tools-design.js'
 import { registerGenerateTools } from '../lib/tools-generate.js'
 import { registerLoudnessTools } from '../lib/tools-loudness.js'
-import { registerSingTools } from '../lib/tools-sing.js'
 import { registerStretchTools } from '../lib/tools-stretch.js'
 import { registerTools } from '../lib/tools.js'
 import { registerTtsTool, registerVoicesTool } from '../lib/tts.js'
@@ -310,7 +309,6 @@ registerDesignTools(primary.ctx)
 registerVisualTools(primary.ctx)
 registerBindTools(primary.ctx)
 registerComposeTools(primary.ctx)
-registerSingTools(primary.ctx)
 registerStretchTools(primary.ctx)
 // A second registry with no provider configured: proves the "no key" errors
 // name a configuration field instead of failing on the wire.
@@ -338,10 +336,13 @@ await mkdir(join(cwd, 'fixtures'), { recursive: true })
 
 section('1. registration and tool shape')
 {
+  // Only the modules this harness wires below; `test/tool-schemas.mjs` asserts
+  // the full 30-tool surface. Keep this list in sync with the register calls
+  // directly underneath it rather than with index.js.
   const EXPECTED = [
     'audio_synth', 'audio_pattern', 'audio_mix', 'audio_probe', 'audio_tts', 'audio_voices',
     'audio_check', 'audio_convert', 'audio_loudness', 'audio_design', 'audio_lipsync',
-    'audio_beats', 'audio_bind', 'audio_regress', 'audio_compose', 'audio_sing', 'audio_stretch',
+    'audio_beats', 'audio_bind', 'audio_regress', 'audio_compose', 'audio_stretch',
     'audio_generate'
   ]
   const names = [...primary.tools.keys()].sort()
@@ -506,10 +507,6 @@ section('2. bad arguments')
   await expectError('audio_compose unknown mode', 'audio_compose', { genre: 'lofi', mode: 'mixolydiann' })
   await expectError('audio_compose sections wrong type', 'audio_compose', { genre: 'lofi', sections: 'nope' })
 
-  // -- audio_sing --
-  await expectError('audio_sing 257 notes', 'audio_sing', { notes: Array.from({ length: 257 }, () => ({ midi: 60, dur: 1 })) }, { match: /256/, maxMs: 1000 })
-  await expectError('audio_sing over 120 s', 'audio_sing', { notes: [{ midi: 60, dur: 32, beat: 3000 }], bpm: 20 }, { match: /120/, maxMs: 1000 })
-
   // -- audio_stretch --
   await expectError('audio_stretch no source', 'audio_stretch', {})
   await expectError('audio_stretch no mode', 'audio_stretch', { render: { preset: 'impact' } })
@@ -607,8 +604,6 @@ section('2c. tolerated coercions and documented clamps')
   record('audio_tts text number is coerced', await invoke('audio_tts', { text: 42, out: 'clamp/tts-num.wav' }), (v) => (v.chunks >= 1 ? null : `chunks ${v.chunks}`))
   record('audio_lipsync fps 1e308 clamps to 120', await invoke('audio_lipsync', { path: 'fixtures/ok.wav', fps: 1e308 }), (v) => (v.fps === 120 ? null : `fps ${v.fps}`))
   record('audio_beats beatsPerBar garbage falls back to 4', await invoke('audio_beats', { path: 'fixtures/ok.wav', beatsPerBar: 'abc' }), (v) => (v.beatsPerBar === 4 ? null : `beatsPerBar ${v.beatsPerBar}`))
-  record('audio_sing empty request still sings (documented)', await invoke('audio_sing', { out: 'clamp/sing-empty.wav' }), (v) => (v.notes >= 1 ? null : `notes ${v.notes}`))
-  record('audio_sing invalid melody still sings (documented)', await invoke('audio_sing', { melody: 'H9:x', out: 'clamp/sing-bad-melody.wav' }), (v) => (v.notes >= 1 ? null : `notes ${v.notes}`))
   record('audio_design unknown intensity is ignored', await invoke('audio_design', { recipe: 'ui-success', intensity: 'loud', out: 'clamp/design-intensity.wav' }), (v) => (v.intensity === 1 ? null : `intensity ${v.intensity}`))
   record('audio_synth extra unknown property is ignored', await invoke('audio_synth', { preset: 'tick', bogus: true, out: 'clamp/extra-synth.wav' }), (v) => (v.durationSeconds > 0 ? null : `duration ${v.durationSeconds}`))
   record('audio_convert extra unknown property is ignored', await invoke('audio_convert', { inputs: ['fixtures/ok.wav'], op: 'convert', bogus: 1, out: 'clamp/extra-convert.wav' }), (v) => (v.durationSeconds > 0 ? null : `duration ${v.durationSeconds}`))
@@ -653,8 +648,6 @@ section('2c. tolerated coercions and documented clamps')
   if (tts.ok && tts.value.effective?.subtitle === 'wordz') fallbacks.push("audio_tts {subtitleType:'wordz'} forwarded and echoed as 'wordz'")
   const lipsync = await invoke('audio_lipsync', { path: 'fixtures/ok.wav', format: 'nope' })
   if (lipsync.ok && lipsync.value.format === 'json') fallbacks.push("audio_lipsync {format:'nope'} → json")
-  const sing = await invoke('audio_sing', { melody: 'C4:1', voice: 'nope', out: 'warn/sing-voice.wav' })
-  if (sing.ok && sing.value.voice === 'nope') fallbacks.push("audio_sing {voice:'nope'} renders alto but reports voice:'nope'")
   if (fallbacks.length > 0) warn('unknown enum ids are accepted silently (schema normally blocks them)', fallbacks.join(' · '))
   else ok('unknown enum ids are rejected or reported honestly')
 }
@@ -716,15 +709,6 @@ section('2d. hard guards name their parameter')
   }
   if (unnamed.length > 0) bug('decode/read errors do not name the file', unnamed.join(' · '))
   else ok('decode/read errors name the file', 'zero.wav, text.wav, adir')
-
-  // An unknown voice is a schema escape hatch, not a crash: report what sang.
-  {
-    const outcome = await invoke('audio_sing', { melody: 'C4:1', voice: 'nope', out: 'warn/sing-voice.wav' })
-    if (!outcome.ok) bug('audio_sing unknown voice threw', String(outcome.error?.message))
-    else if (outcome.value.voice !== 'alto') bug('audio_sing unknown voice reports an id that did not sing', `voice=${outcome.value.voice}`)
-    else if (!(outcome.value.warnings ?? []).some((line) => /unknown voice/.test(line))) bug('audio_sing unknown voice does not say it fell back', JSON.stringify(outcome.value.warnings))
-    else ok('audio_sing reports the voice that actually sang', `voice ${outcome.value.voice} · ${(outcome.value.warnings ?? []).find((line) => /unknown voice/.test(line))}`)
-  }
 }
 
 /* ------------------------------------------ 3. filesystem edge cases -- */
@@ -856,9 +840,6 @@ section('4. number hygiene and determinism')
   await checkRender(`stretch +${STRETCH_LIMITS.maxSemitones} semitones (limit)`, 'audio_stretch', { render: { preset: 'impact' }, semitones: STRETCH_LIMITS.maxSemitones, out: 'hygiene/stretch-limit-up.wav' })
   await checkRender('stretch fit to exactly 0.5 s', 'audio_stretch', { path: okPath, targetSeconds: 0.5, out: 'hygiene/stretch-fit.wav' })
 
-  await checkRender('sing MIDI 0 and 127 at 20 bpm', 'audio_sing', { notes: [{ midi: 0, dur: 0.0625 }, { midi: 127, dur: 0.0625 }], bpm: 20, out: 'hygiene/sing-edges.wav' })
-  await checkRender('sing 256 notes with a choir harmony', 'audio_sing', { notes: Array.from({ length: 256 }, (_, index) => ({ midi: 60 + (index % 12), dur: 0.0625 })), bpm: 300, voice: 'choir', harmony: 'fifth', vibrato: 0, breath: 1, seed: 2, out: 'hygiene/sing-256.wav' })
-
   await checkRender('tts speed 0.5 and pitch -12', 'audio_tts', { text: 'hello world', speed: 0.5, pitch: -12, subtitle: false, out: 'hygiene/tts-min.wav' })
   await checkRender('tts speed 2 and pitch +12 with SRT', 'audio_tts', { text: 'hello world', speed: 2, pitch: 12, sampleRate: 48000, srt: true, out: 'hygiene/tts-max.wav' })
 
@@ -927,7 +908,7 @@ section('4. number hygiene and determinism')
     else ok('audio_voices', `${outcome.value.source} list, ${outcome.value.voices.length} voices`)
   }
 
-  ok('boundary values exercised', `duration 0.008 s..30 s (1e999 clamp) · rates 8000/22050/44100/48000/96000 · bit depths 8/16/24/32 · channels 1/2 · mix gains -60..0 dB · stretch factors ${STRETCH_LIMITS.minFactor}/${STRETCH_LIMITS.maxFactor} and semitones ±${STRETCH_LIMITS.maxSemitones} · sing 256 notes / bpm 20..300 · tts speed 0.5..2 and pitch ±12`)
+  ok('boundary values exercised', `duration 0.008 s..30 s (1e999 clamp) · rates 8000/22050/44100/48000/96000 · bit depths 8/16/24/32 · channels 1/2 · mix gains -60..0 dB · stretch factors ${STRETCH_LIMITS.minFactor}/${STRETCH_LIMITS.maxFactor} and semitones ±${STRETCH_LIMITS.maxSemitones} · compose bpm 20..220 · tts speed 0.5..2 and pitch ±12`)
 }
 
 // NaN and 0-frame root causes: every one of these must reject or stay finite.
@@ -1040,17 +1021,6 @@ try {
     } else {
       ok('pattern count=1e9 is rejected before rendering', `${childMs}ms · ${childText.split('\n')[0].slice(0, 140)}`)
     }
-  }
-
-  // Sing caps: 256 notes and 120 s.
-  checkGuard('sing 257 notes', await invoke('audio_sing', { notes: Array.from({ length: 257 }, () => ({ midi: 60, dur: 1 })) }), 1000)
-  checkGuard('sing over 120 s', await invoke('audio_sing', { notes: [{ midi: 60, dur: 32, beat: 3000 }], bpm: 20 }), 1000)
-  {
-    const started = Date.now()
-    const outcome = await invoke('audio_sing', { notes: Array.from({ length: 256 }, (_, index) => ({ midi: 60 + (index % 12), dur: 0.0625 })), bpm: 300, out: 'guard/sing-256.wav' })
-    if (!outcome.ok) bug('sing at the 256 note limit was rejected', String(outcome.error.message))
-    else if (Date.now() - started > 5000) bug('sing at the 256 note limit is slow', `${Date.now() - started}ms`)
-    else ok('sing at the 256 note limit is accepted', `${outcome.value.notes} notes in ${Date.now() - started}ms`)
   }
 
   // Bind inline budget: refusal must be a bounded answer, not a 40 MB page.

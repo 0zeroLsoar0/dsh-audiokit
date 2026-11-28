@@ -8,9 +8,11 @@
  *    has articulation, per-track gain targets and chord labels), so this
  *    conversion is lossy in one direction only: everything MIDI can express
  *    survives the round trip, and the extras simply have no MIDI equivalent.
- * 2. `parseMidiFile` + `midiToPlan` bring existing music in. A parsed file can be
- *    summarised, inspected, or handed to `singPlan` and sung, which is how a
- *    melody somebody already wrote becomes audio in this plugin.
+ * 2. `parseMidiFile` reads existing music. A parsed file can be summarised and
+ *    inspected — tempo, tracks, note counts and ranges — so a `.mid` from the
+ *    user becomes structured data the model can talk about and re-compose from.
+ *    Turning it into sung audio was dropped with the formant voice: singing now
+ *    belongs to a TTS engine or an external plugin.
  *
  * Deliberately supported: format 0/1/2 reading and format 1 writing,
  * ticks-per-quarter timing, running status, variable-length quantities, tempo
@@ -39,7 +41,6 @@
  */
 
 import { clamp } from './dsp.js'
-import { parseSyllable, primaryVowel } from './sing.js'
 
 /* --------------------------------------------------------------- constants -- */
 
@@ -895,207 +896,4 @@ export function scoreToMid (score, options = {}) {
   }
 
   return { bpm, beatsPerBar: clamp(beatsPerBar, 1, 32), endBeats, tracks, skippedNotes }
-}
-
-/* ------------------------------------------------------------- mid -> plan -- */
-
-/**
- * Pick the track to sing from a parsed file.
- *
- * Named tracks win (a file that says "melody" means it), else the track with the
- * most notes, which on a normal arrangement is the lead or the comping part. A
- * per-call `track` option overrides both.
- */
-function choosePlanTrack (parsed, option) {
-  const playable = parsed.tracks.filter((track) => track !== null && typeof track === 'object' &&
-    Array.isArray(track.notes) && track.notes.length > 0)
-  if (playable.length === 0) throw new Error('midiToPlan: the file contains no notes to sing')
-  if (option !== undefined && option !== null) {
-    // A numeric string is an index too: tool arguments sometimes arrive as text.
-    const asIndex = typeof option === 'number'
-      ? option
-      : (typeof option === 'string' && /^\s*\d+\s*$/.test(option) ? Number(option) : null)
-    if (asIndex !== null) {
-      const wanted = parsed.tracks[Math.round(asIndex)]
-      if (wanted === undefined) {
-        throw new Error(`midiToPlan: track ${asIndex} does not exist (the file has ${parsed.tracks.length})`)
-      }
-      if (!Array.isArray(wanted.notes) || wanted.notes.length === 0) {
-        throw new Error(`midiToPlan: track ${asIndex} has no notes`)
-      }
-      return { track: wanted, warnings: [] }
-    }
-    const needle = String(option).toLowerCase()
-    const match = playable.find((track) => String(track.name ?? '').toLowerCase().includes(needle))
-    if (match === undefined) {
-      const names = playable.map((track) => track.name ?? `(track ${track.index + 1})`).join(', ')
-      throw new Error(`midiToPlan: no track name contains "${needle}"; names: ${names}`)
-    }
-    return { track: match, warnings: [] }
-  }
-  const named = playable.find((track) => /melod|lead|vocal|solo|flute|horn|voice|sing/i.test(String(track.name ?? '')))
-  if (named !== undefined) return { track: named, warnings: [] }
-  const busiest = playable.slice().sort((a, b) => b.notes.length - a.notes.length || a.index - b.index)[0]
-  const warnings = playable.length > 1
-    ? [`no track was named like a melody; sang "${busiest.name ?? `track ${busiest.index + 1}`}" because it has the most notes`]
-    : []
-  return { track: busiest, warnings }
-}
-
-/**
- * Convert a parsed MIDI file into a plan `singPlan`/`renderSing` can sing.
- *
- * The output is deliberately dual: it carries `startBeat`/`durBeats` (so
- * `renderSing(plan)` works directly) and `beat`/`dur` (so `singPlan(plan)` — which
- * reads the `audio_sing` argument names — preserves the same timing).
- *
- * The line is forced monophonic: a sung voice cannot hold a chord, and silently
- * averaging one would destroy the melody. Overlaps are truncated to the next
- * onset; simultaneous notes keep the highest pitch (the top voice is what a
- * listener hears as the tune). Notes are octave-folded into a singable register,
- * which is reported in `warnings`.
- *
- * @param {object} parsed - result of {@link parseMidiFile}.
- * @param {object} [options]
- * @param {number|string} [options.track] - track index, or part of a track name.
- * @param {number} [options.bpm] - overrides the file tempo.
- * @param {number} [options.maxNotes] - cap on sung notes (default 256).
- * @param {number} [options.maxSeconds] - cap on sung length (default 120).
- * @param {number} [options.lowMidi] - soft low bound, default 48.
- * @param {number} [options.highMidi] - soft high bound, default 84.
- * @param {string} [options.syllable] - syllable to sing, default "la".
- * @returns {{ notes:object[], bpm:number, totalBeats:number, totalSeconds:number, source:object, warnings:string[] }}
- */
-export function midiToPlan (parsed, options = {}) {
-  if (parsed === null || typeof parsed !== 'object' || !Array.isArray(parsed.tracks)) {
-    throw new Error('midiToPlan: expected the result of parseMidiFile (an object with a tracks array)')
-  }
-  const opts = options !== null && typeof options === 'object' ? options : {}
-  const ticksPerQuarter = Number(parsed.ticksPerQuarter) > 0 ? Number(parsed.ticksPerQuarter) : MIDI_TICKS_PER_QUARTER
-  const fileBpm = Number(parsed.tempoBpm) > 0 ? Number(parsed.tempoBpm) : DEFAULT_BPM
-  const bpm = clamp(Number.isFinite(Number(opts.bpm)) && Number(opts.bpm) > 0 ? Number(opts.bpm) : fileBpm, 20, 400)
-  const maxNotes = clamp(Math.round(Number.isFinite(Number(opts.maxNotes)) ? Number(opts.maxNotes) : 256), 1, 4096)
-  const maxSeconds = clamp(Number.isFinite(Number(opts.maxSeconds)) ? Number(opts.maxSeconds) : 120, 0.5, 600)
-  const syllable = typeof opts.syllable === 'string' && opts.syllable.trim() !== '' ? opts.syllable.trim() : 'la'
-  const lowMidi = clamp(Number.isFinite(Number(opts.lowMidi)) ? Math.round(Number(opts.lowMidi)) : 48, 0, 127)
-  const highMidi = clamp(Number.isFinite(Number(opts.highMidi)) ? Math.round(Number(opts.highMidi)) : 84, lowMidi, 127)
-  const chosen = choosePlanTrack(parsed, opts.track)
-  const warnings = chosen.warnings.slice()
-  if (chosen.track.channel === 9) {
-    warnings.push('the selected track is on the GM percussion channel; its pitches are hit types, not a sung melody')
-  }
-
-  /* Notes to a sorted, monophonic line. */
-  const source = []
-  for (const note of chosen.track.notes) {
-    const midi = Math.round(Number(note.midi))
-    const startTicks = Math.max(0, Math.round(Number(note.startTicks)))
-    const durTicks = Math.max(1, Math.round(Number(note.durTicks)))
-    const velocity = clamp(Number(note.velocity) / 127, 0.01, 1)
-    if (!Number.isFinite(midi) || midi < 0 || midi > 127) continue
-    if (!Number.isFinite(startTicks) || !Number.isFinite(durTicks)) continue
-    source.push({ midi, startTicks, durTicks, velocity })
-  }
-  // Highest pitch first at one onset, so the monophonic pass keeps the top voice.
-  source.sort((a, b) => a.startTicks - b.startTicks || b.midi - a.midi || a.durTicks - b.durTicks)
-
-  const line = []
-  let dropped = 0
-  for (const note of source) {
-    if (line.length > 0) {
-      const previous = line[line.length - 1]
-      const previousEnd = previous.startTicks + previous.durTicks
-      if (note.startTicks < previousEnd) {
-        if (note.startTicks <= previous.startTicks + 1) {
-          dropped += 1
-          continue
-        }
-        previous.durTicks = note.startTicks - previous.startTicks
-      }
-    }
-    line.push({ ...note })
-  }
-  if (dropped > 0) warnings.push(`dropped ${dropped} simultaneous note(s): a sung line is monophonic`)
-
-  /* Octave folding into the soft register. */
-  const rangeOf = (notes) => {
-    let low = 127
-    let high = 0
-    for (const note of notes) {
-      if (note.midi < low) low = note.midi
-      if (note.midi > high) high = note.midi
-    }
-    return { low, high }
-  }
-  let octaveShift = 0
-  let span = rangeOf(line)
-  for (let guard = 0; guard < 8 && line.length > 0; guard += 1) {
-    if (span.low < lowMidi && span.high + 12 <= 127) {
-      for (const note of line) note.midi += 12
-      octaveShift += 1
-    } else if (span.high > highMidi && span.low - 12 >= 0) {
-      for (const note of line) note.midi -= 12
-      octaveShift -= 1
-    } else {
-      break
-    }
-    span = rangeOf(line)
-  }
-  if (octaveShift !== 0) {
-    warnings.push(`transposed ${octaveShift > 0 ? '+' : ''}${octaveShift} octave(s) into the singable range ${lowMidi}-${highMidi}`)
-  }
-  for (const note of line) note.midi = clamp(note.midi, 0, 127)
-
-  /* Cap notes and length: a sung cue has to stay renderable. */
-  const kept = []
-  let totalBeats = 0
-  let truncated = 0
-  for (const note of line) {
-    const startBeat = note.startTicks / ticksPerQuarter
-    const endBeat = (note.startTicks + note.durTicks) / ticksPerQuarter
-    if (kept.length >= maxNotes || endBeat * 60 / bpm > maxSeconds) {
-      truncated += 1
-      continue
-    }
-    kept.push({ ...note, startBeat, endBeat })
-    totalBeats = Math.max(totalBeats, endBeat)
-  }
-  if (truncated > 0) warnings.push(`kept ${kept.length} of ${line.length} note(s): limits are ${maxNotes} notes and ${maxSeconds} s`)
-  if (kept.length === 0) throw new Error('midiToPlan: every note is outside the request limits; raise maxNotes or maxSeconds')
-
-  const parsedSyllable = parseSyllable(syllable)
-  const vowel = primaryVowel(parsedSyllable.vowels)
-  const notes = kept.map((note) => {
-    const startBeat = round6(note.startBeat)
-    const durBeats = round6(Math.max(1, note.durTicks) / ticksPerQuarter)
-    return {
-      midi: note.midi,
-      startBeat,
-      durBeats,
-      velocity: round3(note.velocity),
-      syllable,
-      vowel,
-      consonant: parsedSyllable.consonant,
-      vowels: parsedSyllable.vowels.slice(),
-      // `audio_sing` argument names, so singPlan(plan) keeps the same timing.
-      beat: startBeat,
-      dur: durBeats
-    }
-  })
-
-  return {
-    notes,
-    bpm,
-    totalBeats: round6(totalBeats),
-    totalSeconds: round6(totalBeats * 60 / bpm),
-    source: {
-      track: chosen.track.name ?? null,
-      trackIndex: chosen.track.index,
-      channel: chosen.track.channel ?? null,
-      ticksPerQuarter,
-      tempoBpm: fileBpm,
-      noteCount: chosen.track.notes.length
-    },
-    warnings
-  }
 }

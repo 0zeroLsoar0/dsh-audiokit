@@ -27,6 +27,9 @@ import {
   unit
 } from './dsp.js'
 import { decodeWav, encodeWav } from './wav.js'
+// Channel-layout knowledge lives in one module: a mix never guesses which
+// channel is the centre or the LFE, it asks the WAVE layout table.
+import { CHANNEL_COUNTS, fitChannels, layoutFor } from './multichannel.js'
 
 /** Bumped whenever synthesis changes in a way that alters output bytes. */
 export const ENGINE_VERSION = 2
@@ -587,6 +590,30 @@ function describeValue (value) {
   }
 }
 
+/** Acceptable `channels` values for a mix: automatic, forced mono, forced stereo. */
+export const MIX_CHANNELS = Object.freeze(['auto', 1, 2])
+
+/**
+ * Normalise the `channels` mix option.
+ *
+ * `'auto'` is the default: the output follows the widest input, so an all-mono
+ * request keeps the historical mono output (byte for byte) while one stereo or
+ * multichannel input can no longer be averaged away. A numeric string is
+ * accepted because the host may send one, exactly like every other numeric
+ * tool argument.
+ *
+ * @param {unknown} requested - 'auto', 1, 2 or a numeric string.
+ * @returns {'auto'|1|2} the normalised choice.
+ */
+export function normalizeMixChannels (requested) {
+  if (requested === undefined || requested === null || requested === 'auto') return 'auto'
+  const numeric = typeof requested === 'number'
+    ? requested
+    : (typeof requested === 'string' && requested.trim() !== '' ? Number(requested) : Number.NaN)
+  if (numeric === 1 || numeric === 2) return numeric
+  throw new Error(`mix: channels must be 'auto', 1 or 2, got ${describeValue(requested)}`)
+}
+
 /**
  * Validate the numeric mix options.
  *
@@ -597,6 +624,7 @@ function describeValue (value) {
  * @param {object} [options] - the same object `mixTracks` accepts.
  */
 export function validateMixOptions (options = {}) {
+  normalizeMixChannels(options.channels)
   const offsets = Array.isArray(options.offsets) ? options.offsets : []
   for (let index = 0; index < offsets.length; index += 1) {
     const value = Number(offsets[index])
@@ -620,37 +648,256 @@ export function validateMixOptions (options = {}) {
 }
 
 /**
- * Sum decoded tracks into one file.
- * @param {{ samples: Float32Array, sampleRate: number }[]} inputs - decoded tracks.
- * @param {object} options - sampleRate, gains (dB), offsets (seconds), normalizePeakDbfs, limiter, durationSeconds.
+ * The channel buffers of one mix input.
+ *
+ * A file decoded for a mix arrives as `{ channels }` — the layout-preserving
+ * read. A direct caller may still pass the mono-era `{ samples }` shape, which
+ * is exactly one channel, so both shapes stay accepted.
+ *
+ * @param {object} input - decoded track.
+ * @param {number} index - position in the input list, for error messages.
+ * @returns {Float32Array[]} one buffer per channel.
  */
-export function mixTracks (inputs, options = {}) {
+function channelsOfInput (input, index) {
+  const channels = Array.isArray(input?.channels)
+    ? input.channels
+    : (input?.samples === undefined ? null : [input.samples])
+  if (channels === null || channels.length === 0) {
+    throw new Error(`mix: input ${index} needs a samples buffer or a non-empty channels array`)
+  }
+  const frames = channels[0]?.length
+  if (!Number.isInteger(frames) || frames < 0) {
+    throw new Error(`mix: input ${index} channels must be sample buffers with a length`)
+  }
+  for (const channel of channels) {
+    if (channel === null || channel === undefined || channel.length !== frames) {
+      throw new Error(`mix: input ${index} channels must be sample buffers of equal length`)
+    }
+  }
+  return channels
+}
+
+/**
+ * Fold one input to the mix's channel count through the WAVE layout matrix.
+ *
+ * A stereo target sends a mono input through the layout's own 1->2 upmix (the
+ * equal-power centre pan law: -3 dB per side, so a mono fold-down recovers the
+ * original level) and a 4/6/8-channel input through its downmix to L/R, which
+ * drops LFE. A mono target uses the layout downmix as well, so LFE never enters
+ * a full-range mix. A count with no WAVE layout (3, 5, 7) has no speaker order
+ * to guess, so it keeps the historical plain average and is only placed at the
+ * target width.
+ *
+ * @param {Float32Array[]} channels - source channels, WAVE order when the count has a layout.
+ * @param {1|2} target - output channel count.
+ * @returns {Float32Array[]} the folded channels.
+ */
+function foldMixInput (channels, target) {
+  if (channels.length === target) return channels
+  if (CHANNEL_COUNTS.includes(channels.length)) return fitChannels(channels, target)
+  return fitChannels([averageChannels(channels)], target)
+}
+
+/**
+ * Whether folding this input to the target drops an LFE channel.
+ * @param {Float32Array[]} channels - source channels.
+ * @param {1|2} target - output channel count.
+ * @returns {boolean} true when the layout has an LFE channel that is dropped.
+ */
+function foldDropsLfe (channels, target) {
+  if (channels.length <= target || !CHANNEL_COUNTS.includes(channels.length)) return false
+  const layout = layoutFor(channels.length)
+  return layout.hasLfe && layout.lfeIndex >= target
+}
+
+/**
+ * Resolve the output channel count of a mix.
+ *
+ * `auto` follows the widest input: any input with more than one channel makes
+ * the output stereo (folded through the layout matrix when it is 4/6/8), and an
+ * all-mono request stays mono.
+ *
+ * @param {object[]} inputs - mix inputs (`channels`, or a legacy `samples` buffer).
+ * @param {'auto'|1|2} [requested] - the `channels` option.
+ * @returns {1|2} the channel count to render.
+ */
+export function resolveMixChannels (inputs, requested = 'auto') {
+  const choice = normalizeMixChannels(requested)
+  if (choice !== 'auto') return choice
+  return inputs.some((input, index) => channelsOfInput(input, index).length > 1) ? 2 : 1
+}
+
+/**
+ * Peak-normalise channel buffers by one shared gain.
+ *
+ * `dsp.normalizePeak` is the mono reference; with more than one channel the
+ * peak that drives the gain is the largest absolute value across every channel
+ * and that same gain is applied to all of them. Normalising each channel to its
+ * own peak would make the quieter side as loud as the louder one and move the
+ * image, which is the bug this keeps out of a stereo mix.
+ *
+ * @param {Float32Array[]} channels - channels modified in place.
+ * @param {number} [targetDbfs] - target peak.
+ * @param {number} [ceilingDbfs] - gain ceiling.
+ * @returns {number} the applied gain.
+ */
+function normalizePeakLinked (channels, targetDbfs = -1, ceilingDbfs = 0) {
+  let peak = 0
+  for (const channel of channels) {
+    for (let i = 0; i < channel.length; i += 1) {
+      const magnitude = Math.abs(channel[i])
+      if (magnitude > peak) peak = magnitude
+    }
+  }
+  if (peak === 0) return 0
+  const target = dbToGain(targetDbfs)
+  const ceiling = dbToGain(ceilingDbfs)
+  const gain = Math.min(target / peak, ceiling / peak)
+  if (gain !== 1) {
+    for (const channel of channels) {
+      for (let i = 0; i < channel.length; i += 1) channel[i] *= gain
+    }
+  }
+  return gain
+}
+
+/**
+ * Soft-limit channel buffers with one gain curve.
+ *
+ * `dsp.softLimit` is a per-sample waveshaper, so calling it channel by channel
+ * clips the louder side harder and pulls a hard-panned hit towards the centre.
+ * This runs the same knee and curve but takes the frame's largest absolute
+ * value across the channels as the detector and multiplies every channel by
+ * that one gain, so the ratio between channels (the pan position) survives
+ * limiting.
+ *
+ * @param {Float32Array[]} channels - channels modified in place.
+ * @param {number} [knee] - the linear threshold `dsp.softLimit` uses.
+ * @returns {Float32Array[]} the same channels.
+ */
+function softLimitLinked (channels, knee = 0.85) {
+  const frames = Math.min(...channels.map((channel) => channel.length))
+  for (let i = 0; i < frames; i += 1) {
+    let magnitude = 0
+    for (const channel of channels) {
+      const value = Math.abs(channel[i])
+      if (value > magnitude) magnitude = value
+    }
+    if (magnitude <= knee) continue
+    const over = (magnitude - knee) / (1 - knee)
+    const gain = (knee + (1 - knee) * Math.tanh(over)) / magnitude
+    for (const channel of channels) channel[i] *= gain
+  }
+  return channels
+}
+
+/**
+ * Render a mix and keep its channels.
+ *
+ * The mono-era mixer folded every input to one channel by averaging, which is
+ * wrong for a cue assembled from stereo material: an out-of-phase pair came out
+ * silent and a panned image came out flat. This is the channel-preserving core:
+ * each input is folded to the target count by the layout matrix (never by
+ * guessing the channel order), the sums are per channel, and the limiter and
+ * peak normaliser are driven by the frame's worst channel and apply that same
+ * gain to every channel, so the image cannot drift.
+ *
+ * The single-channel path calls the exact historical primitives
+ * (`softLimit`/`normalizePeak`), which is why an all-mono mix is byte-compatible
+ * with what the plugin wrote before this function existed.
+ *
+ * @param {{ channels?: Float32Array[], samples?: Float32Array, sampleRate: number }[]} inputs - decoded tracks.
+ * @param {object} options - channels ('auto'|1|2), sampleRate, gains (dB), offsets (seconds), peakDbfs, limiter, durationSeconds, fades.
+ * @returns {{ channels: Float32Array[], channelCount: number, sampleRate: number, durationSeconds: number, inputChannels: number[], foldedFrom: number, lfeDropped: boolean }}
+ */
+export function renderMix (inputs, options = {}) {
   if (!Array.isArray(inputs) || inputs.length === 0) throw new Error('mix requires at least one input')
   validateMixOptions(options)
+  const targetChannels = resolveMixChannels(inputs, options.channels)
   const sampleRate = clamp(Math.round(options.sampleRate ?? Math.max(...inputs.map((i) => i.sampleRate))), 8000, 96000)
+  const inputChannels = []
+  const lfeDropped = []
   const resampled = inputs.map((input, index) => {
     const gain = dbToGain(Number(options.gains?.[index] ?? 0))
-    const samples = resample(input.samples, input.sampleRate, sampleRate)
-    const out = new Float32Array(samples.length)
-    for (let i = 0; i < samples.length; i += 1) out[i] = samples[i] * gain
-    return out
+    const source = channelsOfInput(input, index)
+    inputChannels.push(source.length)
+    lfeDropped.push(foldDropsLfe(source, targetChannels))
+    // Every channel goes through the same linear resampler and the same gain,
+    // so the per-channel alignment (the stereo image) cannot change here.
+    return foldMixInput(source, targetChannels).map((channel) => {
+      const samples = resample(channel, input.sampleRate, sampleRate)
+      const out = new Float32Array(samples.length)
+      for (let i = 0; i < samples.length; i += 1) out[i] = samples[i] * gain
+      return out
+    })
   })
   const offsets = inputs.map((_, index) => Number(options.offsets?.[index] ?? 0))
-  const longest = Math.max(...resampled.map((track, index) => track.length + Math.round(offsets[index] * sampleRate)))
+  const longest = Math.max(...resampled.map((track, index) => track[0].length + Math.round(offsets[index] * sampleRate)))
   const targetFrames = options.durationSeconds !== undefined && options.durationSeconds !== null
     ? frameCount(Number(options.durationSeconds), sampleRate)
     : longest
-  const master = new Float32Array(targetFrames)
-  resampled.forEach((track, index) => addInto(master, track, Math.round(offsets[index] * sampleRate), 1))
+  const master = Array.from({ length: targetChannels }, () => new Float32Array(targetFrames))
+  resampled.forEach((track, index) => {
+    const start = Math.round(offsets[index] * sampleRate)
+    for (let channel = 0; channel < targetChannels; channel += 1) addInto(master[channel], track[channel], start, 1)
+  })
 
+  // One fade shape for every channel: the same multiplier per frame, so the
+  // image is untouched by a fade.
   const fadeIn = Math.min(Math.round((options.fadeInSeconds ?? 0) * sampleRate), targetFrames)
   const fadeOut = Math.min(Math.round((options.fadeOutSeconds ?? 0) * sampleRate), targetFrames)
-  for (let i = 0; i < fadeIn; i += 1) master[i] *= i / Math.max(1, fadeIn)
-  for (let i = 0; i < fadeOut; i += 1) master[targetFrames - 1 - i] *= i / Math.max(1, fadeOut)
+  for (let i = 0; i < fadeIn; i += 1) {
+    const gain = i / Math.max(1, fadeIn)
+    for (const channel of master) channel[i] *= gain
+  }
+  for (let i = 0; i < fadeOut; i += 1) {
+    const gain = i / Math.max(1, fadeOut)
+    for (const channel of master) channel[targetFrames - 1 - i] *= gain
+  }
 
-  if (options.limiter !== false) softLimit(master)
-  if (Number.isFinite(options.peakDbfs)) normalizePeak(master, Number(options.peakDbfs))
-  return { samples: master, sampleRate, durationSeconds: master.length / sampleRate }
+  if (targetChannels === 1) {
+    // Keep the mono bytes exactly as they were: the historical primitives are
+    // the regression contract for every existing caller.
+    if (options.limiter !== false) softLimit(master[0])
+    if (Number.isFinite(options.peakDbfs)) normalizePeak(master[0], Number(options.peakDbfs))
+  } else {
+    if (options.limiter !== false) softLimitLinked(master)
+    if (Number.isFinite(options.peakDbfs)) normalizePeakLinked(master, Number(options.peakDbfs))
+  }
+  return {
+    channels: master,
+    channelCount: targetChannels,
+    sampleRate,
+    durationSeconds: targetFrames / sampleRate,
+    inputChannels,
+    foldedFrom: Math.max(...inputChannels),
+    lfeDropped: lfeDropped.some(Boolean)
+  }
+}
+
+/**
+ * Sum decoded tracks into one buffer.
+ *
+ * The mono-shaped wrapper around `renderMix`, kept so the many existing callers
+ * that pass `{ samples }` tracks and read `.samples` keep working. `samples` is
+ * the mono buffer of a mono mix and the mono fold-down of a stereo one (use
+ * `channels` for the real result); `channels`/`channelCount` are always
+ * present.
+ *
+ * @param {{ samples?: Float32Array, channels?: Float32Array[], sampleRate: number }[]} inputs - decoded tracks.
+ * @param {object} options - channels, sampleRate, gains (dB), offsets (seconds), peakDbfs, limiter, durationSeconds, fades.
+ * @returns {{ samples: Float32Array, channels: Float32Array[], channelCount: number, sampleRate: number, durationSeconds: number, foldedFrom: number }}
+ */
+export function mixTracks (inputs, options = {}) {
+  const mixed = renderMix(inputs, options)
+  return {
+    samples: mixed.channelCount === 1 ? mixed.channels[0] : averageChannels(mixed.channels),
+    channels: mixed.channels,
+    channelCount: mixed.channelCount,
+    sampleRate: mixed.sampleRate,
+    durationSeconds: mixed.durationSeconds,
+    foldedFrom: mixed.foldedFrom
+  }
 }
 
 /**
@@ -672,6 +919,37 @@ export function finalize (samples, sampleRate, peakDbfs = -1, options = {}) {
   normalizePeak(samples, peakDbfs)
   softLimit(samples)
   return samples
+}
+
+/**
+ * The channel-preserving `finalize`: DC-block every channel, then one linked
+ * peak normalisation and one linked limiter.
+ *
+ * A single channel delegates to `finalize`, so every mono file the plugin
+ * already wrote is reproduced exactly. The linked stages are the whole point for
+ * stereo: normalising or limiting each channel separately would change the L/R
+ * ratio and move the image, while one shared gain keeps it.
+ *
+ * @param {Float32Array[]} channels - one buffer per channel, modified in place.
+ * @param {number} sampleRate - Hz.
+ * @param {number} [peakDbfs] - target peak.
+ * @param {{ loop?: boolean }} [options] - `loop: true` for the circular DC blocker.
+ * @returns {Float32Array[]} the same channel list.
+ */
+export function finalizeChannels (channels, sampleRate, peakDbfs = -1, options = {}) {
+  if (!Array.isArray(channels) || channels.length === 0) throw new Error('finalizeChannels needs at least one channel buffer')
+  if (channels.length === 1) {
+    finalize(channels[0], sampleRate, peakDbfs, options)
+    return channels
+  }
+  const loop = options !== null && typeof options === 'object' && options.loop === true
+  for (const channel of channels) {
+    if (loop) dcBlockLoop(channel, sampleRate)
+    else dcBlock(channel, sampleRate)
+  }
+  normalizePeakLinked(channels, peakDbfs)
+  softLimitLinked(channels)
+  return channels
 }
 
 /* ----------------------------------------------------------------- files -- */
@@ -719,10 +997,10 @@ export async function writeFileAtomic (target, bytes) {
  * Read a wav file and decode it into its true channels.
  *
  * This is the channel-preserving read: `readTrack` deliberately folds to mono
- * for the synthesis/mix path, which loses exactly the information a measurement
- * needs (one clipped channel, an out-of-phase stereo pair). A measurement tool
- * reads through here instead, and decides for itself what to do with the
- * channels.
+ * for the tools that reason about one waveform, which loses exactly the
+ * information a measurement needs (one clipped channel, an out-of-phase stereo
+ * pair). A measurement tool reads through here instead, and decides for itself
+ * what to do with the channels.
  *
  * @param {string} path - file to read.
  * @returns {Promise<{ channels: Float32Array[], sampleRate: number, channelCount: number, bitDepth: number }>}
@@ -783,6 +1061,23 @@ export function averageChannels (channels) {
 export function toWavBytes (samples, sampleRate, bitDepth = 16) {
   if (bitDepth !== 16) throw new Error('only 16-bit output is supported')
   return encodeWav([samples], sampleRate)
+}
+
+/**
+ * Encode the channel list of a mix as a 16-bit wav.
+ *
+ * `toWavBytes` writes one channel; the writer underneath (`encodeWav`) already
+ * emits any channel count as plain 16-bit PCM, which is what a stereo cue needs
+ * and what every decoder reads back. The mono path stays on `toWavBytes` so its
+ * bytes do not move.
+ *
+ * @param {Float32Array[]} channels - one buffer per channel, equal lengths.
+ * @param {number} sampleRate - samples per second.
+ * @returns {Buffer} complete `.wav` bytes.
+ */
+export function toWavBytesChannels (channels, sampleRate) {
+  if (!Array.isArray(channels) || channels.length === 0) throw new Error('toWavBytesChannels needs at least one channel buffer')
+  return encodeWav(channels, sampleRate)
 }
 
 /** Hash a render spec so identical requests share one file name. */

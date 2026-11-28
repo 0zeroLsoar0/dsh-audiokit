@@ -31,7 +31,7 @@ import {
   writeFileAtomic
 } from './audio.js'
 import { SAMPLER_LIMITS, buildKeymap, midiToName, renderSampler, samplerInfo } from './sampler.js'
-import { noteToMidi, parseMelody } from './sing.js'
+import { noteToMidi, parseMelody } from './pinyin.js'
 
 function displayPath (cwd, path) {
   const rel = relative(cwd, path)
@@ -261,7 +261,7 @@ export function registerSamplerTools (ctx) {
           items: { anyOf: [{ type: 'number' }, { type: 'string' }, { type: 'object', additionalProperties: true }] },
           description: 'Notes to play, in order: { midi, startBeat?, durBeats?, velocity? } (midi may be a number or a name; midi: null is a rest), or bare MIDI numbers / note names placed end to end. Omit with no melody to audition the sample once.'
         },
-        melody: { type: 'string', description: 'Compact melody such as "C4:1 E4:1 G4:2" (pitch:beats; "r" is a rest), same syntax as audio_sing. Used when notes is absent.' },
+        melody: { type: 'string', description: 'Compact melody such as "C4:1 E4:1 G4:2" (pitch:beats; "r" is a rest), same syntax as audio_midi note lists. Used when notes is absent.' },
         bpm: { type: 'number', description: 'Tempo the startBeat/durBeats are measured in (20..400); default 96.' },
         envelope: { type: 'object', additionalProperties: true, description: 'ADSR: { attack, decay, release } in seconds and { sustain } 0..1. Default a 2 ms de-click attack and a 50 ms release. Applied after pitch, so a recorded transient survives a slow pitch.' },
         loop: {

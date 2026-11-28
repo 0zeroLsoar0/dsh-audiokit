@@ -11,13 +11,22 @@
 - **U 盘上的版本目录只增不删。** 需要更新同一版本时覆盖同名文件，不要删目录。
 - 旧版本的唯一权威来源是 git tag；U 盘只是副本。
 
-## 未发布（0.5.11-dev）— 2026-11-28
+## 0.6.0 — 2026-11-28
 
-版本号**暂未改动**（仍是 0.5.10）；以下改动已在仓库，等发版指令再 bump 与打 tag。
+`package.json` 已 bump 到 0.6.0；以下改动已在仓库，等发版指令再打 tag。
+
+### 移除
+
+- **`audio_sing` / voicebank 采样声库**：合成唱腔不可辨识（共振峰合成出来的人声听不出字），
+  演唱交给 TTS（`audio_tts`）或 AnyAudio。随之删除 `lib/sing.js`、`lib/tools-sing.js`、
+  `lib/voicebank.js`、`tools/fetch-voicebank.mjs`、`tools/sing-bank.mjs` 与 4 个相关测试；
+  拼音表迁到 `lib/pinyin.js`，`audio_mouth` 与 `audio_sampler` 继续复用。工具 31 → **30**。
+- **`audio_midi` 的"导入即演唱"**：import 动作（`midiToPlan` → `singPlan` → `renderSing`）随合成唱腔一起移除，
+  只保留 `export`（作曲导出 .mid）与 `parse`（读 .mid 报告速度/轨道/音符，不渲染音频）。
 
 ### 新增
 
-- **`audio_generate`**（第 31 个工具）：接入外部纯音频生成模型。支持 OpenAI 兼容端点与自定义 HTTP 端点，
+- **`audio_generate`**：接入外部纯音频生成模型。支持 OpenAI 兼容端点与自定义 HTTP 端点，
   prompt → wav；未配置时不可用，结果不保证确定性（内容哈希命名，同一 prompt 重跑生成新 take）。
 - **时间线编辑器** `/dsh-audio/editor`：载入 cue 表、按波形拖动起点、改增益/淡入淡出/循环、BPM 吸附、试听，
   导出 cue JSON / `audio_bind` / `audio_daw` 片段；只读工作区内的 `.json`/`.wav`，拒绝路径逃逸。
@@ -27,7 +36,7 @@
   AAF 是结构子集、OMF 是骨架，均在文件内与返回值里明确标注"不可导入"。
 - **`audio_design` 生物配方 ×12**：鸟鸣/群鸟、虫群、鲸歌、狼嚎、蛙鸣、马蹄、翅膀、呼吸、嘶声、鼠叫、蝙蝠回声。
   猫叫/狗吠等"人耳模板极强"的叫声刻意不做（合成会掉进恐怖谷），请走采样器。
-- **`test/schema-budget.mjs`**：把工具 schema 的模型侧字节纳入测试预算（当前 102,605 B / 31 工具）。
+- **`test/schema-budget.mjs`**：把工具 schema 的模型侧字节纳入测试预算（当前 98,442 B / 30 工具）。
 
 ### 修复（只读审计驱动）
 
@@ -51,12 +60,13 @@
 ### 上下文税
 
 - 移除常驻 system prompt 注入（约 1.2 KB/会话，所有会话都付）；`animation-sound` 技能仍在需要时按需加载。
-- 31 个工具的模型侧 schema 实测 **102,605 B（约 32k token）**，削减方案（短描述 + skill、按需启用、合并入口）
+- 30 个工具的模型侧 schema 实测 **98,442 B（约 31k token）**，削减方案（短描述 + skill、按需启用、合并入口）
   见 `dsh-audio/docs/SCHEMA_DIET.zh.md`。`test/schema-budget.mjs` 会阻止它继续变大。
 
 ### 测试
 
-- `node tools/test-all.mjs` → **57 file(s) · 57 ok · 0 failed · 2 skipped**。
+- `node tools/test-all.mjs` → **57 file(s) · 57 ok · 0 failed**（本机实测；CI 上 `test/video.mjs` 会自跳为
+  唯一的 `[skip]`）。移除 `sing` / `sing-listen` / `sing-voicebank` / `voicebank` 四个测试文件；
   新增：`check` / `selfcheck` / `loudness` / `pattern` / `lipsync` / `generate` / `security-settings` /
   `wav-decode` / `schema-budget` / `daw-aaf` 扩充。
 

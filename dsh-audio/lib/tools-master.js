@@ -28,7 +28,7 @@ import {
 } from './audio.js'
 import { PRESETS } from './dsp.js'
 import { analyzeLoudness, truePeak } from './lufs.js'
-import { masterChain, masterPresets } from './master.js'
+import { MASTER_MODES, masterChain, masterPresets } from './master.js'
 import { CHANNEL_COUNTS, encodeAnyWav, fitChannels, layoutFor, loudnessChannels } from './multichannel.js'
 import { decodeWav } from './wav.js'
 
@@ -153,6 +153,11 @@ function resolveRequest (tool, args) {
     overrides.bands = args.bands
   }
 
+  // The memory/time switch is not part of the sound, so it is kept out of
+  // `request` (which also names the default output file): the same input must
+  // land on the same path in either mode, because the bytes are identical.
+  const mode = resolveMode(tool, args.mode)
+
   let presetName = null
   let request
   if (args.preset !== undefined && args.preset !== null) {
@@ -174,7 +179,21 @@ function resolveRequest (tool, args) {
   } else {
     request = {}
   }
-  return { presetName, request: { ...request, ...overrides } }
+  return { presetName, mode, request: { ...request, ...overrides } }
+}
+
+/**
+ * Read `mode`, rejecting anything that is not one of the chain's two names.
+ *
+ * The chain validates it too (a caller of `masterChain` gets the same error),
+ * but doing it here names the tool and happens before any file is read or
+ * rendered — a typo must not cost a decode, a render or a write.
+ */
+function resolveMode (tool, value) {
+  if (value === undefined || value === null) return MASTER_MODES[0]
+  const mode = String(value)
+  if (MASTER_MODES.includes(mode)) return mode
+  throw new Error(`${tool}: mode must be "${MASTER_MODES[0]}" (default: re-render the chosen attempt once, lowest memory) or "${MASTER_MODES[1]}" (keep every attempt's samples, one limiter pass less), got ${JSON.stringify(mode)}`)
 }
 
 function resolveBitDepth (tool, value) {
@@ -256,6 +275,11 @@ function summaryText ({ destination, info, before, after, report, presetName, bi
     parts.push('width stage bypassed (surround input)')
   }
   parts.push(`${report.iterations} iteration(s)`)
+  if (report.mode === 'fast') {
+    // Only worth a clause when it is not the default: the bytes are identical,
+    // so naming the mode is a note about how it was computed, not about what.
+    parts.push('fast mode (every attempt kept in memory)')
+  }
   if (report.achievable) {
     parts.push(`target ${fmt(target.lufs, 1)} LUFS hit`)
   } else if (report.limitedBy === 'true-peak') {
@@ -265,6 +289,9 @@ function summaryText ({ destination, info, before, after, report, presetName, bi
   } else {
     parts.push(`target ${fmt(target.lufs, 1)} LUFS not reached after ${report.iterations} iteration(s): landed ${fmt(report.lufsErrorLu, 1)} LU off target`)
   }
+  // A warning about the mode's memory cost is part of the answer: the model
+  // reads this line, not the structured fields, so it must not stay silent.
+  if (Array.isArray(report.warnings)) for (const warning of report.warnings) parts.push(warning)
   return parts.join(' | ')
 }
 
@@ -319,6 +346,7 @@ export function registerMasterTools (ctx) {
         bassMonoHz: { type: 'number', description: 'Fold side content below this frequency to the centre (mono bass), 0 disables. A stereo control: ignored for mono, bypassed for a surround input. Overrides the preset.' },
         driveDb: { type: 'number', description: 'Gain into the multiband compressor in dB, -24..24; raise it to make the compressor work on quiet material. Overrides the preset.' },
         maxGainReductionDb: { type: 'number', description: 'Limiting budget in dB: if the target would need more reduction than this, the chain stops and reports the shortfall; defaults to the preset value (6..14).' },
+        mode: { type: 'string', enum: MASTER_MODES, description: 'Memory/time tradeoff: memory (default) keeps only attempt measurements and re-renders the chosen attempt once; fast keeps every attempt\'s samples and skips that re-render. Output is byte-identical either way; fast costs ~350 MB for a 180 s stereo master.' },
         bitDepth: { type: 'integer', enum: BIT_DEPTHS, description: '8=smallest (inline HTML), 16=default, 24=video master, 32=32-bit IEEE float. A 4/6/8-channel master supports 16 or 24 bits (the extensible WAV writer); 8/32-bit is refused for surround. Defaults to 16.' },
         out: { type: 'string', description: 'Output path, relative to the working directory or absolute. Defaults to assets/audio/master-<hash>.wav.' }
       },
@@ -340,7 +368,7 @@ export function registerMasterTools (ctx) {
       if (wantsRender && requestedPath !== undefined) throw new Error('audio_master takes either `path` or `render`, not both')
       if (!wantsRender && requestedPath === undefined) throw new Error('audio_master needs a wav `path` or an inline `render` spec')
 
-      const { presetName, request } = resolveRequest('audio_master', args)
+      const { presetName, request, mode } = resolveRequest('audio_master', args)
       const bitDepth = resolveBitDepth('audio_master', args.bitDepth)
 
       // --- get the channels (1/2/4/6/8; the layout is preserved) ------------
@@ -380,7 +408,10 @@ export function registerMasterTools (ctx) {
       // The write guard is part of the requested ceiling, not an extra knob: an
       // integer file must still measure at or below the ceiling after encoding.
       const guardDb = WRITE_CEILING_GUARD_DB[bitDepth] ?? 0
-      const chainOptions = { ...request }
+      // `mode` never changes the mastered samples, so it is passed to the chain
+      // but not to `hashSpec` below: the same input must resolve to the same
+      // default output path whichever mode produced it.
+      const chainOptions = { ...request, mode }
       if (Number.isFinite(request.ceilingDbtp)) chainOptions.ceilingDbtp = request.ceilingDbtp - guardDb
       else if (guardDb > 0) chainOptions.ceilingDbtp = -1 - guardDb
       const chain = masterChain(channels.length === 1 ? channels[0] : channels, sampleRate, chainOptions)
@@ -470,6 +501,9 @@ export function registerMasterTools (ctx) {
         before,
         after,
         preset: presetName,
+        // The memory/time trade the chain ran, and any warning that cost earned.
+        mode: report.mode,
+        warnings: report.warnings,
         target: {
           lufs: Number.isFinite(request.targetLufs) ? request.targetLufs : -14,
           ceilingDbtp: requestCeiling,

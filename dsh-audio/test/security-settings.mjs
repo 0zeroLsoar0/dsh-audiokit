@@ -134,7 +134,10 @@ const revert = {
     model: 'qwen2.5-omni-7b',
     apiKey: 'saved-check-secret',
     apiKeyEnv: 'DASHSCOPE_API_KEY',
-    autoValidate: false
+    autoValidate: false,
+    // The semantic layer is off by default; these cases inspect its saved row,
+    // so they have to opt in the same way the settings page does.
+    enabled: true
   }
 }
 const config = JSON.parse(JSON.stringify({ ...revert, tts: { ...revert.tts }, check: { ...revert.check } }))

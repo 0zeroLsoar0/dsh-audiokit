@@ -1,9 +1,9 @@
-/**
- * AAF (Advanced Authoring Format) export — a written subset, and the parser
+﻿/**
+ * AAF (Advanced Authoring Format) export 鈥?a written subset, and the parser
  * that proves what was written.
  *
  * What this module is, stated without decoration: it writes a **valid MS-CFB
- * container** holding a **generated-subset AAF object graph** — a header, a
+ * container** holding a **generated-subset AAF object graph** 鈥?a header, a
  * dictionary of the data/container definitions it uses, a content storage with
  * one composition mob (a timeline of lanes), one master mob and one source mob
  * per clip, PCM descriptors, and the audio itself embedded as raw PCM frames
@@ -12,7 +12,7 @@
  * of `pid / format / size` records over built-in AAF property ids) and every
  * class is an AAF class identifier taken from the specification's registration.
  *
- * What this module is not: a complete AAF writer. AAF is self-describing — a
+ * What this module is not: a complete AAF writer. AAF is self-describing 鈥?a
  * conforming file embeds a MetaDictionary with a class definition for every
  * object it contains (around 900 definition objects and 120 KB for a minimal
  * real file, measured from a reference implementation). That dictionary is not
@@ -25,7 +25,7 @@
  *
  * Determinism: mob ids are SHA-256 digests of a stable seed string, timestamps
  * are a fixed constant, lanes are packed by a deterministic first-fit, and no
- * clock or random source is consulted — the same request produces the same
+ * clock or random source is consulted 鈥?the same request produces the same
  * bytes, which is what lets the tool name the file after a content hash.
  */
 
@@ -159,13 +159,13 @@ const PROPERTY_BYTE_ORDER = 0x4c
  * 2025-01-01T00:00:00Z. AAF stores creation/modification times, but this
  * exporter must be deterministic (the tool names the output after a content
  * hash), and a wall clock would change the bytes on every run. The value is
- * visible in only one place — the file's own header — so nothing is lost.
+ * visible in only one place 鈥?the file's own header 鈥?so nothing is lost.
  */
 const AAF_DATE = Object.freeze({ year: 2025, month: 1, day: 1, hour: 0, minute: 0, second: 0, fraction: 0 })
 
 /** Product identity written into the file's Identification object. */
 const PRODUCT_NAME = 'dsh-audiokit'
-const PRODUCT_VERSION = '0.5.10'
+const PRODUCT_VERSION = '0.6.0'
 const COMPANY_NAME = 'dsh-audiokit'
 
 /**
@@ -313,7 +313,7 @@ function readAafString (data) {
  * number derived from `seed`.
  *
  * The material number is a SHA-256 slice rather than a random UUID so the same
- * request always names the same mob — determinism is a hard requirement here,
+ * request always names the same mob 鈥?determinism is a hard requirement here,
  * and a UMID's only job is to be unique within the file.
  */
 function umid (seed) {
@@ -394,7 +394,7 @@ export function encodePropertyStream (properties) {
 }
 
 /**
- * Decode a `properties` stream into pid → { format, data }.
+ * Decode a `properties` stream into pid 鈫?{ format, data }.
  *
  * @param {Buffer} buffer
  * @returns {{ version: number, properties: Map<number, {format: number, data: Buffer}> }}
@@ -490,7 +490,7 @@ const DATA_DEFINITION_WEAKREF = 0
  * Serialise the referenced-properties table.
  *
  * `u8 0x4c`, `u16 path count`, `u32 pid count`, then each path as pid values
- * terminated by a zero — the count including the terminators.
+ * terminated by a zero 鈥?the count including the terminators.
  */
 function encodeReferencedProperties () {
   const pids = []
@@ -676,15 +676,15 @@ function readClip (caller, entry, index, projectRate) {
  * The object graph written:
  *
  * ```
- * /                     Root           (class b3b398a5…)
+ * /                     Root           (class b3b398a5鈥?
  *   MetaDictionary-1                    (empty: see the module comment)
  *   Header-2
  *     Dictionary-3b04                   (data / container definitions)
  *     Content-3b03
  *       Mobs-1901{0}                    CompositionMob  = the timeline
  *       Mobs-1901{1..n}                 MasterMob       = one per clip
- *       Mobs-1901{…}                    SourceMob       = one per clip, with a PCMDescriptor
- *       EssenceData-1902{i}             embedded PCM frames, MobID → the SourceMob
+ *       Mobs-1901{鈥                    SourceMob       = one per clip, with a PCMDescriptor
+ *       EssenceData-1902{i}             embedded PCM frames, MobID 鈫?the SourceMob
  *   properties, referenced properties
  * ```
  *
@@ -785,7 +785,7 @@ export function exportAaf (request = {}) {
       origin: 0,
       // The source mob's own slot describes the media it owns: a clip of the
       // full media length that names this same mob, so both ends of the chain
-      // (descriptor → essence and timeline → master → source) meet at one mob
+      // (descriptor 鈫?essence and timeline 鈫?master 鈫?source) meet at one mob
       // instead of at an all-zero UMID.
       segment: sourceClip({ length: sourceFrames, sourceMobId, sourceSlotId: 1, start: 0 })
     })
@@ -815,7 +815,7 @@ export function exportAaf (request = {}) {
       essenceItems.push(createObject(AAF_CLASS_IDS.EssenceData, [
         // EssenceData names the mob that owns it: the SourceMob carrying the
         // PCMDescriptor, not the MasterMob the timeline references. A reader
-        // resolves descriptor → essence through this property, so pointing it at
+        // resolves descriptor 鈫?essence through this property, so pointing it at
         // the master would leave the descriptor without its bytes.
         dataProperty(PID.essenceDataMobId, sourceMobId),
         streamProperty(PID.essenceDataData, 'Data-2702', clip.pcm.data)
@@ -823,7 +823,7 @@ export function exportAaf (request = {}) {
     }
   }
 
-  // ---- the composition: lanes of Sequence(Filler, SourceClip, …) ----------
+  // ---- the composition: lanes of Sequence(Filler, SourceClip, 鈥? ----------
   const lanes = packLanes(clips)
   const compositionSlots = lanes.map((lane, laneIndex) => {
     const components = []
@@ -947,7 +947,7 @@ function prop (object, pid) {
  *
  * The parser is deliberately generic: it walks the container, decodes every
  * `properties` stream it finds, and then interprets the object graph it expects
- * (root → header → content storage → mobs → slots → sequences → clips). Object
+ * (root 鈫?header 鈫?content storage 鈫?mobs 鈫?slots 鈫?sequences 鈫?clips). Object
  * classes are resolved from the CLSID of the storage, which is what makes the
  * round trip meaningful: the writer and the reader agree only if the class ids,
  * the property ids and the reference naming scheme are all correct.
@@ -958,8 +958,7 @@ function prop (object, pid) {
  * describes them. A file whose graph disagrees with itself is thrown out instead
  * of returned as a parsed structure. That strictness makes this a validator of
  * the writer's contract rather than a general AAF reader: a file that uses AAF's
- * null-UMID convention for a source mob slot is refused, which is the point —
- * this module only ever claims to parse what it wrote.
+ * null-UMID convention for a source mob slot is refused, which is the point 鈥? * this module only ever claims to parse what it wrote.
  *
  * @param {Buffer} buffer - the AAF file bytes.
  * @returns {object} the parsed structure.
@@ -1249,15 +1248,15 @@ function collectSourceClips (segment, found = []) {
 /**
  * Assert the essence-ownership chain an exported AAF has to carry.
  *
- * The writer's contract — and what a reader resolves on import — is one chain
+ * The writer's contract 鈥?and what a reader resolves on import 鈥?is one chain
  * with both ends on the same mob:
  *
  * ```
- * CompositionMob slot ──SourceClip──▶ MasterMob    (one per cue)
- * MasterMob slot      ──SourceClip──▶ SourceMob    (the media)
- * SourceMob slot      ──SourceClip──▶ itself       (length = media frames)
- * SourceMob.EssenceDescription ─────▶ PCMDescriptor (length = media frames)
- * EssenceData.MobID   ──────────────▶ that SourceMob (the one with the descriptor)
+ * CompositionMob slot 鈹€鈹€SourceClip鈹€鈹€鈻?MasterMob    (one per cue)
+ * MasterMob slot      鈹€鈹€SourceClip鈹€鈹€鈻?SourceMob    (the media)
+ * SourceMob slot      鈹€鈹€SourceClip鈹€鈹€鈻?itself       (length = media frames)
+ * SourceMob.EssenceDescription 鈹€鈹€鈹€鈹€鈹€鈻?PCMDescriptor (length = media frames)
+ * EssenceData.MobID   鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈻?that SourceMob (the one with the descriptor)
  * ```
  *
  * Two failures are possible in a hand-written subset and both are checked here:
@@ -1289,7 +1288,7 @@ export function validateAafGraph (parsed) {
     if (mobId === null) fail(caller, `${label} has no source mob id`)
     if (mobId === ZERO_UMID_HEX) fail(caller, `${label} points at the null UMID (32 zero bytes)`)
     const owner = byId.get(mobId)
-    if (owner === undefined) fail(caller, `${label} points at mob ${mobId.slice(0, 16)}… which is not in the file`)
+    if (owner === undefined) fail(caller, `${label} points at mob ${mobId.slice(0, 16)}鈥?which is not in the file`)
     return owner
   }
 

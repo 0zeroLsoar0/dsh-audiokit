@@ -51,6 +51,13 @@
  * stored before these checks existed is presented as unconfigured instead of
  * being echoed back or used by `/voices` (see `presentSection`).
  *
+ * The semantic (audio-understanding) layer is opt-in through `check.enabled`,
+ * false by default. While it is off, `GET /config` exposes only that flag (the
+ * model row is not even readable), and `/test` plus `/validate` answer from the
+ * saved flag without a single outbound request: reporting a disabled feature is
+ * data the page can render, not a provider failure to classify (see
+ * `semanticCheckEnabled` and `SEMANTIC_DISABLED_TEXT`).
+ *
  * Routes are registered inside `ctx.inject(['webServer'], …)`: on a cold boot
  * this plugin can activate before the HTTP carrier is mounted.
  */
@@ -75,7 +82,7 @@ const MAX_BODY = 64 * 1024
 const BODY_TIMEOUT_MS = 10_000
 
 const TTS_FIELDS = ['provider', 'baseUrl', 'model', 'voice', 'speed', 'pitch', 'sampleRate', 'groupId', 'ffmpegPath', 'apiKey', 'apiKeyEnv']
-const CHECK_FIELDS = ['provider', 'baseUrl', 'model', 'apiKey', 'apiKeyEnv', 'autoValidate']
+const CHECK_FIELDS = ['enabled', 'provider', 'baseUrl', 'model', 'apiKey', 'apiKeyEnv', 'autoValidate']
 /** Numeric fields, coerced by `pickFields`. */
 const TTS_NUMERIC = ['speed', 'pitch', 'sampleRate']
 
@@ -120,6 +127,8 @@ const OPENAI_ENV = 'OPENAI_API_KEY'
  *   provider-none        TTS is switched off (provider = none)
  *   decoder-missing      Edge returned compressed audio and no ffmpeg can decode it
  *   unsupported-target   the saved provider cannot serve this target at all
+ *   semantic-disabled    the optional semantic layer (check.enabled) is off, so
+ *                        nothing is asked and no request is made
  *
  * The page maps these to `reason.*` dictionary keys. `test/client-locale.mjs`
  * fails when a code has no Chinese or English string, and
@@ -134,8 +143,33 @@ export const REASON_CODES = Object.freeze([
   'no-base-url',
   'provider-none',
   'decoder-missing',
-  'unsupported-target'
+  'unsupported-target',
+  'semantic-disabled'
 ])
+
+/**
+ * The one sentence a switched-off semantic layer reports.
+ *
+ * Chinese is the tool/report language; the page never shows it raw when a
+ * `reasonCode` is present (`reason.semantic-disabled` carries the same fact in
+ * the reader's language), but `audio_check` has no i18n layer of its own, so the
+ * shared constant is what both surfaces read.
+ */
+export const SEMANTIC_DISABLED_TEXT = '语义检查未启用（设置→声音里打开）'
+
+/**
+ * Whether the optional semantic (audio-understanding) layer is switched on.
+ *
+ * `check.enabled` is the single authority: false when absent, so a row written
+ * before the switch existed behaves as off. Every no-network path reads this
+ * one predicate, which is what keeps the "disabled means no request" promise
+ * from depending on each call site remembering it.
+ * @param {object} [checkSection] - the saved `config.check` row.
+ * @returns {boolean} true only for an explicit `enabled: true`.
+ */
+export function semanticCheckEnabled (checkSection) {
+  return checkSection !== null && typeof checkSection === 'object' && checkSection.enabled === true
+}
 
 /** How long a reachability probe may take before it is reported as a timeout. */
 const PROBE_TIMEOUT_MS = 5000
@@ -573,6 +607,9 @@ function validate (section) {
   if (tts.speed !== undefined && (tts.speed < 0.5 || tts.speed > 2)) throw new Error('语速必须在 0.5–2.0 之间')
   if (tts.pitch !== undefined && (tts.pitch < -12 || tts.pitch > 12)) throw new Error('音调必须在 −12..12 半音之间')
   if (tts.sampleRate !== undefined && (tts.sampleRate < 8000 || tts.sampleRate > 48000)) throw new Error('采样率必须在 8000–48000 之间')
+  // The switch itself must be a real boolean: a stored `"true"` string would
+  // read as off (`=== true`) and silently hide the fields the user just filled.
+  if (check.enabled !== undefined && typeof check.enabled !== 'boolean') throw new Error('check.enabled 必须是布尔值')
   for (const row of [tts, check]) {
     assertApiKeyEnv(row)
     assertBaseUrl(row)
@@ -602,6 +639,21 @@ function presentSection (section, defaultEnv) {
     envName,
     envPresent: typeof process.env[envName] === 'string' && process.env[envName].trim().length > 0
   }
+}
+
+/**
+ * The `check` section as `GET /config` (and a save response) may show it.
+ *
+ * Off is not "empty": the row exists but is not readable. Returning only
+ * `{ enabled: false }` means a stale endpoint/model/key env name can never leak
+ * into a disabled page, and the page has exactly one fact to render (the
+ * checkbox) instead of several empty fields that look configured.
+ * @param {object} section - saved `config.check` row.
+ * @returns {object} `{ enabled: false }`, or the redacted row when enabled.
+ */
+function presentCheck (section) {
+  if (!semanticCheckEnabled(section)) return { enabled: false }
+  return presentSection(section, DEFAULT_ENV.check)
 }
 
 /**
@@ -959,7 +1011,7 @@ export function registerSettingsRoute (ctx, config, version) {
   // OPENAI_API_KEY, not the MiniMax one.
   const snapshot = () => ({
     tts: presentSection(config.tts, defaultEnvFor('tts', { provider: config.tts?.provider })),
-    check: presentSection(config.check, DEFAULT_ENV.check)
+    check: presentCheck(config.check)
   })
 
   ctx.inject(['webServer'], (child) => {
@@ -1018,7 +1070,7 @@ export function registerSettingsRoute (ctx, config, version) {
             ? null
             : {
                 tts: presentSection(saved.tts, defaultEnvFor('tts', { provider: saved.tts?.provider })),
-                check: presentSection(saved.check, DEFAULT_ENV.check)
+                check: presentCheck(saved.check)
               }
         })
       } catch (error) {
@@ -1038,6 +1090,20 @@ export function registerSettingsRoute (ctx, config, version) {
         }
         const body = await readJson(request)
         const target = body.target === 'check' ? 'check' : 'tts'
+        // A switched-off semantic layer is a configuration state, not a provider
+        // failure: answer from the saved flag alone, with no outbound request at
+        // all, and let the page translate the reason code.
+        if (target === 'check' && !semanticCheckEnabled(config.check)) {
+          sendJson(response, 200, {
+            ok: false,
+            target,
+            disabled: true,
+            error: SEMANTIC_DISABLED_TEXT,
+            detail: SEMANTIC_DISABLED_TEXT,
+            reasonCode: 'semantic-disabled'
+          })
+          return
+        }
         const section = providerSection(target === 'check' ? (config.check ?? {}) : (config.tts ?? {}))
         const provider = target === 'check' ? null : String(section.provider ?? 'minimax').toLowerCase()
         pending = {
@@ -1217,7 +1283,31 @@ export function registerSettingsRoute (ctx, config, version) {
         }
 
         // Only the saved row is consulted from here on: choosing the section is
-        // the page's job, choosing an address is not.
+        // the page's job, choosing an address is not. A switched-off semantic
+        // layer stops before the row is even resolved: disabled means no probe,
+        // no sample and no request, reported as one readable row.
+        if (target === 'check' && !semanticCheckEnabled(config.check)) {
+          sendJson(response, 200, {
+            ok: true,
+            target,
+            disabled: true,
+            baseUrl: null,
+            model: null,
+            endpoint: {
+              reachable: null,
+              status: 0,
+              error: SEMANTIC_DISABLED_TEXT,
+              detail: SEMANTIC_DISABLED_TEXT,
+              reasonCode: 'semantic-disabled'
+            },
+            audioAccepted: false,
+            error: SEMANTIC_DISABLED_TEXT,
+            detail: SEMANTIC_DISABLED_TEXT,
+            reasonCode: 'semantic-disabled',
+            latencyMs: Date.now() - started
+          })
+          return
+        }
         const section = providerSection(target === 'check' ? (config.check ?? {}) : (config.tts ?? {}))
         const resolved = resolveSelfCheckTarget(target, section)
         // Everything a failure needs to name its cause, resolved before the call

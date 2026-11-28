@@ -16,7 +16,8 @@ import { makeRng, normalizePeak } from '../lib/dsp.js'
 import { mixTracks, renderPreset, toWavBytes, writeFileAtomic } from '../lib/audio.js'
 import { analyzeVisemes, isVowelViseme, smoothFrames, visemeToSrt, visemeToTimeline, VISEMES } from '../lib/lipsync.js'
 import { analyzeBeats } from '../lib/beats.js'
-import { registerVisualTools } from '../lib/tools-visual.js'
+import { registerMouthTools } from '../lib/tools-mouth.js'
+import { registerVisualTools, visemeFallbackWarnings } from '../lib/tools-visual.js'
 
 const SAMPLE_RATE = 44100
 const scratch = fileURLToPath(new URL('./out/visual/', import.meta.url))
@@ -24,7 +25,9 @@ await rm(scratch, { recursive: true, force: true })
 await mkdir(scratch, { recursive: true })
 
 let failures = 0
+let checks = 0
 function check (label, condition, detail = '') {
+  checks += 1
   if (condition) return
   failures += 1
   console.log(`  FAIL ${label} ${detail}`)
@@ -501,8 +504,60 @@ let guardThrew = false
 try { await call('audio_beats', {}) } catch (error) { guardThrew = /path|render/.test(String(error.message)) }
 check('beats tool needs a source', guardThrew)
 
+/* ------------------------------------------------- lipsync warnings ---- */
+
+console.log('-- mouth warnings are opt-in (includeWarnings) --')
+{
+  // Off by default: the response shape the tools always had. A track this engine
+  // generates is always whitelisted, so the array is only useful for outside
+  // data — the *shape* contract is what is asserted here, not a stray warning.
+  const plain = await call('audio_lipsync', { path: 'vowel.wav', fps: 24 })
+  check('lipsync omits warnings by default', !Object.prototype.hasOwnProperty.call(plain, 'warnings'), Object.keys(plain).join(','))
+
+  const asked = await call('audio_lipsync', { path: 'vowel.wav', fps: 24, includeWarnings: true })
+  check('lipsync includeWarnings returns an array', Array.isArray(asked.warnings), typeof asked.warnings)
+  check('a generated track needs no fallback warning', asked.warnings.length === 0, JSON.stringify(asked.warnings))
+
+  // The fallback report is what makes the flag worth having: it names the frame
+  // index and the illegal label the formatter would silently replace with none.
+  const synthetic = [
+    { t: 0, viseme: 'AA', openness: 0.5, energy: 0.4, voiced: true },
+    { t: 1 / 24, viseme: 'ZZ', openness: 0.5, energy: 0.4, voiced: true },
+    { t: 2 / 24, viseme: 'EH', openness: 0.5, energy: 0.4, voiced: true },
+    { t: 3 / 24, viseme: null, openness: 0.5, energy: 0.2, voiced: false },
+    { t: 4 / 24, viseme: 42, openness: 0.5, energy: 0.2, voiced: false }
+  ]
+  const fallbacks = visemeFallbackWarnings(synthetic)
+  console.log(`  fallback warnings: ${JSON.stringify(fallbacks)}`)
+  check('only the illegal frames are reported', fallbacks.length === 3, String(fallbacks.length))
+  check('frame 1 is named with its label', /frame 1\b/.test(fallbacks[0]) && fallbacks[0].includes('ZZ'), fallbacks[0])
+  check('frame 3 is named with its label', /frame 3\b/.test(fallbacks[1]) && fallbacks[1].includes('null'), fallbacks[1])
+  check('frame 4 is named with its label', /frame 4\b/.test(fallbacks[2]) && fallbacks[2].includes('42'), fallbacks[2])
+  check('every warning says what the fallback was', fallbacks.every((line) => line.includes('used "none"')), JSON.stringify(fallbacks))
+}
+
+console.log('-- audio_mouth warnings are opt-in too --')
+{
+  const mouthRegistered = new Map()
+  const mouthCtx = {
+    tools: { register: (definition) => { mouthRegistered.set(definition.name, definition); return () => {} } },
+    get: (name) => (name === 'workingDirectory' ? { get: () => scratch } : undefined)
+  }
+  registerMouthTools(mouthCtx)
+  const mouthCall = (args) => mouthRegistered.get('audio_mouth').execute(args, toolExec)
+  check('audio_mouth is registered', mouthRegistered.has('audio_mouth'))
+
+  const plain = await mouthCall({ text: 'wo ai ni', fps: 24 })
+  check('mouth omits warnings by default', !Object.prototype.hasOwnProperty.call(plain, 'warnings'), Object.keys(plain).join(','))
+  const asked = await mouthCall({ text: 'wo ai ni', fps: 24, includeWarnings: true })
+  check('mouth includeWarnings returns an array', Array.isArray(asked.warnings), typeof asked.warnings)
+  const han = await mouthCall({ text: '你好', fps: 24, includeWarnings: true })
+  check('mouth reports its text note when asked', han.warnings.some((line) => /pinyin/.test(line)), JSON.stringify(han.warnings))
+}
+
 /* --------------------------------------------------------- summary ----- */
 
 await rm(scratch, { recursive: true, force: true })
-console.log(failures === 0 ? '\nOK: lipsync and beats behave' : `\nFAILED: ${failures} check(s)`)
+console.log(`\n${checks - failures}/${checks} checks passed`)
+console.log(failures === 0 ? 'OK: lipsync and beats behave' : `FAILED: ${failures} check(s)`)
 process.exit(failures === 0 ? 0 : 1)
